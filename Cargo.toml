@@ -1,0 +1,13 @@
+
+[profile.bench]
+debug = true
+
+[workspace]
+members = [
+	"mfio"
+]
+
+default-members = [
+	"mfio"
+]
+

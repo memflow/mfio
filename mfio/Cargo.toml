@@ -1,0 +1,30 @@
+[package]
+name = "mfio"
+version = "0.1.0"
+edition = "2018"
+authors = ["Aurimas Blažulionis <0x60@pm.me>"]
+license = "MIT"
+repository = "https://github.com/memflow/mfio"
+description = "memflow completion-based I/O primitives"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+bench = false
+
+[[bench]]
+name = "main"
+harness = false
+
+[dependencies]
+event-listener = "2.5.3"
+futures = "0.3.25"
+fxhash = "0.2.1"
+parking_lot = "0.12.1"
+pin-project = "1.0.12"
+tarc = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1.24.2", features = ["rt", "macros", "rt-multi-thread"] }
+criterion = { version = "0.4", git = "https://github.com/h33p/criterion.rs", branch = "tput2", features = ["async_tokio", "async_smol", "async_futures"] }
+pollster = "0.2"
