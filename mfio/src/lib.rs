@@ -154,7 +154,7 @@ mod tests {
     use packet::PacketIo;
 
     use super::*;
-    use crate::packet::Write;
+    use crate::packet::{PacketStream, Write};
     use crate::sample::SampleIo;
     use core::mem::MaybeUninit;
     use futures::StreamExt;
@@ -204,6 +204,40 @@ mod tests {
         }
 
         core::mem::drop(handle);
+    }
+
+    #[tokio::test]
+    async fn drop_bare_stream() {
+        let handle = SampleIo::default();
+
+        let stream = PacketIo::<Write, _>::alloc_stream(&handle).await;
+
+        core::mem::drop(stream);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(feature = "stream_blocking_drop"), should_panic)]
+    async fn drop_bound_stream() {
+        let handle = SampleIo::default();
+
+        let mut value = [MaybeUninit::uninit()];
+
+        let stream = handle.alloc_stream().await;
+
+        stream.send_io(0, &mut value[..]);
+
+        core::mem::drop(stream);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(feature = "stream_blocking_drop"), should_panic)]
+    async fn drop_io_stream() {
+        let handle = SampleIo::default();
+
+        let mut value = [MaybeUninit::uninit()];
+        let stream = handle.io(100, &mut value[..]).await;
+
+        core::mem::drop(stream);
     }
 
     use std::time::{Duration, Instant};

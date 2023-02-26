@@ -5,7 +5,6 @@ use criterion::measurement::Measurement;
 use criterion::*;
 use futures::StreamExt;
 use mfio::packet::*;
-use mfio::*;
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime as TokioRuntime;
 

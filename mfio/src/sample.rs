@@ -78,7 +78,6 @@ impl IoThreadState {
                     //CNT.fetch_add(1, Ordering::Relaxed);
                     let proc_inp = move |(addr, buf): (usize, BoundPacket<'static, Write>)| {
                         let mut pkt = buf.get_mut();
-                        println!("Packet {:?}", pkt.as_ptr());
                         pkt[0].write(addr as u8);
                     };
 

@@ -84,7 +84,6 @@ impl<'a, T, Perms: PacketPerms, Param> Future for AllocStreamFut<'a, T, Perms, P
     }
 }
 
-#[pin_project::pin_project]
 pub struct PacketStream<'a, Perms: PacketPerms, Param> {
     pub ctx: Arc<PacketCtx<'a, Perms, Param>>,
     pub future: SharedFuture<BoxedFuture>,
@@ -129,6 +128,54 @@ impl<'a, Perms: PacketPerms, Param> Stream for PacketStream<'a, Perms, Param> {
     }
 }
 
+#[cfg(not(feature = "stream_blocking_drop"))]
+impl<'a, Perms: PacketPerms, Param> Drop for PacketStream<'a, Perms, Param> {
+    fn drop(&mut self) {
+        assert_eq!(
+            1,
+            self.ctx.strong_count(),
+            "Packet stream dropped strong_count > 1"
+        );
+    }
+}
+
+#[cfg(feature = "stream_blocking_drop")]
+impl<'a, Perms: PacketPerms, Param> Drop for PacketStream<'a, Perms, Param> {
+    fn drop(&mut self) {
+        let strong_count = self.ctx.strong_count();
+
+        if strong_count <= 1 {
+            return;
+        }
+
+        use core::task::{RawWaker, RawWakerVTable};
+
+        unsafe fn wake(_: *const ()) {}
+
+        unsafe fn wake_by_ref(_: *const ()) {}
+
+        unsafe fn drop(_: *const ()) {}
+
+        unsafe fn clone(ptr: *const ()) -> RawWaker {
+            RawWaker::new(ptr, &RawWakerVTable::new(clone, wake, wake_by_ref, drop))
+        }
+
+        let waker = unsafe { Waker::from_raw(clone(core::ptr::null())) };
+        let mut ctx = Context::from_waker(&waker);
+
+        loop {
+            let _ = Pin::new(&mut *self).poll_next(&mut ctx);
+
+            let strong_count = self.ctx.strong_count();
+
+            if strong_count <= 1 {
+                break;
+            }
+        }
+        //assert_eq!(1, strong_count, "Packet stream dropped strong_count > 1");
+    }
+}
+
 impl<'a, Perms: PacketPerms, Param> PacketStream<'a, Perms, Param> {
     pub fn send_io(&self, param: Param, packet: impl Into<Packet<'a, Perms>>) {
         let packet = packet.into().bind(self);
@@ -162,12 +209,6 @@ pub struct PacketCtx<'a, Perms: PacketPerms, Param> {
 impl<'a, Perms: PacketPerms, Param> AsRef<PacketOutput<'a, Perms>> for PacketCtx<'a, Perms, Param> {
     fn as_ref(&self) -> &PacketOutput<'a, Perms> {
         &self.output
-    }
-}
-
-impl<'a, Perms: PacketPerms, Param> Drop for PacketCtx<'a, Perms, Param> {
-    fn drop(&mut self) {
-        //unsafe { Arc::decrement_strong_count(self.io) }
     }
 }
 

@@ -28,3 +28,7 @@ tarc = "0.1"
 tokio = { version = "1.24.2", features = ["rt", "macros", "rt-multi-thread"] }
 criterion = { version = "0.4", git = "https://github.com/h33p/criterion.rs", branch = "tput2", features = ["async_tokio", "async_smol", "async_futures"] }
 pollster = "0.2"
+
+[features]
+default = []
+stream_blocking_drop = []
