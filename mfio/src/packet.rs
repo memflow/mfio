@@ -16,15 +16,15 @@ type Output<'a, DataType> = (PacketObj<'a, DataType>, Option<()>);
 
 pub type BoxedFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-pub trait PacketIo<Perms: PacketPerms>: Sized {
+pub trait PacketIo<Perms: PacketPerms, Param>: Sized {
     fn separate_thread_state(&mut self);
 
     fn try_alloc_stream(
         &self,
         context: &mut Context,
-    ) -> Option<Pin<AllocHandle<PacketStream<'_, Perms>>>>;
+    ) -> Option<Pin<AllocHandle<PacketStream<'_, Perms, Param>>>>;
 
-    fn alloc_stream(&self) -> AllocStreamFut<'_, Self, Perms> {
+    fn alloc_stream(&self) -> AllocStreamFut<'_, Self, Perms, Param> {
         AllocStreamFut {
             this: self,
             poll_fn: Self::try_alloc_stream,
@@ -33,31 +33,33 @@ pub trait PacketIo<Perms: PacketPerms>: Sized {
 
     fn io<'a>(
         &'a self,
-        address: usize,
+        param: Param,
         packet: impl Into<Packet<'a, Perms>>,
-    ) -> IoFut<'a, Self, Perms> {
+    ) -> IoFut<'a, Self, Perms, Param> {
         IoFut {
             this: self,
             poll_fn: Self::try_alloc_stream,
-            state: Some((address, packet.into())),
+            state: Some((param, packet.into())),
         }
     }
 }
 
-pub struct IoFut<'a, T: PacketIo<Perms>, Perms: PacketPerms> {
+pub struct IoFut<'a, T: PacketIo<Perms, Param>, Perms: PacketPerms, Param> {
     this: &'a T,
     poll_fn: fn(&'a T, &mut Context) -> Option<<Self as Future>::Output>,
-    state: Option<(usize, Packet<'a, Perms>)>,
+    state: Option<(Param, Packet<'a, Perms>)>,
 }
 
-impl<'a, T: PacketIo<Perms>, Perms: PacketPerms> Future for IoFut<'a, T, Perms> {
-    type Output = <AllocStreamFut<'a, T, Perms> as Future>::Output;
+impl<'a, T: PacketIo<Perms, Param>, Perms: PacketPerms, Param> Future
+    for IoFut<'a, T, Perms, Param>
+{
+    type Output = <AllocStreamFut<'a, T, Perms, Param> as Future>::Output;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
         if let Some(stream) = (this.poll_fn)(this.this, cx) {
-            let (address, buffer) = this.state.take().unwrap();
-            stream.send_io(address, buffer);
+            let (param, buffer) = this.state.take().unwrap();
+            stream.send_io(param, buffer);
             Poll::Ready(stream)
         } else {
             Poll::Pending
@@ -65,13 +67,13 @@ impl<'a, T: PacketIo<Perms>, Perms: PacketPerms> Future for IoFut<'a, T, Perms> 
     }
 }
 
-pub struct AllocStreamFut<'a, T, Perms: PacketPerms> {
+pub struct AllocStreamFut<'a, T, Perms: PacketPerms, Param> {
     this: &'a T,
     poll_fn: fn(&'a T, &mut Context) -> Option<<Self as Future>::Output>,
 }
 
-impl<'a, T, Perms: PacketPerms> Future for AllocStreamFut<'a, T, Perms> {
-    type Output = Pin<AllocHandle<PacketStream<'a, Perms>>>;
+impl<'a, T, Perms: PacketPerms, Param> Future for AllocStreamFut<'a, T, Perms, Param> {
+    type Output = Pin<AllocHandle<PacketStream<'a, Perms, Param>>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         if let Some(stream) = (self.poll_fn)(self.this, cx) {
@@ -83,20 +85,20 @@ impl<'a, T, Perms: PacketPerms> Future for AllocStreamFut<'a, T, Perms> {
 }
 
 #[pin_project::pin_project]
-pub struct PacketStream<'a, Perms: PacketPerms> {
-    pub ctx: Arc<PacketCtx<'a, Perms>>,
+pub struct PacketStream<'a, Perms: PacketPerms, Param> {
+    pub ctx: Arc<PacketCtx<'a, Perms, Param>>,
     pub future: SharedFuture<BoxedFuture>,
 }
 
-impl<'a, Perms: PacketPerms> Stream for PacketStream<'a, Perms> {
+impl<'a, Perms: PacketPerms, Param> Stream for PacketStream<'a, Perms, Param> {
     type Item = Output<'a, Perms::DataType>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         let this = self.as_ref();
 
-        let closed = this.ctx.size.load(Ordering::Relaxed) <= 0;
+        let closed = this.ctx.output.size.load(Ordering::Relaxed) <= 0;
 
-        match this.ctx.output.lock().pop_front() {
+        match this.ctx.output.queue.lock().pop_front() {
             Some(elem) => return Poll::Ready(Some(elem)),
             _ if closed => return Poll::Ready(None),
             _ => {}
@@ -106,20 +108,20 @@ impl<'a, Perms: PacketPerms> Stream for PacketStream<'a, Perms> {
 
         // Try running the future once
         if this.future.try_run_once_sync(cx).is_some() {
-            if let Some(elem) = this.ctx.output.lock().pop_front() {
+            if let Some(elem) = this.ctx.output.queue.lock().pop_front() {
                 return Poll::Ready(Some(elem));
             }
         }
 
         // Install the waker. Note that after this we must check for end condition once more to
         // avoid deadlocks.
-        *this.ctx.wake.lock() = Some(cx.waker().clone());
+        *this.ctx.output.wake.lock() = Some(cx.waker().clone());
 
-        match this.ctx.output.lock().pop_front() {
+        match this.ctx.output.queue.lock().pop_front() {
             Some(elem) => return Poll::Ready(Some(elem)),
             // Check for one final time if we got closed while inserting the waker,
             // and if so, avoid returning Pending to avoid deadlock.
-            _ if this.ctx.size.load(Ordering::Acquire) <= 0 => return Poll::Ready(None),
+            _ if this.ctx.output.size.load(Ordering::Acquire) <= 0 => return Poll::Ready(None),
             _ => {}
         }
 
@@ -127,54 +129,75 @@ impl<'a, Perms: PacketPerms> Stream for PacketStream<'a, Perms> {
     }
 }
 
-impl<'a, Perms: PacketPerms> PacketStream<'a, Perms> {
-    pub fn send_io(&self, address: usize, packet: impl Into<Packet<'a, Perms>>) {
+impl<'a, Perms: PacketPerms, Param> PacketStream<'a, Perms, Param> {
+    pub fn send_io(&self, param: Param, packet: impl Into<Packet<'a, Perms>>) {
         let packet = packet.into().bind(self);
-        PacketIoHandle::send_input(&self.ctx.io, address, packet);
+        PacketIoHandle::send_input(&self.ctx.io, param, packet);
     }
 }
 
 #[derive(Debug)]
-pub struct PacketCtx<'a, Perms: PacketPerms> {
-    pub io: Arc<PacketIoHandle<'a, Perms>>,
-    pub output: Mutex<VecDeque<Output<'a, Perms::DataType>>>,
+pub struct PacketOutput<'a, Perms: PacketPerms> {
+    pub queue: Mutex<VecDeque<Output<'a, <Perms as PacketPerms>::DataType>>>,
     pub size: AtomicIsize,
     pub wake: Mutex<Option<Waker>>,
 }
 
-impl<'a, Perms: PacketPerms> Drop for PacketCtx<'a, Perms> {
+impl<'a, Perms: PacketPerms> Default for PacketOutput<'a, Perms> {
+    fn default() -> Self {
+        Self {
+            queue: Default::default(),
+            wake: Default::default(),
+            size: 0.into(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct PacketCtx<'a, Perms: PacketPerms, Param> {
+    pub io: Arc<PacketIoHandle<'a, Perms, Param>>,
+    pub output: PacketOutput<'a, Perms>,
+}
+
+impl<'a, Perms: PacketPerms, Param> AsRef<PacketOutput<'a, Perms>> for PacketCtx<'a, Perms, Param> {
+    fn as_ref(&self) -> &PacketOutput<'a, Perms> {
+        &self.output
+    }
+}
+
+impl<'a, Perms: PacketPerms, Param> Drop for PacketCtx<'a, Perms, Param> {
     fn drop(&mut self) {
         //unsafe { Arc::decrement_strong_count(self.io) }
     }
 }
 
-impl<'a, Perms: PacketPerms> PacketCtx<'a, Perms> {
-    pub fn new<T: IntoIoHandle<'a, Perms>>(read_io: BaseArc<T>) -> Self {
+impl<'a, Perms: PacketPerms, Param> PacketCtx<'a, Perms, Param> {
+    pub fn new<T: IntoIoHandle<'a, Perms, Param>>(read_io: BaseArc<T>) -> Self {
         Self {
             output: Default::default(),
-            wake: Default::default(),
-            size: 0.into(),
             io: IntoIoHandle::into_handle(read_io),
         }
     }
 }
 
-pub trait IntoIoHandle<'a, Perms: PacketPerms> {
-    fn into_handle(this: BaseArc<Self>) -> Arc<PacketIoHandle<'a, Perms>>;
+pub trait IntoIoHandle<'a, Perms: PacketPerms, Param> {
+    fn into_handle(this: BaseArc<Self>) -> Arc<PacketIoHandle<'a, Perms, Param>>;
 }
 
-impl<'a, T: AsRef<PacketIoHandle<'a, Perms>>, Perms: PacketPerms> IntoIoHandle<'a, Perms> for T {
-    fn into_handle(this: BaseArc<Self>) -> Arc<PacketIoHandle<'a, Perms>> {
+impl<'a, T: AsRef<PacketIoHandle<'a, Perms, Param>>, Perms: PacketPerms, Param>
+    IntoIoHandle<'a, Perms, Param> for T
+{
+    fn into_handle(this: BaseArc<Self>) -> Arc<PacketIoHandle<'a, Perms, Param>> {
         this.transpose()
     }
 }
 
-pub trait PacketIoHandleable<'a, Perms: PacketPerms> {
-    extern "C" fn send_input(&self, address: usize, buffer: BoundPacket<'a, Perms>);
+pub trait PacketIoHandleable<'a, Perms: PacketPerms, Param> {
+    extern "C" fn send_input(&self, param: Param, buffer: BoundPacket<'a, Perms>);
     extern "C" fn flush(&self);
 }
 
-impl<'a, Perms: PacketPerms> core::fmt::Debug for PacketIoHandle<'a, Perms> {
+impl<'a, Perms: PacketPerms, Param> core::fmt::Debug for PacketIoHandle<'a, Perms, Param> {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
         write!(
             fmt,
@@ -185,12 +208,12 @@ impl<'a, Perms: PacketPerms> core::fmt::Debug for PacketIoHandle<'a, Perms> {
 }
 
 #[repr(C)]
-pub struct PacketIoHandle<'a, Perms: PacketPerms> {
-    send_input: unsafe extern "C" fn(*const (), usize, BoundPacket<'a, Perms>),
+pub struct PacketIoHandle<'a, Perms: PacketPerms, Param> {
+    send_input: unsafe extern "C" fn(*const (), Param, BoundPacket<'a, Perms>),
     flush: unsafe extern "C" fn(*const ()),
 }
 
-impl<'a, Perms: PacketPerms> PacketIoHandle<'a, Perms> {
+impl<'a, Perms: PacketPerms, Param> PacketIoHandle<'a, Perms, Param> {
     /// Create a new PacketIoHandle vtable
     ///
     /// # Safety
@@ -198,16 +221,16 @@ impl<'a, Perms: PacketPerms> PacketIoHandle<'a, Perms> {
     /// The caller must ensure that T contains one, and only one instance of `PacketIoHandle`, and it
     /// is located at the very start of the structure. T must also ensure that its drop
     /// implementation does not drop the underlying `PacketIoHandle`.
-    pub unsafe fn new<T: PacketIoHandleable<'a, Perms>>() -> Self {
+    pub unsafe fn new<T: PacketIoHandleable<'a, Perms, Param>>() -> Self {
         Self {
             send_input: unsafe { core::mem::transmute(T::send_input as extern "C" fn(_, _, _)) },
             flush: unsafe { core::mem::transmute(T::flush as extern "C" fn(_)) },
         }
     }
 
-    fn send_input(this: &Arc<Self>, address: usize, buffer: BoundPacket<'a, Perms>) {
+    fn send_input(this: &Arc<Self>, param: Param, buffer: BoundPacket<'a, Perms>) {
         // We must use raw ptr in order to satisfy miri stacked borrows rules
-        unsafe { (this.send_input)(this.as_original_ptr::<()>(), address, buffer) };
+        unsafe { (this.send_input)(this.as_original_ptr::<()>(), param, buffer) };
     }
 
     fn flush(this: &Arc<Self>) {
@@ -473,13 +496,13 @@ impl core::ops::Deref for ReadPacketObj<'_> {
 }
 
 impl<'a, Perms: PacketPerms> Packet<'a, Perms> {
-    pub fn bind(self, stream: &PacketStream<'a, Perms>) -> BoundPacket<'a, Perms> {
+    pub fn bind<Param>(self, stream: &PacketStream<'a, Perms, Param>) -> BoundPacket<'a, Perms> {
         let Packet { obj, vtable } = self;
-        stream.ctx.size.fetch_add(1, Ordering::Acquire);
+        stream.ctx.output.size.fetch_add(1, Ordering::Acquire);
         BoundPacket {
             obj: BoundPacketObj {
                 buffer: ManuallyDrop::new(obj),
-                output: stream.ctx.clone(),
+                output: stream.ctx.clone().transpose(),
             },
             vtable,
         }
@@ -490,13 +513,13 @@ impl<'a, Perms: PacketPerms> Packet<'a, Perms> {
 #[repr(C)]
 pub struct BoundPacketObj<'a, T: PacketPerms> {
     buffer: ManuallyDrop<PacketObj<'a, T::DataType>>,
-    output: Arc<PacketCtx<'a, T>>,
+    output: Arc<PacketOutput<'a, T>>,
 }
 
 impl<'a, T: PacketPerms> Drop for BoundPacketObj<'a, T> {
     fn drop(&mut self) {
         self.output
-            .output
+            .queue
             .lock()
             .push_back((unsafe { ManuallyDrop::take(&mut self.buffer) }, None));
         self.output.size.fetch_sub(1, Ordering::Release);

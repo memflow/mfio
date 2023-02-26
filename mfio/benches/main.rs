@@ -103,7 +103,7 @@ fn allocations(c: &mut Criterion) {
                     for _ in 0..iters {
                         let streams = (0..size)
                             .into_iter()
-                            .map(|_| PacketIo::<Write>::alloc_stream(&handle))
+                            .map(|_| PacketIo::<Write, _>::alloc_stream(&handle))
                             .collect::<Vec<_>>();
                         let futures = futures::future::join_all(streams);
 

@@ -1,3 +1,9 @@
+//! # mfio
+//!
+//! ## Completion based I/O primitives
+//!
+//! mfio is memflow's async completion based I/O base.
+
 pub mod heap;
 pub mod packet;
 pub mod shared_future;
@@ -123,7 +129,7 @@ mod tests {
         let jobs_in_flight = (1..=2)
             .map(|i| {
                 let mut handle = handle.clone();
-                PacketIo::<Write>::separate_thread_state(&mut handle);
+                PacketIo::<Write, _>::separate_thread_state(&mut handle);
                 async move {
                     println!("Multiple reads in-flight MT:");
 

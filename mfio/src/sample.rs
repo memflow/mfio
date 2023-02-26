@@ -11,13 +11,15 @@ use tarc::{Arc, BaseArc};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 
-struct IoThreadHandle<PERMS: PacketPerms> {
-    handle: PacketIoHandle<'static, PERMS>,
-    input: Mutex<VecDeque<(usize, BoundPacket<'static, PERMS>)>>,
+type Address = usize;
+
+struct IoThreadHandle<Perms: PacketPerms> {
+    handle: PacketIoHandle<'static, Perms, Address>,
+    input: Mutex<VecDeque<(usize, BoundPacket<'static, Perms>)>>,
     flush: (AtomicBool, Event),
 }
 
-impl<PERMS: PacketPerms> Default for IoThreadHandle<PERMS> {
+impl<Perms: PacketPerms> Default for IoThreadHandle<Perms> {
     fn default() -> Self {
         Self {
             handle: unsafe { PacketIoHandle::new::<Self>() },
@@ -27,14 +29,14 @@ impl<PERMS: PacketPerms> Default for IoThreadHandle<PERMS> {
     }
 }
 
-impl<PERMS: PacketPerms> AsRef<PacketIoHandle<'static, PERMS>> for IoThreadHandle<PERMS> {
-    fn as_ref(&self) -> &PacketIoHandle<'static, PERMS> {
+impl<Perms: PacketPerms> AsRef<PacketIoHandle<'static, Perms, Address>> for IoThreadHandle<Perms> {
+    fn as_ref(&self) -> &PacketIoHandle<'static, Perms, Address> {
         &self.handle
     }
 }
 
-impl<PERMS: PacketPerms> PacketIoHandleable<'static, PERMS> for IoThreadHandle<PERMS> {
-    extern "C" fn send_input(&self, address: usize, packet: BoundPacket<'static, PERMS>) {
+impl<Perms: PacketPerms> PacketIoHandleable<'static, Perms, Address> for IoThreadHandle<Perms> {
+    extern "C" fn send_input(&self, address: usize, packet: BoundPacket<'static, Perms>) {
         self.input.lock().push_back((address, packet))
     }
 
@@ -162,18 +164,18 @@ impl IoThreadState {
 
 #[derive(Clone)]
 pub struct SampleIo {
-    read_streams: Arc<PinHeap<PacketStream<'static, Write>>>,
-    write_streams: Arc<PinHeap<PacketStream<'static, Read>>>,
+    read_streams: Arc<PinHeap<PacketStream<'static, Write, Address>>>,
+    write_streams: Arc<PinHeap<PacketStream<'static, Read, Address>>>,
     thread_state: IoThreadState,
 }
 
-impl PacketIo<Read> for SampleIo {
+impl PacketIo<Read, Address> for SampleIo {
     fn separate_thread_state(&mut self) {
         self.write_streams = Default::default();
         self.thread_state = Default::default();
     }
 
-    fn try_alloc_stream(&self, _: &mut Context) -> Option<Pin<AllocHandle<PacketStream<Read>>>> {
+    fn try_alloc_stream(&self, _: &mut Context) -> Option<Pin<AllocHandle<PacketStream<Read, Address>>>> {
         let stream = PinHeap::alloc_or_cached(
             self.write_streams.clone(),
             || {
@@ -189,9 +191,9 @@ impl PacketIo<Read> for SampleIo {
                 if e.ctx.strong_count() > 1 {
                     e.ctx = Arc::new(PacketCtx::new(self.thread_state.write_io.clone()));
                 } else {
-                    e.ctx.output.lock().clear();
-                    *e.ctx.wake.lock() = None;
-                    e.ctx.size.store(0, Ordering::Relaxed);
+                    e.ctx.output.queue.lock().clear();
+                    *e.ctx.output.wake.lock() = None;
+                    e.ctx.output.size.store(0, Ordering::Relaxed);
                 }
                 // No need to clone the future - it's the same future!
                 //e.future = self.future.clone();
@@ -204,13 +206,13 @@ impl PacketIo<Read> for SampleIo {
     }
 }
 
-impl PacketIo<Write> for SampleIo {
+impl PacketIo<Write, Address> for SampleIo {
     fn separate_thread_state(&mut self) {
         self.read_streams = Default::default();
         self.thread_state = Default::default();
     }
 
-    fn try_alloc_stream(&self, _: &mut Context) -> Option<Pin<AllocHandle<PacketStream<Write>>>> {
+    fn try_alloc_stream(&self, _: &mut Context) -> Option<Pin<AllocHandle<PacketStream<Write, Address>>>> {
         let stream = PinHeap::alloc_or_cached(
             self.read_streams.clone(),
             || {
@@ -226,9 +228,9 @@ impl PacketIo<Write> for SampleIo {
                 if e.ctx.strong_count() > 1 {
                     e.ctx = Arc::new(PacketCtx::new(self.thread_state.read_io.clone()));
                 } else {
-                    e.ctx.output.lock().clear();
-                    *e.ctx.wake.lock() = None;
-                    e.ctx.size.store(0, Ordering::Relaxed);
+                    e.ctx.output.queue.lock().clear();
+                    *e.ctx.output.wake.lock() = None;
+                    e.ctx.output.size.store(0, Ordering::Relaxed);
                 }
                 // No need to clone the future - it's the same future!
                 //e.future = self.future.clone();
