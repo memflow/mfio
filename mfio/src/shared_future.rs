@@ -131,33 +131,6 @@ pub enum SharedFutureOutput<T> {
 }
 
 impl<F: Future> SharedFuture<F> {
-    /*pub async fn run_till_finished(self) {
-        loop {
-            match SharedFutureWrapper(&self).await {
-                SharedFutureOutput::AlreadyFinished | SharedFutureOutput::JustFinished(_) => return,
-                _ => {}
-            }
-
-            // Yield once to avoid deadlock
-            let mut yielded = false;
-
-            core::future::poll_fn(|cx| {
-                if !yielded {
-                    yielded = true;
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                } else {
-                    Poll::Ready(())
-                }
-            })
-            .await;
-        }
-    }*/
-
-    pub fn run_once(&self) -> SharedFutureWrapper<'_, F> {
-        SharedFutureWrapper(self)
-    }
-
     pub fn try_run_once_sync(
         &self,
         cx: &mut Context<'_>,
@@ -208,14 +181,12 @@ impl<F: Future> SharedFuture<F> {
     }
 }
 
-pub struct SharedFutureWrapper<'a, F>(&'a SharedFuture<F>);
-
-impl<F: Future> Future for SharedFutureWrapper<'_, F> {
+impl<F: Future> Future for &'_ SharedFuture<F> {
     type Output = SharedFutureOutput<F::Output>;
 
     #[inline(always)]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.as_ref().0;
+        let this = self.as_ref();
 
         this.try_run_once_sync(cx)
             .unwrap_or(Poll::Ready(SharedFutureOutput::Running))

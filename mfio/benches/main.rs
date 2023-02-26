@@ -12,6 +12,9 @@ use tokio::runtime::Runtime as TokioRuntime;
 use sample::*;
 
 mod sample {
+    use mfio::heap::{AllocHandle, PinHeap};
+    use mfio::packet::*;
+    use mfio::shared_future::SharedFuture;
     include!("../src/sample.rs");
 }
 

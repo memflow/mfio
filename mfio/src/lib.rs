@@ -2,13 +2,149 @@
 //!
 //! ## Completion based I/O primitives
 //!
-//! mfio is memflow's async completion based I/O base.
+//! mfio is memflow's async completion based I/O base. It aims to make the following aspects of an
+//! I/O chain as simple as possible:
+//!
+//! 1. Async
+//! 2. Automatic batching
+//! 3. Fragmentation
+//! 4. Partial success
+//!
+//! One could view mfio as _programmable I/O_, because native fragmentation support allows one to
+//! map non-linear I/O space into a linear space. This is incredibly useful for interpretation of
+//! process virtual address space on top of physical address space. Async operation allows to queue
+//! up multiple I/O operations simultaneously and have them automatically batched up by the I/O
+//! implementation. This results in the highest performance possible in scenarios where dispatching
+//! a single I/O operation incurs heavy latency. Batching queues up operations and issues fewer
+//! calls for the same amount of I/O. Partial success is critical in fragmentable context. Unlike
+//! typical I/O interfaces, mfio does not enforce sequence of operations. A single packet may get
+//! partially read/written, depending on which parts of the underlying I/O space is available. This
+//! works really well with sparse files, albeit differs from the typical "stop as soon as an error
+//! occurs" model.
+//!
+//! ## Safety
+//!
+//! mfio can invoke UB in safe code if `mem::forget` is run on a packet stream and data sent to the
+//! stream gets reused.
+//!
+//! ### Safety examples
+//!
+//! Wrong:
+//!
+//! ```rust no_run
+//! # mod sample {
+//! #     use mfio::heap::{AllocHandle, PinHeap};
+//! #     use mfio::packet::*;
+//! #     use mfio::shared_future::SharedFuture;
+//! #     include!("sample.rs");
+//! # }
+//! # use sample::SampleIo;
+//! # pollster::block_on(async move {
+//! use mfio::packet::{PacketIo, Write};
+//! use core::mem::MaybeUninit;
+//! use futures::{Stream, StreamExt};
+//!
+//! let handle = SampleIo::default();
+//!
+//! {
+//!     let mut data = [MaybeUninit::uninit()];
+//!
+//!     let stream = handle.alloc_stream().await;
+//!
+//!     stream.send_io(0, &mut data);
+//!
+//!     // Unsafe! data is reused directly after the call.
+//!     core::mem::forget(stream);
+//!
+//!     data[0] = MaybeUninit::new(4);
+//! }
+//!
+//! let mut data = [MaybeUninit::uninit()];
+//!
+//! // This will process both I/O streams, even though the previous one was forgotten.
+//! let _ = handle.io(0, &mut data).await.count().await;
+//! # });
+//! ```
+//!
+//! ```rust no_run
+//! # mod sample {
+//! #     use mfio::heap::{AllocHandle, PinHeap};
+//! #     use mfio::packet::*;
+//! #     use mfio::shared_future::SharedFuture;
+//! #     include!("sample.rs");
+//! # }
+//! # use sample::SampleIo;
+//! # pollster::block_on(async move {
+//! use mfio::packet::{PacketIo, Write};
+//! use core::mem::MaybeUninit;
+//! use futures::{Stream, StreamExt};
+//!
+//! let handle = SampleIo::default();
+//!
+//! {
+//!     let mut data = [MaybeUninit::uninit()];
+//!
+//!     let stream = handle.alloc_stream().await;
+//!
+//!     stream.send_io(0, &mut data);
+//!
+//!     // Unsafe! data is dropped, and its memory is reused later outside the scope
+//!     core::mem::forget(stream);
+//! }
+//!
+//! let mut data = [MaybeUninit::uninit()];
+//!
+//! // This will process both I/O streams, even though the previous one was forgotten.
+//! let _ = handle.io(0, &mut data).await.count().await;
+//! # });
+//! ```
+//!
+//! Okay:
+//!
+//! ```rust
+//! # mod sample {
+//! #     use mfio::heap::{AllocHandle, PinHeap};
+//! #     use mfio::packet::*;
+//! #     use mfio::shared_future::SharedFuture;
+//! #     include!("sample.rs");
+//! # }
+//! # use sample::SampleIo;
+//! # pollster::block_on(async move {
+//! use mfio::packet::{PacketIo, Write};
+//! use core::mem::MaybeUninit;
+//! use futures::{Stream, StreamExt};
+//!
+//! let handle = SampleIo::default();
+//!
+//! {
+//!     let mut data = Box::leak(vec![MaybeUninit::uninit()].into_boxed_slice());
+//!
+//!     let stream = handle.alloc_stream().await;
+//!
+//!     stream.send_io(0, &mut data);
+//!
+//!     // Okay! Data has been leaked to the heap.
+//!     // In addition, we don't touch the data afterwards!
+//!     core::mem::forget(stream);
+//! }
+//!
+//! let mut data = [MaybeUninit::uninit()];
+//!
+//! // This will process both I/O streams, even though the previous one was forgotten.
+//! // Processing a forgotten stream is okay, because it was allocated on the `SampleIo` heap,
+//! // instead of the stack.
+//! let _ = handle.io(0, &mut data).await.count().await;
+//! # });
+//! ```
 
 pub mod heap;
 pub mod packet;
 pub mod shared_future;
 #[cfg(test)]
 mod sample {
+    use crate::heap::{AllocHandle, PinHeap};
+    use crate::packet::*;
+    use crate::shared_future::SharedFuture;
     include!("sample.rs");
 }
 
