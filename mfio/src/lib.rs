@@ -154,7 +154,7 @@ mod tests {
     use packet::PacketIo;
 
     use super::*;
-    use crate::packet::{PacketStream, Write};
+    use crate::packet::Write;
     use crate::sample::SampleIo;
     use core::mem::MaybeUninit;
     use futures::StreamExt;

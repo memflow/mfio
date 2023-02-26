@@ -160,6 +160,7 @@ impl IoThreadState {
 }
 
 #[derive(Clone)]
+#[derive(Default)]
 pub struct SampleIo {
     read_streams: Arc<PinHeap<PacketStream<'static, Write, Address>>>,
     write_streams: Arc<PinHeap<PacketStream<'static, Read, Address>>>,
@@ -240,12 +241,4 @@ impl PacketIo<Write, Address> for SampleIo {
     }
 }
 
-impl Default for SampleIo {
-    fn default() -> Self {
-        SampleIo {
-            read_streams: Default::default(),
-            write_streams: Default::default(),
-            thread_state: Default::default(),
-        }
-    }
-}
+

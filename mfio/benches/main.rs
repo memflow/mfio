@@ -191,7 +191,7 @@ fn reads_tasked(c: &mut Criterion) {
             let handle = &SampleIo::default();
             let size = 1024 / tasks;
 
-            group.throughput(Throughput::Elements(size as u64 * tasks));
+            group.throughput(Throughput::Elements(size * tasks));
 
             group.bench_function(
                 BenchmarkId::new(
