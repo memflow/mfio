@@ -1,6 +1,5 @@
 use crate::packet::*;
 use bytemuck::Pod;
-use core::cell::UnsafeCell;
 use core::future::Future;
 use core::mem::MaybeUninit;
 use core::pin::Pin;
@@ -211,7 +210,7 @@ impl<'a, Io: PacketIo<Write, Param>, Param: Copy + core::ops::AddAssign<usize>> 
                     Poll::Ready(Some((pkt, err))) => {
                         // We failed, thus cap the buffer length, complete queued I/O, but do not
                         // perform any further reads.
-                        if let Some(_) = err {
+                        if err.is_some() {
                             let new_end = pkt.end();
                             let end = final_cap.get_or_insert(new_end);
                             *end = core::cmp::min(*end, new_end);

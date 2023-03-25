@@ -21,7 +21,7 @@ pub trait PacketIo<Perms: PacketPerms, Param>: Sized {
         context: &mut Context,
     ) -> Option<Pin<AllocHandle<PacketStream<'a, Perms, Param>>>>;
 
-    fn alloc_stream<'a>(&'a self) -> AllocStreamFut<'a, Self, Perms, Param> {
+    fn alloc_stream(&self) -> AllocStreamFut<Self, Perms, Param> {
         AllocStreamFut {
             this: self,
             poll_fn: Self::try_alloc_stream,
@@ -121,7 +121,7 @@ impl<'a, Perms: PacketPerms, Param> Stream for PacketStream<'a, Perms, Param> {
     }
 }
 
-fn release_stream<'a, Perms: PacketPerms, Param>(stream: &mut PacketStream<'a, Perms, Param>) {
+fn release_stream<Perms: PacketPerms, Param>(stream: &mut PacketStream<Perms, Param>) {
     assert_eq!(
         1,
         stream.ctx.strong_count(),

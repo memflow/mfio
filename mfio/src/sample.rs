@@ -92,7 +92,6 @@ unsafe impl Sync for VolatileMem {}
 
 impl Drop for VolatileMem {
     fn drop(&mut self) {
-        println!("Drop mem");
         unsafe {
             let _ = Box::from_raw(core::slice::from_raw_parts_mut(self.buf, self.len));
         }
@@ -149,12 +148,8 @@ impl IoThreadState {
                     // try_pop here many elems
                     {
                         let mut input = read_io.input.lock();
-                        loop {
-                            match input.pop_front() {
-                                Some(inp) => proc_inp(inp),
-                                //Err(concurrent_queue::PopError::Closed) => return,
-                                _ => break,
-                            }
+                        while let Some(inp) = input.pop_front() {
+                            proc_inp(inp);
                         }
                     }
 
@@ -201,12 +196,8 @@ impl IoThreadState {
                     // try_pop here many elems
                     {
                         let mut input = write_io.input.lock();
-                        loop {
-                            match input.pop_front() {
-                                Some(inp) => proc_inp(inp),
-                                //Err(concurrent_queue::PopError::Closed) => return,
-                                _ => break,
-                            }
+                        while let Some(inp) = input.pop_front() {
+                            proc_inp(inp);
                         }
                     }
                 }
