@@ -1,7 +1,7 @@
 use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
-use core::task::Context;
+use core::task::{Context, Waker};
 use event_listener::Event;
 
 use tarc::{Arc, BaseArc};
@@ -13,7 +13,10 @@ type Address = usize;
 
 struct IoThreadHandle<Perms: PacketPerms> {
     handle: PacketIoHandle<'static, Perms, Address>,
-    input: Mutex<VecDeque<(usize, BoundPacket<'static, Perms>)>>,
+    input: Mutex<(
+        VecDeque<(usize, BoundPacket<'static, Perms>)>,
+        Option<Waker>,
+    )>,
     flush: (AtomicBool, Event),
 }
 
@@ -35,7 +38,12 @@ impl<Perms: PacketPerms> AsRef<PacketIoHandle<'static, Perms, Address>> for IoTh
 
 impl<Perms: PacketPerms> PacketIoHandleable<'static, Perms, Address> for IoThreadHandle<Perms> {
     extern "C" fn send_input(&self, address: usize, packet: BoundPacket<'static, Perms>) {
-        self.input.lock().push_back((address, packet))
+        let mut guard = self.input.lock();
+        let (input, waker) = &mut *guard;
+        input.push_back((address, packet));
+        if let Some(waker) = waker.take() {
+            waker.wake()
+        }
     }
 
     extern "C" fn flush(&self) {
@@ -107,39 +115,28 @@ pub struct IoThreadState {
 }
 
 impl IoThreadState {
-    fn new(io: &SampleIo) -> (Self, BoxedFuture) {
-        let read_io = BaseArc::new(IoThreadHandle::default());
-        let write_io = BaseArc::new(IoThreadHandle::default());
+    fn new(io: &SampleIo) -> (Self, BoxedFuture, Arc<AtomicBool>) {
+        // Reuse local thread state if current thread only
+        let read_io = if io.read_io.strong_count() == 1 {
+            io.read_io.clone()
+        } else {
+            Default::default()
+        };
+        let write_io = if io.write_io.strong_count() == 1 {
+            io.write_io.clone()
+        } else {
+            Default::default()
+        };
+
+        let progressed = Arc::new(AtomicBool::new(false));
 
         let read = {
             let mem = io.mem.clone();
             let read_io = read_io.clone();
+            let progressed = progressed.clone();
 
             async move {
                 loop {
-                    if !read_io.flush.0.load(Ordering::Acquire) {
-                        let listen = read_io.flush.1.listen();
-                        if !read_io.flush.0.load(Ordering::Acquire) {
-                            listen.await;
-                        }
-                    }
-
-                    read_io.flush.0.store(false, Ordering::Release);
-
-                    let mut yielded = false;
-
-                    core::future::poll_fn(|cx| {
-                        if !yielded {
-                            yielded = true;
-                            cx.waker().wake_by_ref();
-                            core::task::Poll::Pending
-                        } else {
-                            core::task::Poll::Ready(())
-                        }
-                    })
-                    .await;
-
-                    //CNT.fetch_add(1, Ordering::Relaxed);
                     let proc_inp = |(addr, buf): (usize, BoundPacket<'static, Write>)| {
                         let mut pkt = buf.get_mut();
                         mem.read(addr, &mut pkt);
@@ -147,28 +144,32 @@ impl IoThreadState {
 
                     // try_pop here many elems
                     {
-                        let mut input = read_io.input.lock();
-                        while let Some(inp) = input.pop_front() {
+                        let mut guard = read_io.input.lock();
+
+                        let mut p = false;
+
+                        while let Some(inp) = guard.0.pop_front() {
                             proc_inp(inp);
+                            p = true;
+                        }
+
+                        if p {
+                            progressed.store(p, Ordering::Relaxed);
                         }
                     }
-
-                    //std::thread::sleep(std::time::Duration::from_micros(1000));
-
-                    /*std::thread::yield_now();
 
                     let mut yielded = false;
 
                     core::future::poll_fn(|cx| {
                         if !yielded {
+                            read_io.input.lock().1 = Some(cx.waker().clone());
                             yielded = true;
-                            cx.waker().wake_by_ref();
-                            Poll::Pending
+                            core::task::Poll::Pending
                         } else {
-                            Poll::Ready(())
+                            core::task::Poll::Ready(())
                         }
                     })
-                    .await;*/
+                    .await;
                 }
             }
         };
@@ -176,18 +177,10 @@ impl IoThreadState {
         let write = {
             let mem = io.mem.clone();
             let write_io = write_io.clone();
+            let progressed = progressed.clone();
 
             async move {
                 loop {
-                    if !write_io.flush.0.load(Ordering::Acquire) {
-                        let listen = write_io.flush.1.listen();
-                        if !write_io.flush.0.load(Ordering::Acquire) {
-                            listen.await;
-                        }
-                    }
-
-                    write_io.flush.0.store(false, Ordering::Release);
-
                     let proc_inp = |(pos, buf): (usize, BoundPacket<'static, Read>)| {
                         let pkt = buf.get();
                         mem.write(pos, &pkt);
@@ -195,11 +188,32 @@ impl IoThreadState {
 
                     // try_pop here many elems
                     {
-                        let mut input = write_io.input.lock();
-                        while let Some(inp) = input.pop_front() {
+                        let mut guard = write_io.input.lock();
+
+                        let mut p = false;
+
+                        while let Some(inp) = guard.0.pop_front() {
                             proc_inp(inp);
+                            p = true;
+                        }
+
+                        if p {
+                            progressed.store(p, Ordering::Relaxed);
                         }
                     }
+
+                    let mut yielded = false;
+
+                    core::future::poll_fn(|cx| {
+                        if !yielded {
+                            write_io.input.lock().1 = Some(cx.waker().clone());
+                            yielded = true;
+                            core::task::Poll::Pending
+                        } else {
+                            core::task::Poll::Ready(())
+                        }
+                    })
+                    .await;
                 }
             }
         };
@@ -217,12 +231,15 @@ impl IoThreadState {
                 write_streams: io.write_streams.clone(),
             },
             future,
+            progressed,
         )
     }
 }
 
 #[derive(Clone)]
 pub struct SampleIo {
+    read_io: BaseArc<IoThreadHandle<Write>>,
+    write_io: BaseArc<IoThreadHandle<Read>>,
     read_streams: Arc<PinHeap<PacketStream<'static, Write, Address>>>,
     write_streams: Arc<PinHeap<PacketStream<'static, Read, Address>>>,
     mem: Arc<VolatileMem>,
@@ -238,7 +255,12 @@ impl SampleIo {
     pub fn new(mem: Vec<u8>) -> Self {
         let mem = Arc::new(mem.into());
 
+        let read_io = BaseArc::new(IoThreadHandle::default());
+        let write_io = BaseArc::new(IoThreadHandle::default());
+
         Self {
+            read_io,
+            write_io,
             read_streams: Default::default(),
             write_streams: Default::default(),
             mem,
@@ -250,7 +272,7 @@ impl IoHandle for SampleIo {
     type BackendFuture = BoxedFuture;
     type Backend = IoThreadState;
 
-    fn local_backend(&self) -> (Self::Backend, Self::BackendFuture) {
+    fn local_backend(&self) -> (Self::Backend, Self::BackendFuture, Arc<AtomicBool>) {
         IoThreadState::new(self)
     }
 }

@@ -103,20 +103,19 @@ impl<'a, Perms: PacketPerms, Param> Stream for PacketStream<'a, Perms, Param> {
         // TODO: decide on threading assumptions. I.e. Do we need to flush if this is running in a
         // single-threaded scope?
 
-        PacketIoHandle::flush(&this.ctx.io);
+        //PacketIoHandle::flush(&this.ctx.io);
 
         // Install the waker. Note that after this we must check for end condition once more to
         // avoid deadlocks.
         *this.ctx.output.wake.lock() = Some(cx.waker().clone());
 
-        match this.ctx.output.queue.lock().pop_front() {
+        /*match this.ctx.output.queue.lock().pop_front() {
             Some(elem) => return Poll::Ready(Some(elem)),
             // Check for one final time if we got closed while inserting the waker,
             // and if so, avoid returning Pending to avoid deadlock.
             _ if this.ctx.output.size.load(Ordering::Acquire) <= 0 => return Poll::Ready(None),
             _ => {}
-        }
-
+        }*/
         Poll::Pending
     }
 }
