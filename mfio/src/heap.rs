@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tarc::Arc;
 
 #[allow(clippy::type_complexity)]
-pub struct PinHeap<T> {
+pub struct PinHeap<T: Release> {
     data: [UnsafeCell<Option<Box<[MaybeUninit<T>]>>>; 32],
     shards: Mutex<usize>,
     cached_elems_len: AtomicUsize,
@@ -15,10 +15,10 @@ pub struct PinHeap<T> {
     free_elems: Mutex<VecDeque<(usize, usize)>>,
 }
 
-unsafe impl<T> Send for PinHeap<T> {}
-unsafe impl<T> Sync for PinHeap<T> {}
+unsafe impl<T: Release> Send for PinHeap<T> {}
+unsafe impl<T: Release> Sync for PinHeap<T> {}
 
-impl<T> Default for PinHeap<T> {
+impl<T: Release> Default for PinHeap<T> {
     #[allow(clippy::uninit_assumed_init)]
     fn default() -> Self {
         Self {
@@ -31,7 +31,7 @@ impl<T> Default for PinHeap<T> {
     }
 }
 
-impl<T> Drop for PinHeap<T> {
+impl<T: Release> Drop for PinHeap<T> {
     fn drop(&mut self) {
         if core::mem::needs_drop::<T>() {
             let mut guard = self.cached_elems.lock();
@@ -39,11 +39,15 @@ impl<T> Drop for PinHeap<T> {
                 // SAFETY: we have exclusive access to the element on the shard
                 // that has been fully allocated.
                 unsafe {
-                    let shard = &mut *self.data[shard_id].get();
-                    let shard = shard.as_mut().unwrap_unchecked();
-                    // Intentionally drop the slice metadata so that there is no pointer retagging
-                    // happening in MIR
-                    let shard = shard as *mut Box<_> as *mut *mut MaybeUninit<T>;
+                    let shard = self.data[shard_id].get();
+                    // Here we would have an intermediary step of taking &mut Option and unwrapping it,
+                    // but that would cause data race in miri. Since we are certain that the value is
+                    // Some(_), and *mut Option<Box<T>> is equivalent to *mut *mut T (because
+                    // Option<Box<T>> is equivalent to *mut T), we can ignore the unwrap and instead cast
+                    // `*mut Option<Box<T>>` directly into `*mut *mut T`.
+                    let shard = shard as *mut Box<MaybeUninit<T>> as *mut *mut MaybeUninit<T>;
+                    // In addition, do manual pointer addition to drop slice metadata, in order to avoid
+                    // pointer retagging happening in MIR.
                     let elem = (*shard).add(idx);
                     core::ptr::drop_in_place(elem as *mut T);
                 };
@@ -52,7 +56,7 @@ impl<T> Drop for PinHeap<T> {
     }
 }
 
-impl<T> PinHeap<T> {
+impl<T: Release> PinHeap<T> {
     pub fn alloc_pin(this: Arc<Self>, value: T) -> Pin<AllocHandle<T>> {
         Self::alloc(this, value).into()
     }
@@ -66,11 +70,15 @@ impl<T> PinHeap<T> {
         if let Some((shard_id, idx)) = elem {
             this.cached_elems_len.fetch_sub(1, Ordering::Relaxed);
             let data = unsafe {
-                let shard = &mut *this.data[shard_id].get();
-                let shard = shard.as_mut().unwrap_unchecked();
-                // Intentionally drop the slice metadata so that there is no pointer retagging
-                // happening in MIR
-                let shard = shard as *mut Box<_> as *mut *mut MaybeUninit<_>;
+                let shard = this.data[shard_id].get();
+                // Here we would have an intermediary step of taking &mut Option and unwrapping it,
+                // but that would cause data race in miri. Since we are certain that the value is
+                // Some(_), and *mut Option<Box<T>> is equivalent to *mut *mut T (because
+                // Option<Box<T>> is equivalent to *mut T), we can ignore the unwrap and instead cast
+                // `*mut Option<Box<T>>` directly into `*mut *mut T`.
+                let shard = shard as *mut Box<MaybeUninit<T>> as *mut *mut MaybeUninit<_>;
+                // In addition, do manual pointer addition to drop slice metadata, in order to avoid
+                // pointer retagging happening in MIR.
                 let elem = (*shard).add(idx);
                 (*elem).assume_init_mut()
             };
@@ -132,11 +140,15 @@ impl<T> PinHeap<T> {
         // SAFETY: we have exclusive access to the element on the shard that has been fully
         // allocated.
         let data = unsafe {
-            let shard = &mut *this.data[shard_id].get();
-            let shard = shard.as_mut().unwrap_unchecked();
-            // Intentionally drop the slice metadata so that there is no pointer retagging
-            // happening in MIR
-            let shard = shard as *mut Box<_> as *mut *mut MaybeUninit<_>;
+            let shard = this.data[shard_id].get();
+            // Here we would have an intermediary step of taking &mut Option and unwrapping it,
+            // but that would cause data race in miri. Since we are certain that the value is
+            // Some(_), and *mut Option<Box<T>> is equivalent to *mut *mut T (because
+            // Option<Box<T>> is equivalent to *mut T), we can ignore the unwrap and instead cast
+            // `*mut Option<Box<T>>` directly into `*mut *mut T`.
+            let shard = shard as *mut Box<MaybeUninit<T>> as *mut *mut MaybeUninit<_>;
+            // In addition, do manual pointer addition to drop slice metadata, in order to avoid
+            // pointer retagging happening in MIR.
             let elem = (*shard).add(idx);
             (*elem).write(value) as *mut _
         };
@@ -159,22 +171,23 @@ impl<T> PinHeap<T> {
     }
 }
 
-pub struct AllocHandle<T> {
+pub struct AllocHandle<T: Release> {
     data: *mut T,
     location: (usize, usize),
     store: Arc<PinHeap<T>>,
 }
 
-unsafe impl<T: Send> Send for AllocHandle<T> {}
-unsafe impl<T: Sync> Sync for AllocHandle<T> {}
+unsafe impl<T: Send + Release> Send for AllocHandle<T> {}
+unsafe impl<T: Sync + Release> Sync for AllocHandle<T> {}
 
-impl<T> Drop for AllocHandle<T> {
+impl<T: Release> Drop for AllocHandle<T> {
     fn drop(&mut self) {
+        (**self).release();
         PinHeap::release(self.store.clone(), self.location, self.data);
     }
 }
 
-impl<T> core::ops::Deref for AllocHandle<T> {
+impl<T: Release> core::ops::Deref for AllocHandle<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -182,17 +195,21 @@ impl<T> core::ops::Deref for AllocHandle<T> {
     }
 }
 
-impl<T> core::ops::DerefMut for AllocHandle<T> {
+impl<T: Release> core::ops::DerefMut for AllocHandle<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut *self.data }
     }
 }
 
-impl<T> From<AllocHandle<T>> for Pin<AllocHandle<T>> {
+impl<T: Release> From<AllocHandle<T>> for Pin<AllocHandle<T>> {
     fn from(handle: AllocHandle<T>) -> Self {
         // SAFETY: It's not possible to move or replace the insides of a
         // `Pin<AllocHandle<T>>` when `T: !Unpin`, so it's safe to pin it
         // directly without any additional requirements.
         unsafe { Pin::new_unchecked(handle) }
     }
+}
+
+pub trait Release {
+    fn release(&mut self);
 }

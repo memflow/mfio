@@ -35,34 +35,35 @@
 //! # mod sample {
 //! #     use mfio::heap::{AllocHandle, PinHeap};
 //! #     use mfio::packet::*;
-//! #     use mfio::shared_future::SharedFuture;
+//! #     use mfio::handle::*;
 //! #     include!("sample.rs");
 //! # }
 //! # use sample::SampleIo;
 //! # pollster::block_on(async move {
 //! use mfio::packet::{PacketIo, Write};
+//! use mfio::handle::IoHandle;
 //! use core::mem::MaybeUninit;
 //! use futures::{Stream, StreamExt};
 //!
-//! let handle = SampleIo::default();
+//! SampleIo::default().run(|scope| async move {
+//!     {
+//!         let mut data = [MaybeUninit::uninit()];
 //!
-//! {
+//!         let stream = scope.alloc_stream().await;
+//!
+//!         stream.send_io(0, &mut data);
+//!
+//!         // Unsafe! data is reused directly after the call.
+//!         core::mem::forget(stream);
+//!
+//!         data[0] = MaybeUninit::new(4);
+//!     }
+//!
 //!     let mut data = [MaybeUninit::uninit()];
 //!
-//!     let stream = handle.alloc_stream().await;
-//!
-//!     stream.send_io(0, &mut data);
-//!
-//!     // Unsafe! data is reused directly after the call.
-//!     core::mem::forget(stream);
-//!
-//!     data[0] = MaybeUninit::new(4);
-//! }
-//!
-//! let mut data = [MaybeUninit::uninit()];
-//!
-//! // This will process both I/O streams, even though the previous one was forgotten.
-//! let _ = handle.io(0, &mut data).await.count().await;
+//!     // This will process both I/O streams, even though the previous one was forgotten.
+//!     let _ = scope.io(0, &mut data).await.count().await;
+//! }).await;
 //! # });
 //! ```
 //!
@@ -70,32 +71,33 @@
 //! # mod sample {
 //! #     use mfio::heap::{AllocHandle, PinHeap};
 //! #     use mfio::packet::*;
-//! #     use mfio::shared_future::SharedFuture;
+//! #     use mfio::handle::*;
 //! #     include!("sample.rs");
 //! # }
 //! # use sample::SampleIo;
 //! # pollster::block_on(async move {
 //! use mfio::packet::{PacketIo, Write};
+//! use mfio::handle::IoHandle;
 //! use core::mem::MaybeUninit;
 //! use futures::{Stream, StreamExt};
 //!
-//! let handle = SampleIo::default();
+//! SampleIo::default().run(|scope| async move {
+//!     {
+//!         let mut data = [MaybeUninit::uninit()];
 //!
-//! {
+//!         let stream = scope.alloc_stream().await;
+//!
+//!         stream.send_io(0, &mut data);
+//!
+//!         // Unsafe! data is dropped, and its memory is reused later outside the scope
+//!         core::mem::forget(stream);
+//!     }
+//!
 //!     let mut data = [MaybeUninit::uninit()];
 //!
-//!     let stream = handle.alloc_stream().await;
-//!
-//!     stream.send_io(0, &mut data);
-//!
-//!     // Unsafe! data is dropped, and its memory is reused later outside the scope
-//!     core::mem::forget(stream);
-//! }
-//!
-//! let mut data = [MaybeUninit::uninit()];
-//!
-//! // This will process both I/O streams, even though the previous one was forgotten.
-//! let _ = handle.io(0, &mut data).await.count().await;
+//!     // This will process both I/O streams, even though the previous one was forgotten.
+//!     let _ = scope.io(0, &mut data).await.count().await;
+//! }).await;
 //! # });
 //! ```
 //!
@@ -105,46 +107,50 @@
 //! # mod sample {
 //! #     use mfio::heap::{AllocHandle, PinHeap};
 //! #     use mfio::packet::*;
-//! #     use mfio::shared_future::SharedFuture;
+//! #     use mfio::handle::*;
 //! #     include!("sample.rs");
 //! # }
 //! # use sample::SampleIo;
 //! # pollster::block_on(async move {
 //! use mfio::packet::{PacketIo, Write};
+//! use mfio::handle::IoHandle;
 //! use core::mem::MaybeUninit;
 //! use futures::{Stream, StreamExt};
 //!
-//! let handle = SampleIo::default();
+//! SampleIo::default().run(|scope| async move {
+//!     {
+//!         let mut data = Box::leak(vec![MaybeUninit::uninit()].into_boxed_slice());
 //!
-//! {
-//!     let mut data = Box::leak(vec![MaybeUninit::uninit()].into_boxed_slice());
+//!         let stream = scope.alloc_stream().await;
 //!
-//!     let stream = handle.alloc_stream().await;
+//!         stream.send_io(0, data);
 //!
-//!     stream.send_io(0, &mut data);
+//!         // Okay! Data has been leaked to the heap.
+//!         // In addition, we don't touch the data afterwards!
+//!         core::mem::forget(stream);
+//!     }
 //!
-//!     // Okay! Data has been leaked to the heap.
-//!     // In addition, we don't touch the data afterwards!
-//!     core::mem::forget(stream);
-//! }
+//!     let mut data = [MaybeUninit::uninit()];
 //!
-//! let mut data = [MaybeUninit::uninit()];
-//!
-//! // This will process both I/O streams, even though the previous one was forgotten.
-//! // Processing a forgotten stream is okay, because it was allocated on the `SampleIo` heap,
-//! // instead of the stack.
-//! let _ = handle.io(0, &mut data).await.count().await;
+//!     // This will process both I/O streams, even though the previous one was forgotten.
+//!     // Processing a forgotten stream is okay, because it was allocated on the `SampleIo` heap,
+//!     // instead of the stack.
+//!     let _ = scope.io(0, &mut data).await.count().await;
+//! }).await;
 //! # });
 //! ```
 
+pub mod handle;
 pub mod heap;
 pub mod packet;
 pub mod shared_future;
+pub mod traits;
+
 #[cfg(test)]
 mod sample {
+    use crate::handle::*;
     use crate::heap::{AllocHandle, PinHeap};
     use crate::packet::*;
-    use crate::shared_future::SharedFuture;
     include!("sample.rs");
 }
 
@@ -153,102 +159,227 @@ mod tests {
 
     use packet::PacketIo;
 
+    use super::traits::*;
     use super::*;
+    use crate::handle::IoHandle;
     use crate::packet::Write;
     use crate::sample::SampleIo;
+    use bytemuck::{Pod, Zeroable};
     use core::mem::MaybeUninit;
     use futures::StreamExt;
 
     #[tokio::test]
     async fn single_elem_read() {
-        let handle = SampleIo::default();
+        SampleIo::new((0..200).collect::<Vec<_>>())
+            .run(|scope| async move {
+                let mut value = [MaybeUninit::uninit()];
 
-        let mut value = [MaybeUninit::uninit()];
+                let stream = scope.io(100, &mut value[..]).await;
 
-        let stream = handle.io(100, &mut value[..]).await;
+                let output = stream.map(|(_, b)| b).collect::<Vec<_>>().await;
+                assert_eq!(vec![None], output);
+                assert_eq!(100, unsafe { value[0].assume_init() });
 
-        let output = stream.map(|(_, b)| b).collect::<Vec<_>>().await;
-        assert_eq!(vec![None], output);
-        assert_eq!(100, unsafe { value[0].assume_init() });
+                core::mem::drop(scope);
+            })
+            .await;
+    }
 
-        core::mem::drop(handle);
+    #[tokio::test]
+    async fn two_read_scopes() {
+        let handle = SampleIo::new((0..200).collect::<Vec<_>>());
+
+        handle
+            .run(|scope| async move {
+                let mut value = [MaybeUninit::uninit()];
+
+                let stream = scope.io(100, &mut value[..]).await;
+
+                let output = stream.map(|(_, b)| b).collect::<Vec<_>>().await;
+                assert_eq!(vec![None], output);
+                assert_eq!(100, unsafe { value[0].assume_init() });
+
+                core::mem::drop(scope);
+            })
+            .await;
+
+        println!("Part 2");
+
+        handle
+            .run(|scope| async move {
+                let mut value = [MaybeUninit::uninit()];
+
+                let stream = scope.io(100, &mut value[..]).await;
+
+                let output = stream.map(|(_, b)| b).collect::<Vec<_>>().await;
+                assert_eq!(vec![None], output);
+                assert_eq!(100, unsafe { value[0].assume_init() });
+
+                core::mem::drop(scope);
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn single_elem_write() {
-        let handle = SampleIo::default();
+        SampleIo::default()
+            .run(|scope| async move {
+                let value = [42u8];
 
-        let value = [42u8];
+                let stream = scope.io(100, &value[..]).await;
 
-        let stream = handle.io(100, &value[..]).await;
+                let output = stream.map(|(_, b)| b).collect::<Vec<_>>().await;
+                assert_eq!(vec![None], output);
+                assert_eq!([42], value);
 
-        let output = stream.map(|(_, b)| b).collect::<Vec<_>>().await;
-        assert_eq!(vec![None], output);
-        assert_eq!([42], value);
-
-        core::mem::drop(handle);
+                core::mem::drop(scope);
+            })
+            .await;
     }
 
     #[tokio::test]
-    async fn two_elems() {
+    async fn single_elem_write_and_read() {
+        SampleIo::default()
+            .run(|scope| async move {
+                let write = [42u8];
+
+                scope.write_all(100, &write[..]).await;
+
+                let mut read = (0..write.len())
+                    .map(|_| MaybeUninit::uninit())
+                    .collect::<Vec<_>>();
+
+                scope.read_all(100, &mut read[..]).await;
+
+                let read = read
+                    .into_iter()
+                    .map(|v| unsafe { v.assume_init() })
+                    .collect::<Vec<_>>();
+
+                assert_eq!(&write[..], &read[..]);
+            })
+            .await
+    }
+
+    #[cfg_attr(not(miri), tokio::test)]
+    async fn simple_struct_write_and_read() {
+        SampleIo::default()
+            .run(|scope| async move {
+                #[repr(C)]
+                #[derive(Clone, Copy, Eq, PartialEq, Debug, Pod, Zeroable)]
+                struct TestStruct {
+                    a: u32,
+                    b: u32,
+                    c: u32,
+                }
+
+                let write = TestStruct {
+                    a: 57,
+                    b: 109,
+                    c: 8,
+                };
+
+                scope.write(100, &write).await;
+
+                let read = scope.read::<TestStruct>(100).await;
+
+                assert_eq!(write, read);
+            })
+            .await
+    }
+
+    /*#[tokio::test]
+    async fn padded_struct_write_and_read() {
         let handle = SampleIo::default();
 
-        for _ in 0..2 {
-            let mut value = [MaybeUninit::uninit()];
-
-            let stream = handle.io(100, &mut value[..]).await;
-
-            let output = stream.map(|(_, b)| b).collect::<Vec<_>>().await;
-            assert_eq!(vec![None], output);
-            assert_eq!(100, unsafe { value[0].assume_init() });
+        #[repr(C)]
+        #[derive(Clone, Copy, Eq, PartialEq, Debug, Pod, Zeroable)]
+        struct TestStruct {
+            a: u8,
+            b: u32,
+            c: u128,
         }
 
-        core::mem::drop(handle);
+        let write = TestStruct {
+            a: 57,
+            b: 109,
+            c: 8
+        };
+
+        scope.write(100, &write).await;
+
+        let read = scope.read::<TestStruct>(100).await;
+
+        assert_eq!(write, read);
+    }*/
+
+    #[tokio::test]
+    async fn two_elems() {
+        SampleIo::new((0..200).collect::<Vec<_>>())
+            .run(|scope| async move {
+                for _ in 0..2 {
+                    let mut value = [MaybeUninit::uninit()];
+
+                    let stream = scope.io(100, &mut value[..]).await;
+
+                    let output = stream.map(|(_, b)| b).collect::<Vec<_>>().await;
+                    assert_eq!(vec![None], output);
+                    assert_eq!(100, unsafe { value[0].assume_init() });
+                }
+
+                core::mem::drop(scope);
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn drop_bare_stream() {
-        let handle = SampleIo::default();
-
-        let stream = PacketIo::<Write, _>::alloc_stream(&handle).await;
-
-        core::mem::drop(stream);
+        SampleIo::default()
+            .run(|scope| async move {
+                let stream = PacketIo::<Write, _>::alloc_stream(&scope).await;
+                core::mem::drop(stream);
+            })
+            .await
     }
 
     #[tokio::test]
-    #[cfg_attr(not(feature = "stream_blocking_drop"), should_panic)]
+    #[cfg(should_panic)]
     async fn drop_bound_stream() {
-        let handle = SampleIo::default();
+        SampleIo::default()
+            .run(|scope| async move {
+                let mut value = [MaybeUninit::uninit()];
 
-        let mut value = [MaybeUninit::uninit()];
+                let stream = scope.alloc_stream().await;
 
-        let stream = handle.alloc_stream().await;
+                stream.send_io(0, &mut value[..]);
 
-        stream.send_io(0, &mut value[..]);
-
-        core::mem::drop(stream);
+                core::mem::drop(stream);
+            })
+            .await
     }
 
     #[tokio::test]
-    #[cfg_attr(not(feature = "stream_blocking_drop"), should_panic)]
+    #[cfg(should_panic)]
     async fn drop_io_stream() {
-        let handle = SampleIo::default();
+        SampleIo::default()
+            .run(|scope| async move {
+                let mut value = [MaybeUninit::uninit()];
+                let stream = scope.io(100, &mut value[..]).await;
 
-        let mut value = [MaybeUninit::uninit()];
-        let stream = handle.io(100, &mut value[..]).await;
-
-        core::mem::drop(stream);
+                core::mem::drop(stream);
+            })
+            .await
     }
 
     use std::time::{Duration, Instant};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn bench() {
-        let handle = SampleIo::default();
+        let io = SampleIo::default();
 
         const MILLIS: u64 = 10;
 
-        {
+        io.run(|scope| async move {
             println!("Sequential:");
 
             let start = Instant::now();
@@ -257,7 +388,7 @@ mod tests {
 
             while start.elapsed() < Duration::from_millis(MILLIS) {
                 cnt += 1;
-                handle
+                scope
                     .io(100, &mut [MaybeUninit::uninit()])
                     .await
                     .count()
@@ -265,16 +396,17 @@ mod tests {
             }
 
             println!("{:.2}", cnt as f64 / start.elapsed().as_secs_f64());
-        }
+        })
+        .await;
 
-        {
+        io.run(|scope| async move {
             println!("One stream, multiple reads:");
 
             let start = Instant::now();
 
             let mut cnt = 0;
 
-            let stream = handle.alloc_stream().await;
+            let stream = scope.alloc_stream().await;
 
             while start.elapsed() < Duration::from_millis(MILLIS) {
                 cnt += 1;
@@ -286,21 +418,21 @@ mod tests {
 
             println!("{cnt}");
 
-            stream
+            let ret = stream
                 .inspect(|(pkt, _)| {
                     unsafe { Box::from(core::slice::from_raw_parts_mut(pkt.data(), pkt.len())) };
                 })
-                .count()
-                .await;
+                .count();
+
+            ret.await;
 
             println!("{:.2}", cnt as f64 / start.elapsed().as_secs_f64());
-        }
+        })
+        .await;
 
         let jobs_in_flight = (1..=2)
             .map(|i| {
-                let mut handle = handle.clone();
-                PacketIo::<Write, _>::separate_thread_state(&mut handle);
-                async move {
+                io.run(|scope| async move {
                     println!("Multiple reads in-flight MT:");
 
                     let start = Instant::now();
@@ -313,7 +445,7 @@ mod tests {
                         cnt += 1;
 
                         q.push_back(
-                            handle
+                            scope
                                 .io(
                                     100,
                                     Box::leak(vec![MaybeUninit::uninit()].into_boxed_slice()),
@@ -366,10 +498,12 @@ mod tests {
                     println!("{i}: {:.2}", speed);
 
                     speed
-                }
+                })
             })
             .map(tokio::spawn)
             .collect::<Vec<_>>();
+
+        println!("AWAIT");
 
         let cnt = futures::future::join_all(jobs_in_flight)
             .await
@@ -379,7 +513,7 @@ mod tests {
 
         println!("CNT: {cnt:.2}");
 
-        {
+        io.run(|scope| async move {
             println!("Multiple reads in-flight:");
 
             let start = Instant::now();
@@ -392,7 +526,7 @@ mod tests {
                 cnt += 1;
 
                 q.push_back(
-                    handle
+                    scope
                         .io(
                             100,
                             Box::leak(vec![MaybeUninit::uninit()].into_boxed_slice()),
@@ -422,7 +556,7 @@ mod tests {
                 .count()
             }));
 
-            //println!("AWAITING {}", handle.input.queue.len());
+            //println!("AWAITING {}", scope.input.queue.len());
             //println!("{:.2}", cnt as f64 / start.elapsed().as_secs_f64());
 
             fut.await;
@@ -430,9 +564,8 @@ mod tests {
             let speed = cnt as f64 / start.elapsed().as_secs_f64();
 
             println!("{:.2}", speed);
-        }
+        })
+        .await;
         println!("DROP");
-
-        core::mem::drop(handle);
     }
 }

@@ -1,5 +1,4 @@
-use crate::heap::AllocHandle;
-use crate::shared_future::SharedFuture;
+use crate::heap::{AllocHandle, Release};
 use core::future::Future;
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
@@ -17,14 +16,12 @@ type Output<'a, DataType> = (PacketObj<'a, DataType>, Option<()>);
 pub type BoxedFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 pub trait PacketIo<Perms: PacketPerms, Param>: Sized {
-    fn separate_thread_state(&mut self);
-
-    fn try_alloc_stream(
-        &self,
+    fn try_alloc_stream<'a>(
+        &'a self,
         context: &mut Context,
-    ) -> Option<Pin<AllocHandle<PacketStream<'_, Perms, Param>>>>;
+    ) -> Option<Pin<AllocHandle<PacketStream<'a, Perms, Param>>>>;
 
-    fn alloc_stream(&self) -> AllocStreamFut<'_, Self, Perms, Param> {
+    fn alloc_stream<'a>(&'a self) -> AllocStreamFut<'a, Self, Perms, Param> {
         AllocStreamFut {
             this: self,
             poll_fn: Self::try_alloc_stream,
@@ -86,7 +83,7 @@ impl<'a, T, Perms: PacketPerms, Param> Future for AllocStreamFut<'a, T, Perms, P
 
 pub struct PacketStream<'a, Perms: PacketPerms, Param> {
     pub ctx: Arc<PacketCtx<'a, Perms, Param>>,
-    pub future: SharedFuture<BoxedFuture>,
+    //pub future: SharedFuture<BoxedFuture>,
 }
 
 impl<'a, Perms: PacketPerms, Param> Stream for PacketStream<'a, Perms, Param> {
@@ -103,14 +100,10 @@ impl<'a, Perms: PacketPerms, Param> Stream for PacketStream<'a, Perms, Param> {
             _ => {}
         }
 
-        PacketIoHandle::flush(&this.ctx.io);
+        // TODO: decide on threading assumptions. I.e. Do we need to flush if this is running in a
+        // single-threaded scope?
 
-        // Try running the future once
-        if this.future.try_run_once_sync(cx).is_some() {
-            if let Some(elem) = this.ctx.output.queue.lock().pop_front() {
-                return Poll::Ready(Some(elem));
-            }
-        }
+        PacketIoHandle::flush(&this.ctx.io);
 
         // Install the waker. Note that after this we must check for end condition once more to
         // avoid deadlocks.
@@ -128,51 +121,23 @@ impl<'a, Perms: PacketPerms, Param> Stream for PacketStream<'a, Perms, Param> {
     }
 }
 
-#[cfg(not(feature = "stream_blocking_drop"))]
+fn release_stream<'a, Perms: PacketPerms, Param>(stream: &mut PacketStream<'a, Perms, Param>) {
+    assert_eq!(
+        1,
+        stream.ctx.strong_count(),
+        "Packet stream dropped strong_count > 1"
+    );
+}
+
 impl<'a, Perms: PacketPerms, Param> Drop for PacketStream<'a, Perms, Param> {
     fn drop(&mut self) {
-        assert_eq!(
-            1,
-            self.ctx.strong_count(),
-            "Packet stream dropped strong_count > 1"
-        );
+        release_stream(self)
     }
 }
 
-#[cfg(feature = "stream_blocking_drop")]
-impl<'a, Perms: PacketPerms, Param> Drop for PacketStream<'a, Perms, Param> {
-    fn drop(&mut self) {
-        let strong_count = self.ctx.strong_count();
-
-        if strong_count <= 1 {
-            return;
-        }
-
-        use core::task::{RawWaker, RawWakerVTable};
-
-        unsafe fn wake(_: *const ()) {}
-
-        unsafe fn wake_by_ref(_: *const ()) {}
-
-        unsafe fn drop(_: *const ()) {}
-
-        unsafe fn clone(ptr: *const ()) -> RawWaker {
-            RawWaker::new(ptr, &RawWakerVTable::new(clone, wake, wake_by_ref, drop))
-        }
-
-        let waker = unsafe { Waker::from_raw(clone(core::ptr::null())) };
-        let mut ctx = Context::from_waker(&waker);
-
-        loop {
-            let _ = Pin::new(&mut *self).poll_next(&mut ctx);
-
-            let strong_count = self.ctx.strong_count();
-
-            if strong_count <= 1 {
-                break;
-            }
-        }
-        //assert_eq!(1, strong_count, "Packet stream dropped strong_count > 1");
+impl<'a, Perms: PacketPerms, Param> Release for PacketStream<'a, Perms, Param> {
+    fn release(&mut self) {
+        release_stream(self)
     }
 }
 
@@ -213,11 +178,27 @@ impl<'a, Perms: PacketPerms, Param> AsRef<PacketOutput<'a, Perms>> for PacketCtx
 }
 
 impl<'a, Perms: PacketPerms, Param> PacketCtx<'a, Perms, Param> {
-    pub fn new<T: IntoIoHandle<'a, Perms, Param>>(read_io: BaseArc<T>) -> Self {
+    pub fn new<T: IntoIoHandle<'a, Perms, Param>>(io: BaseArc<T>) -> Self {
         Self {
             output: Default::default(),
-            io: IntoIoHandle::into_handle(read_io),
+            io: IntoIoHandle::into_handle(io),
         }
+    }
+}
+
+impl<'a, Perms: PacketPerms, Param, T: IntoIoHandle<'a, Perms, Param>>
+    core::cmp::PartialEq<BaseArc<T>> for PacketCtx<'a, Perms, Param>
+{
+    fn eq(&self, other: &BaseArc<T>) -> bool {
+        self.io.as_ptr() == IntoIoHandle::into_handle(other.clone()).as_ptr()
+    }
+}
+
+impl<'a, Perms: PacketPerms, Param, T: IntoIoHandle<'a, Perms, Param>>
+    core::cmp::PartialEq<PacketCtx<'a, Perms, Param>> for BaseArc<T>
+{
+    fn eq(&self, other: &PacketCtx<'a, Perms, Param>) -> bool {
+        other == self
     }
 }
 
@@ -345,6 +326,14 @@ impl<'a, DataType: Copy> PacketObj<'a, DataType> {
         self.end - self.start
     }
 
+    pub fn start(&self) -> usize {
+        self.start
+    }
+
+    pub fn end(&self) -> usize {
+        self.end
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -366,10 +355,8 @@ pub struct Packet<'a, Perms: PacketPerms> {
     }
 }*/
 
-impl<'a, T: AsMut<[u8]> + ?Sized> From<&'a mut T> for Packet<'a, ReadWrite> {
-    fn from(slc: &'a mut T) -> Self {
-        // Just to be sure that the lifetimes are correct
-        let slc: &'a mut [u8] = slc.as_mut();
+impl<'a> From<&'a mut [u8]> for Packet<'a, ReadWrite> {
+    fn from(slc: &'a mut [u8]) -> Self {
         unsafe extern "C" fn get_mut(obj: BoundPacketObj<ReadWrite>) -> ReadWritePacketObj {
             ReadWritePacketObj {
                 alloced_packet: (obj.buffer.data as *mut u8).add(obj.buffer.start),
@@ -389,10 +376,19 @@ impl<'a, T: AsMut<[u8]> + ?Sized> From<&'a mut T> for Packet<'a, ReadWrite> {
     }
 }
 
-impl<'a, T: AsMut<[MaybeUninit<u8>]> + ?Sized> From<&'a mut T> for Packet<'a, Write> {
-    fn from(slc: &'a mut T) -> Self {
-        // Just to be sure that the lifetimes are correct
-        let slc: &'a mut [MaybeUninit<u8>] = slc.as_mut();
+impl<'a, D: AnyBytes, const N: usize> From<&'a mut [D; N]> for Packet<'a, Write> {
+    fn from(slc: &'a mut [D; N]) -> Self {
+        Self::from(&mut slc[..])
+    }
+}
+
+trait AnyBytes {}
+
+impl AnyBytes for u8 {}
+impl AnyBytes for MaybeUninit<u8> {}
+
+impl<'a, D: AnyBytes> From<&'a mut [D]> for Packet<'a, Write> {
+    fn from(slc: &'a mut [D]) -> Self {
         unsafe extern "C" fn get_mut(obj: BoundPacketObj<Write>) -> WritePacketObj {
             WritePacketObj {
                 alloced_packet: (obj.buffer.data as *mut MaybeUninit<u8>).add(obj.buffer.start),
@@ -411,46 +407,12 @@ impl<'a, T: AsMut<[MaybeUninit<u8>]> + ?Sized> From<&'a mut T> for Packet<'a, Wr
         }
     }
 }
-
-/*impl<'a, T: Into<Packet<'a, ReadWrite>>> From<T> for Packet<'a, Write> {
-    fn from(data: T) -> Self {
-        let packet = data.into();
-
-        Self {
-            obj: packet.vtable,
-            vtable: unsafe { core::mem::transmute(packet.vtable) }
-        }
-    }
-}*/
 
 impl<'a> From<Packet<'a, ReadWrite>> for Packet<'a, Write> {
     fn from(packet: Packet<'a, ReadWrite>) -> Self {
         unsafe { core::mem::transmute(packet) }
     }
 }
-
-/*impl<'a, T: AsMut<[u8]> + ?Sized> From<&'a mut T> for Packet<'a, Write> {
-    fn from(slc: &'a mut T) -> Self {
-        // Just to be sure that the lifetimes are correct
-        let slc: &'a mut [u8] = slc.as_mut();
-        unsafe extern "C" fn get_mut(obj: BoundPacketObj<Write>) -> WritePacketObj {
-            WritePacketObj {
-                alloced_packet: (obj.buffer.data as *mut MaybeUninit<u8>).add(obj.buffer.start),
-                buffer: obj,
-            }
-        }
-
-        Self {
-            obj: PacketObj {
-                data: slc.as_mut_ptr() as *mut _,
-                start: 0,
-                end: slc.len(),
-                _phantom: PhantomData,
-            },
-            vtable: &Write { get_mut },
-        }
-    }
-}*/
 
 impl<'a, T: AsRef<[u8]> + ?Sized> From<&'a T> for Packet<'a, Read> {
     fn from(slc: &'a T) -> Self {
