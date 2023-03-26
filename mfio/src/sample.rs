@@ -110,30 +110,17 @@ impl Drop for VolatileMem {
 pub struct IoThreadState {
     read_io: BaseArc<IoThreadHandle<Write>>,
     write_io: BaseArc<IoThreadHandle<Read>>,
-    read_streams: Arc<PinHeap<PacketStream<'static, Write, Address>>>,
-    write_streams: Arc<PinHeap<PacketStream<'static, Read, Address>>>,
+    future: SharedFuture<BoxedFuture>,
 }
 
 impl IoThreadState {
-    fn new(io: &SampleIo) -> (Self, BoxedFuture, Arc<AtomicBool>) {
-        // Reuse local thread state if current thread only
-        let read_io = if io.read_io.strong_count() == 1 {
-            io.read_io.clone()
-        } else {
-            Default::default()
-        };
-        let write_io = if io.write_io.strong_count() == 1 {
-            io.write_io.clone()
-        } else {
-            Default::default()
-        };
-
-        let progressed = Arc::new(AtomicBool::new(false));
+    fn new(mem: &Arc<VolatileMem>) -> Self {
+        let read_io: BaseArc<IoThreadHandle<Write>> = Default::default();
+        let write_io: BaseArc<IoThreadHandle<Read>> = Default::default();
 
         let read = {
-            let mem = io.mem.clone();
+            let mem = mem.clone();
             let read_io = read_io.clone();
-            let progressed = progressed.clone();
 
             async move {
                 loop {
@@ -146,15 +133,8 @@ impl IoThreadState {
                     {
                         let mut guard = read_io.input.lock();
 
-                        let mut p = false;
-
                         while let Some(inp) = guard.0.pop_front() {
                             proc_inp(inp);
-                            p = true;
-                        }
-
-                        if p {
-                            progressed.store(p, Ordering::Relaxed);
                         }
                     }
 
@@ -163,6 +143,8 @@ impl IoThreadState {
                     core::future::poll_fn(|cx| {
                         if !yielded {
                             read_io.input.lock().1 = Some(cx.waker().clone());
+                            // TODO: handle race conditions in multithreaded env, where elements
+                            // get pusehd after installing the waker
                             yielded = true;
                             core::task::Poll::Pending
                         } else {
@@ -175,9 +157,8 @@ impl IoThreadState {
         };
 
         let write = {
-            let mem = io.mem.clone();
+            let mem = mem.clone();
             let write_io = write_io.clone();
-            let progressed = progressed.clone();
 
             async move {
                 loop {
@@ -190,15 +171,8 @@ impl IoThreadState {
                     {
                         let mut guard = write_io.input.lock();
 
-                        let mut p = false;
-
                         while let Some(inp) = guard.0.pop_front() {
                             proc_inp(inp);
-                            p = true;
-                        }
-
-                        if p {
-                            progressed.store(p, Ordering::Relaxed);
                         }
                     }
 
@@ -221,28 +195,22 @@ impl IoThreadState {
         let future = Box::pin(async move {
             tokio::join!(read, write);
         }) as BoxedFuture;
-        //let future = SharedFuture::from(future);
+        let future = SharedFuture::from(future);
 
-        (
-            Self {
-                read_io,
-                write_io,
-                read_streams: io.read_streams.clone(),
-                write_streams: io.write_streams.clone(),
-            },
+        Self {
+            read_io,
+            write_io,
             future,
-            progressed,
-        )
+        }
     }
 }
 
 #[derive(Clone)]
 pub struct SampleIo {
-    read_io: BaseArc<IoThreadHandle<Write>>,
-    write_io: BaseArc<IoThreadHandle<Read>>,
+    mem: Arc<VolatileMem>,
+    thread_state: IoThreadState,
     read_streams: Arc<PinHeap<PacketStream<'static, Write, Address>>>,
     write_streams: Arc<PinHeap<PacketStream<'static, Read, Address>>>,
-    mem: Arc<VolatileMem>,
 }
 
 impl Default for SampleIo {
@@ -255,29 +223,23 @@ impl SampleIo {
     pub fn new(mem: Vec<u8>) -> Self {
         let mem = Arc::new(mem.into());
 
-        let read_io = BaseArc::new(IoThreadHandle::default());
-        let write_io = BaseArc::new(IoThreadHandle::default());
+        let thread_state = IoThreadState::new(&mem);
 
         Self {
-            read_io,
-            write_io,
+            mem,
+            thread_state,
             read_streams: Default::default(),
             write_streams: Default::default(),
-            mem,
         }
     }
 }
 
-impl IoHandle for SampleIo {
-    type BackendFuture = BoxedFuture;
-    type Backend = IoThreadState;
-
-    fn local_backend(&self) -> (Self::Backend, Self::BackendFuture, Arc<AtomicBool>) {
-        IoThreadState::new(self)
+impl PacketIo<Read, Address> for SampleIo {
+    fn separate_thread_state(&mut self) {
+        self.write_streams = Default::default();
+        self.thread_state = IoThreadState::new(&self.mem);
     }
-}
 
-impl PacketIo<Read, Address> for IoThreadState {
     fn try_alloc_stream(
         &self,
         _: &mut Context,
@@ -286,7 +248,8 @@ impl PacketIo<Read, Address> for IoThreadState {
             self.write_streams.clone(),
             || {
                 let stream = PacketStream {
-                    ctx: PacketCtx::new(self.write_io.clone()).into(),
+                    ctx: PacketCtx::new(self.thread_state.write_io.clone()).into(),
+                    future: self.thread_state.future.clone(),
                 };
 
                 unsafe { core::mem::transmute(stream) }
@@ -294,7 +257,8 @@ impl PacketIo<Read, Address> for IoThreadState {
             |e| {
                 // If queue is referenced somewhere else
                 if e.ctx.strong_count() > 1 {
-                    e.ctx = Arc::new(PacketCtx::new(self.write_io.clone()));
+                    e.ctx = Arc::new(PacketCtx::new(self.thread_state.write_io.clone()));
+                    e.future = self.thread_state.future.clone();
                 } else {
                     e.ctx.output.queue.lock().clear();
                     *e.ctx.output.wake.lock() = None;
@@ -311,7 +275,12 @@ impl PacketIo<Read, Address> for IoThreadState {
     }
 }
 
-impl PacketIo<Write, Address> for IoThreadState {
+impl PacketIo<Write, Address> for SampleIo {
+    fn separate_thread_state(&mut self) {
+        self.read_streams = Default::default();
+        self.thread_state = IoThreadState::new(&self.mem);
+    }
+
     fn try_alloc_stream(
         &self,
         _: &mut Context,
@@ -320,16 +289,17 @@ impl PacketIo<Write, Address> for IoThreadState {
             self.read_streams.clone(),
             || {
                 let stream = PacketStream {
-                    ctx: PacketCtx::new(self.read_io.clone()).into(),
-                    //future: self.thread_state.future.clone(),
+                    ctx: PacketCtx::new(self.thread_state.read_io.clone()).into(),
+                    future: self.thread_state.future.clone(),
                 };
 
                 unsafe { core::mem::transmute(stream) }
             },
             |e| {
                 // If queue is referenced somewhere else, or is pointing to different IO handle
-                if e.ctx.strong_count() > 1 || self.read_io != *e.ctx {
-                    e.ctx = Arc::new(PacketCtx::new(self.read_io.clone()));
+                if e.ctx.strong_count() > 1 || self.thread_state.read_io != *e.ctx {
+                    e.ctx = Arc::new(PacketCtx::new(self.thread_state.read_io.clone()));
+                    e.future = self.thread_state.future.clone();
                 } else {
                     e.ctx.output.queue.lock().clear();
                     *e.ctx.output.wake.lock() = None;

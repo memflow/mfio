@@ -1,4 +1,5 @@
 use crate::heap::{AllocHandle, Release};
+use crate::shared_future::SharedFuture;
 use core::future::Future;
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
@@ -16,6 +17,8 @@ type Output<'a, DataType> = (PacketObj<'a, DataType>, Option<()>);
 pub type BoxedFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 pub trait PacketIo<Perms: PacketPerms, Param>: Sized {
+    fn separate_thread_state(&mut self);
+
     fn try_alloc_stream<'a>(
         &'a self,
         context: &mut Context,
@@ -83,7 +86,7 @@ impl<'a, T, Perms: PacketPerms, Param> Future for AllocStreamFut<'a, T, Perms, P
 
 pub struct PacketStream<'a, Perms: PacketPerms, Param> {
     pub ctx: Arc<PacketCtx<'a, Perms, Param>>,
-    //pub future: SharedFuture<BoxedFuture>,
+    pub future: SharedFuture<BoxedFuture>,
 }
 
 impl<'a, Perms: PacketPerms, Param> Stream for PacketStream<'a, Perms, Param> {
@@ -94,28 +97,29 @@ impl<'a, Perms: PacketPerms, Param> Stream for PacketStream<'a, Perms, Param> {
 
         let closed = this.ctx.output.size.load(Ordering::Relaxed) <= 0;
 
+        // Try polling the backend future if it should be run
+        if !closed {
+            this.future.try_run_once_sync(cx);
+        }
+
         match this.ctx.output.queue.lock().pop_front() {
             Some(elem) => return Poll::Ready(Some(elem)),
             _ if closed => return Poll::Ready(None),
             _ => {}
         }
 
-        // TODO: decide on threading assumptions. I.e. Do we need to flush if this is running in a
-        // single-threaded scope?
-
-        //PacketIoHandle::flush(&this.ctx.io);
-
         // Install the waker. Note that after this we must check for end condition once more to
         // avoid deadlocks.
         *this.ctx.output.wake.lock() = Some(cx.waker().clone());
 
-        /*match this.ctx.output.queue.lock().pop_front() {
+        match this.ctx.output.queue.lock().pop_front() {
             Some(elem) => return Poll::Ready(Some(elem)),
             // Check for one final time if we got closed while inserting the waker,
             // and if so, avoid returning Pending to avoid deadlock.
             _ if this.ctx.output.size.load(Ordering::Acquire) <= 0 => return Poll::Ready(None),
             _ => {}
-        }*/
+        }
+
         Poll::Pending
     }
 }

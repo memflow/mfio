@@ -4,7 +4,6 @@ use criterion::async_executor::*;
 use criterion::measurement::Measurement;
 use criterion::*;
 use futures::StreamExt;
-use mfio::handle::*;
 use mfio::packet::*;
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime as TokioRuntime;
@@ -12,9 +11,9 @@ use tokio::runtime::Runtime as TokioRuntime;
 use sample::*;
 
 mod sample {
-    use mfio::handle::*;
     use mfio::heap::{AllocHandle, PinHeap};
     use mfio::packet::*;
+    use mfio::shared_future::*;
     include!("../src/sample.rs");
 }
 
@@ -101,23 +100,20 @@ fn allocations(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("alloc", size), move |b| {
             b.to_async(PollsterExecutor)
                 .iter_custom(move |iters| async move {
-                    SampleIo::default()
-                        .run(|scope| async move {
-                            let mut elapsed = Duration::default();
-                            for _ in 0..iters {
-                                let streams = (0..size)
-                                    .into_iter()
-                                    .map(|_| PacketIo::<Write, _>::alloc_stream(&scope))
-                                    .collect::<Vec<_>>();
-                                let futures = futures::future::join_all(streams);
+                    let scope = SampleIo::default();
+                    let mut elapsed = Duration::default();
+                    for _ in 0..iters {
+                        let streams = (0..size)
+                            .into_iter()
+                            .map(|_| PacketIo::<Write, _>::alloc_stream(&scope))
+                            .collect::<Vec<_>>();
+                        let futures = futures::future::join_all(streams);
 
-                                let start = Instant::now();
-                                black_box(futures.await);
-                                elapsed += start.elapsed();
-                            }
-                            elapsed
-                        })
-                        .await
+                        let start = Instant::now();
+                        black_box(futures.await);
+                        elapsed += start.elapsed();
+                    }
+                    elapsed
                 })
         });
     }
@@ -150,29 +146,27 @@ fn reads(c: &mut Criterion) {
                     b.to_async(T::executor()).iter_custom(|iters| async move {
                         let mut bufs = vec![[MaybeUninit::uninit()]; size];
 
-                        handle
-                            .run(|scope| async move {
-                                let mut elapsed = Duration::default();
+                        let scope = handle.clone();
 
-                                for _ in 0..iters {
-                                    let futures = bufs
-                                        .iter_mut()
-                                        .map(|b| async { scope.io(0, b).await })
-                                        .collect::<Vec<_>>();
+                        let mut elapsed = Duration::default();
 
-                                    let futures = futures::future::join_all(futures).await;
-                                    let streams = futures::stream::select_all(futures);
+                        for _ in 0..iters {
+                            let futures = bufs
+                                .iter_mut()
+                                .map(|b| async { scope.io(0, b).await })
+                                .collect::<Vec<_>>();
 
-                                    let start = Instant::now();
+                            let futures = futures::future::join_all(futures).await;
+                            let streams = futures::stream::select_all(futures);
 
-                                    black_box(streams.count().await);
+                            let start = Instant::now();
 
-                                    elapsed += start.elapsed();
-                                }
+                            black_box(streams.count().await);
 
-                                elapsed
-                            })
-                            .await
+                            elapsed += start.elapsed();
+                        }
+
+                        elapsed
                     });
                 },
             );
@@ -220,7 +214,10 @@ fn reads_tasked(c: &mut Criterion) {
 
                                     let mut bufs = vec![[MaybeUninit::uninit()]; size as _];
 
-                                    handle.run(|scope| async move {
+                                    let mut scope = handle.clone();
+                                    PacketIo::<Write, _>::separate_thread_state(&mut scope);
+
+                                    async move {
                                         let mut subtract = subtract.elapsed();
 
                                         for _ in 0..iters {
@@ -243,7 +240,7 @@ fn reads_tasked(c: &mut Criterion) {
                                         }
 
                                         subtract
-                                    })
+                                    }
                                 })
                             });
 

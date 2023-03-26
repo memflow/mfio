@@ -39,7 +39,7 @@ pub trait IoRead<Pos>: PacketIo<Write, Pos> {
 
     /// # Notes
     ///
-    /// This function breaks rust stacked borrows rules. If you wish to not do that, please use
+    /// This function may break rust stacked borrows rules. If you wish to not do that, please use
     /// [`read_into`](Self::read_into) function.
     ///
     /// This may be fixed once const generics are able to instantiate `[u8; mem::size_of::<T>()]`.
