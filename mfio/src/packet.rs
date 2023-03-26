@@ -234,13 +234,7 @@ pub struct PacketIoHandle<'a, Perms: PacketPerms, Param> {
 
 impl<'a, Perms: PacketPerms, Param> PacketIoHandle<'a, Perms, Param> {
     /// Create a new PacketIoHandle vtable
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that T contains one, and only one instance of `PacketIoHandle`, and it
-    /// is located at the very start of the structure. T must also ensure that its drop
-    /// implementation does not drop the underlying `PacketIoHandle`.
-    pub unsafe fn new<T: PacketIoHandleable<'a, Perms, Param>>() -> Self {
+    pub fn new<T: PacketIoHandleable<'a, Perms, Param>>() -> Self {
         Self {
             send_input: unsafe { core::mem::transmute(T::send_input as extern "C" fn(_, _, _)) },
         }

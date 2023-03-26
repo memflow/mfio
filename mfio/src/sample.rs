@@ -19,7 +19,7 @@ struct IoThreadHandle<Perms: PacketPerms> {
 impl<Perms: PacketPerms> Default for IoThreadHandle<Perms> {
     fn default() -> Self {
         Self {
-            handle: unsafe { PacketIoHandle::new::<Self>() },
+            handle: PacketIoHandle::new::<Self>(),
             input: Default::default(),
             event: Default::default(),
         }
@@ -233,6 +233,10 @@ impl PacketIo<Read, Address> for SampleIo {
             },
         );
 
+        // Shorten lifetime of the stream.
+        // This is okay, because we do not allow to put any data into the stream with shorter
+        // lifetime, apart from the borrowed byte buffers, which are safe if the stream does not
+        // get forgotten. See mfio top level documentation about the safety guarantees.
         let stream = unsafe { core::mem::transmute(Pin::from(stream)) };
 
         Some(stream)
@@ -274,6 +278,10 @@ impl PacketIo<Write, Address> for SampleIo {
             },
         );
 
+        // Shorten lifetime of the stream.
+        // This is okay, because we do not allow to put any data into the stream with shorter
+        // lifetime, apart from the borrowed byte buffers, which are safe if the stream does not
+        // get forgotten. See mfio top level documentation about the safety guarantees.
         let stream = unsafe { core::mem::transmute(Pin::from(stream)) };
 
         Some(stream)
