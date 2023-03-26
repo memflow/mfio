@@ -219,23 +219,17 @@ impl<'a, T: AsRef<PacketIoHandle<'a, Perms, Param>>, Perms: PacketPerms, Param>
 
 pub trait PacketIoHandleable<'a, Perms: PacketPerms, Param> {
     extern "C" fn send_input(&self, param: Param, buffer: BoundPacket<'a, Perms>);
-    extern "C" fn flush(&self);
 }
 
 impl<'a, Perms: PacketPerms, Param> core::fmt::Debug for PacketIoHandle<'a, Perms, Param> {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-        write!(
-            fmt,
-            "({:?} {:?})",
-            self.send_input as *const (), self.flush as *const ()
-        )
+        write!(fmt, "({:?})", self.send_input as *const (),)
     }
 }
 
 #[repr(C)]
 pub struct PacketIoHandle<'a, Perms: PacketPerms, Param> {
     send_input: unsafe extern "C" fn(*const (), Param, BoundPacket<'a, Perms>),
-    flush: unsafe extern "C" fn(*const ()),
 }
 
 impl<'a, Perms: PacketPerms, Param> PacketIoHandle<'a, Perms, Param> {
@@ -249,17 +243,12 @@ impl<'a, Perms: PacketPerms, Param> PacketIoHandle<'a, Perms, Param> {
     pub unsafe fn new<T: PacketIoHandleable<'a, Perms, Param>>() -> Self {
         Self {
             send_input: unsafe { core::mem::transmute(T::send_input as extern "C" fn(_, _, _)) },
-            flush: unsafe { core::mem::transmute(T::flush as extern "C" fn(_)) },
         }
     }
 
     fn send_input(this: &Arc<Self>, param: Param, buffer: BoundPacket<'a, Perms>) {
         // We must use raw ptr in order to satisfy miri stacked borrows rules
         unsafe { (this.send_input)(this.as_original_ptr::<()>(), param, buffer) };
-    }
-
-    fn flush(this: &Arc<Self>) {
-        unsafe { (this.flush)(this.as_original_ptr::<()>()) };
     }
 }
 

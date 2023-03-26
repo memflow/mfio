@@ -14,6 +14,7 @@ mod sample {
     use mfio::heap::{AllocHandle, PinHeap};
     use mfio::packet::*;
     use mfio::shared_future::*;
+    use mfio::util::Event;
     include!("../src/sample.rs");
 }
 

@@ -1,8 +1,7 @@
 use core::mem::MaybeUninit;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, Ordering};
-use core::task::{Context, Waker};
-use event_listener::Event;
+use core::sync::atomic::Ordering;
+use core::task::Context;
 
 use tarc::{Arc, BaseArc};
 
@@ -13,11 +12,8 @@ type Address = usize;
 
 struct IoThreadHandle<Perms: PacketPerms> {
     handle: PacketIoHandle<'static, Perms, Address>,
-    input: Mutex<(
-        VecDeque<(usize, BoundPacket<'static, Perms>)>,
-        Option<Waker>,
-    )>,
-    flush: (AtomicBool, Event),
+    input: Mutex<VecDeque<(usize, BoundPacket<'static, Perms>)>>,
+    event: Arc<Event>,
 }
 
 impl<Perms: PacketPerms> Default for IoThreadHandle<Perms> {
@@ -25,7 +21,7 @@ impl<Perms: PacketPerms> Default for IoThreadHandle<Perms> {
         Self {
             handle: unsafe { PacketIoHandle::new::<Self>() },
             input: Default::default(),
-            flush: Default::default(),
+            event: Default::default(),
         }
     }
 }
@@ -38,17 +34,9 @@ impl<Perms: PacketPerms> AsRef<PacketIoHandle<'static, Perms, Address>> for IoTh
 
 impl<Perms: PacketPerms> PacketIoHandleable<'static, Perms, Address> for IoThreadHandle<Perms> {
     extern "C" fn send_input(&self, address: usize, packet: BoundPacket<'static, Perms>) {
-        let mut guard = self.input.lock();
-        let (input, waker) = &mut *guard;
+        let mut input = self.input.lock();
         input.push_back((address, packet));
-        if let Some(waker) = waker.take() {
-            waker.wake()
-        }
-    }
-
-    extern "C" fn flush(&self) {
-        self.flush.0.store(true, Ordering::Release);
-        self.flush.1.notify(usize::MAX);
+        self.event.signal();
     }
 }
 
@@ -131,27 +119,14 @@ impl IoThreadState {
 
                     // try_pop here many elems
                     {
-                        let mut guard = read_io.input.lock();
+                        let mut input = read_io.input.lock();
 
-                        while let Some(inp) = guard.0.pop_front() {
+                        while let Some(inp) = input.pop_front() {
                             proc_inp(inp);
                         }
                     }
 
-                    let mut yielded = false;
-
-                    core::future::poll_fn(|cx| {
-                        if !yielded {
-                            read_io.input.lock().1 = Some(cx.waker().clone());
-                            // TODO: handle race conditions in multithreaded env, where elements
-                            // get pusehd after installing the waker
-                            yielded = true;
-                            core::task::Poll::Pending
-                        } else {
-                            core::task::Poll::Ready(())
-                        }
-                    })
-                    .await;
+                    read_io.event.wait().await;
                 }
             }
         };
@@ -169,25 +144,14 @@ impl IoThreadState {
 
                     // try_pop here many elems
                     {
-                        let mut guard = write_io.input.lock();
+                        let mut input = write_io.input.lock();
 
-                        while let Some(inp) = guard.0.pop_front() {
+                        while let Some(inp) = input.pop_front() {
                             proc_inp(inp);
                         }
                     }
 
-                    let mut yielded = false;
-
-                    core::future::poll_fn(|cx| {
-                        if !yielded {
-                            write_io.input.lock().1 = Some(cx.waker().clone());
-                            yielded = true;
-                            core::task::Poll::Pending
-                        } else {
-                            core::task::Poll::Ready(())
-                        }
-                    })
-                    .await;
+                    write_io.event.wait().await;
                 }
             }
         };

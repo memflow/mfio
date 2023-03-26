@@ -31,6 +31,7 @@
 //! #     use mfio::heap::{AllocHandle, PinHeap};
 //! #     use mfio::packet::*;
 //! #     use mfio::shared_future::*;
+//! #     use mfio::util::Event;
 //! #     include!("sample.rs");
 //! # }
 //! # use sample::SampleIo;
@@ -59,6 +60,7 @@
 //! #     use mfio::heap::{AllocHandle, PinHeap};
 //! #     use mfio::packet::*;
 //! #     use mfio::shared_future::*;
+//! #     use mfio::util::Event;
 //! #     include!("sample.rs");
 //! # }
 //! # use sample::SampleIo;
@@ -104,6 +106,7 @@
 //! #     use mfio::heap::{AllocHandle, PinHeap};
 //! #     use mfio::packet::*;
 //! #     use mfio::shared_future::*;
+//! #     use mfio::util::Event;
 //! #     include!("sample.rs");
 //! # }
 //! # use sample::SampleIo;
@@ -139,6 +142,7 @@
 //! #     use mfio::heap::{AllocHandle, PinHeap};
 //! #     use mfio::packet::*;
 //! #     use mfio::shared_future::*;
+//! #     use mfio::util::Event;
 //! #     include!("sample.rs");
 //! # }
 //! # use sample::SampleIo;
@@ -173,6 +177,7 @@
 //! #     use mfio::heap::{AllocHandle, PinHeap};
 //! #     use mfio::packet::*;
 //! #     use mfio::shared_future::*;
+//! #     use mfio::util::Event;
 //! #     include!("sample.rs");
 //! # }
 //! # use sample::SampleIo;
@@ -207,12 +212,14 @@ pub mod heap;
 pub mod packet;
 pub mod shared_future;
 pub mod traits;
+pub mod util;
 
 #[cfg(test)]
 mod sample {
     use crate::heap::{AllocHandle, PinHeap};
     use crate::packet::*;
     use crate::shared_future::*;
+    use crate::util::Event;
     include!("sample.rs");
 }
 
