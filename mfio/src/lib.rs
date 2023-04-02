@@ -31,7 +31,7 @@
 //! #     use mfio::heap::{AllocHandle, PinHeap};
 //! #     use mfio::packet::*;
 //! #     use mfio::shared_future::*;
-//! #     use mfio::util::Event;
+//! #     use mfio::util::*;
 //! #     include!("sample.rs");
 //! # }
 //! # use sample::SampleIo;
@@ -60,7 +60,7 @@
 //! #     use mfio::heap::{AllocHandle, PinHeap};
 //! #     use mfio::packet::*;
 //! #     use mfio::shared_future::*;
-//! #     use mfio::util::Event;
+//! #     use mfio::util::*;
 //! #     include!("sample.rs");
 //! # }
 //! # use sample::SampleIo;
@@ -68,7 +68,7 @@
 //! use mfio::packet::{PacketIo, Write};
 //! use mfio::traits::*;
 //! use core::mem::MaybeUninit;
-//! use futures::{Stream, StreamExt};
+//! use futures::{Stream, StreamExt, pin_mut};
 //! use bytemuck::{Pod, Zeroable};
 //!
 //! #[repr(C, packed)]
@@ -106,13 +106,14 @@
 //! #     use mfio::heap::{AllocHandle, PinHeap};
 //! #     use mfio::packet::*;
 //! #     use mfio::shared_future::*;
-//! #     use mfio::util::Event;
+//! #     use mfio::util::*;
 //! #     include!("sample.rs");
 //! # }
 //! # use sample::SampleIo;
 //! # pollster::block_on(async move {
 //! use mfio::packet::{PacketIo, Write};
 //! use core::mem::MaybeUninit;
+//! use core::pin::Pin;
 //! use futures::{Stream, StreamExt};
 //!
 //! let handle = SampleIo::default();
@@ -120,9 +121,10 @@
 //! {
 //!     let mut data = [MaybeUninit::uninit()];
 //!
-//!     let stream = handle.alloc_stream().await;
+//!     let mut stream = handle.new_id().await;
+//!     let stream_pinned = unsafe { Pin::new_unchecked(&mut stream) };
 //!
-//!     stream.send_io(0, &mut data);
+//!     stream_pinned.as_ref().send_io(0, &mut data);
 //!
 //!     // Unsafe! data is reused directly after the call.
 //!     core::mem::forget(stream);
@@ -133,7 +135,7 @@
 //! let mut data = [MaybeUninit::uninit()];
 //!
 //! // This will process both I/O streams, even though the previous one was forgotten.
-//! let _ = handle.io(0, &mut data).await.count().await;
+//! let _ = handle.io(0, &mut data).count().await;
 //! # });
 //! ```
 //!
@@ -142,22 +144,24 @@
 //! #     use mfio::heap::{AllocHandle, PinHeap};
 //! #     use mfio::packet::*;
 //! #     use mfio::shared_future::*;
-//! #     use mfio::util::Event;
+//! #     use mfio::util::*;
 //! #     include!("sample.rs");
 //! # }
 //! # use sample::SampleIo;
 //! # pollster::block_on(async move {
 //! use mfio::packet::{PacketIo, Write};
 //! use core::mem::MaybeUninit;
+//! use core::pin::Pin;
 //! use futures::{Stream, StreamExt};
 //!
 //! let handle = SampleIo::default();
 //! {
 //!     let mut data = [MaybeUninit::uninit()];
 //!
-//!     let stream = handle.alloc_stream().await;
+//!     let mut stream = handle.new_id().await;
+//!     let stream_pinned = unsafe { Pin::new_unchecked(&mut stream) };
 //!
-//!     stream.send_io(0, &mut data);
+//!     stream_pinned.as_ref().send_io(0, &mut data);
 //!
 //!     // Unsafe! data is dropped, and its memory is reused later outside the handle
 //!     core::mem::forget(stream);
@@ -166,7 +170,7 @@
 //! let mut data = [MaybeUninit::uninit()];
 //!
 //! // This will process both I/O streams, even though the previous one was forgotten.
-//! let _ = handle.io(0, &mut data).await.count().await;
+//! let _ = handle.io(0, &mut data).count().await;
 //! # });
 //! ```
 //!
@@ -177,22 +181,24 @@
 //! #     use mfio::heap::{AllocHandle, PinHeap};
 //! #     use mfio::packet::*;
 //! #     use mfio::shared_future::*;
-//! #     use mfio::util::Event;
+//! #     use mfio::util::*;
 //! #     include!("sample.rs");
 //! # }
 //! # use sample::SampleIo;
 //! # pollster::block_on(async move {
 //! use mfio::packet::{PacketIo, Write};
 //! use core::mem::MaybeUninit;
-//! use futures::{Stream, StreamExt};
+//! use core::pin::Pin;
+//! use futures::{Stream, StreamExt, pin_mut};
 //!
 //! let handle = SampleIo::default();
 //! {
 //!     let mut data = Box::leak(vec![MaybeUninit::uninit()].into_boxed_slice());
 //!
-//!     let stream = handle.alloc_stream().await;
+//!     let mut stream = handle.new_id().await;
+//!     pin_mut!(stream);
 //!
-//!     stream.send_io(0, data);
+//!     stream.as_ref().send_io(0, data);
 //!
 //!     // Okay! Data has been leaked to the heap.
 //!     // In addition, we don't touch the data afterwards!
@@ -204,7 +210,7 @@
 //! // This will process both I/O streams, even though the previous one was forgotten.
 //! // Processing a forgotten stream is okay, because it was allocated on the `SampleIo` heap,
 //! // instead of the stack.
-//! let _ = handle.io(0, &mut data).await.count().await;
+//! let _ = handle.io(0, &mut data).count().await;
 //! # });
 //! ```
 
@@ -219,7 +225,7 @@ mod sample {
     use crate::heap::{AllocHandle, PinHeap};
     use crate::packet::*;
     use crate::shared_future::*;
-    use crate::util::Event;
+    use crate::util::*;
     include!("sample.rs");
 }
 
@@ -241,7 +247,7 @@ mod tests {
         let handle = SampleIo::new((0..200).collect::<Vec<_>>());
         let mut value = [MaybeUninit::uninit()];
 
-        let stream = handle.io(100, &mut value[..]).await;
+        let stream = handle.io(100, &mut value[..]);
 
         let output = stream.map(|(_, b)| b).collect::<Vec<_>>().await;
         assert_eq!(vec![None], output);
@@ -258,7 +264,7 @@ mod tests {
             let scope = handle.clone();
             let mut value = [MaybeUninit::uninit()];
 
-            let stream = scope.io(100, &mut value[..]).await;
+            let stream = scope.io(100, &mut value[..]);
 
             let output = stream.map(|(_, b)| b).collect::<Vec<_>>().await;
             assert_eq!(vec![None], output);
@@ -271,7 +277,7 @@ mod tests {
             let scope = handle.clone();
             let mut value = [MaybeUninit::uninit()];
 
-            let stream = scope.io(100, &mut value[..]).await;
+            let stream = scope.io(100, &mut value[..]);
 
             let output = stream.map(|(_, b)| b).collect::<Vec<_>>().await;
             assert_eq!(vec![None], output);
@@ -286,7 +292,7 @@ mod tests {
         let handle = SampleIo::default();
         let value = [42u8];
 
-        let stream = handle.io(100, &value[..]).await;
+        let stream = handle.io(100, &value[..]);
 
         let output = stream.map(|(_, b)| b).collect::<Vec<_>>().await;
         assert_eq!(vec![None], output);
@@ -371,7 +377,7 @@ mod tests {
         for _ in 0..2 {
             let mut value = [MaybeUninit::uninit()];
 
-            let stream = handle.io(100, &mut value[..]).await;
+            let stream = handle.io(100, &mut value[..]);
 
             let output = stream.map(|(_, b)| b).collect::<Vec<_>>().await;
             assert_eq!(vec![None], output);
@@ -384,7 +390,7 @@ mod tests {
     #[tokio::test]
     async fn drop_bare_stream() {
         let handle = SampleIo::default();
-        let stream = PacketIo::<Write, _>::alloc_stream(&handle).await;
+        let stream = handle.io(100, &[]);
         core::mem::drop(stream);
     }
 
@@ -406,7 +412,7 @@ mod tests {
     async fn drop_io_stream() {
         let handle = SampleIo::default();
         let mut value = [MaybeUninit::uninit()];
-        let stream = handle.io(100, &mut value[..]).await;
+        let stream = handle.io(100, &mut value[..]);
 
         core::mem::drop(stream);
     }
@@ -428,32 +434,33 @@ mod tests {
 
             while start.elapsed() < Duration::from_millis(MILLIS) {
                 cnt += 1;
-                io.io(100, &mut [MaybeUninit::uninit()]).await.count().await;
+                io.io(100, &mut [MaybeUninit::uninit()]).count().await;
             }
 
             println!("{:.2}", cnt as f64 / start.elapsed().as_secs_f64());
         }
 
-        {
-            println!("One stream, multiple reads:");
+        /*{
+            println!("Multiple reads:");
 
             let start = Instant::now();
 
             let mut cnt = 0;
 
-            let stream = io.alloc_stream().await;
+            let mut streams = vec![];
 
             while start.elapsed() < Duration::from_millis(MILLIS) {
                 cnt += 1;
-                stream.send_io(
+                streams.push(io.io(
                     100,
                     Box::leak(vec![MaybeUninit::uninit()].into_boxed_slice()),
-                );
+                ));
             }
 
             println!("{cnt}");
 
-            let ret = stream
+            let ret = futures::stream::iter(streams)
+                .flatten()
                 .inspect(|(pkt, _)| {
                     unsafe { Box::from(core::slice::from_raw_parts_mut(pkt.data(), pkt.len())) };
                 })
@@ -462,7 +469,7 @@ mod tests {
             ret.await;
 
             println!("{:.2}", cnt as f64 / start.elapsed().as_secs_f64());
-        }
+        }*/
 
         let jobs_in_flight = (1..=2)
             .map(|i| {
@@ -480,14 +487,10 @@ mod tests {
                     while start.elapsed() < Duration::from_millis(MILLIS) {
                         cnt += 1;
 
-                        q.push_back(
-                            scope
-                                .io(
-                                    100,
-                                    Box::leak(vec![MaybeUninit::uninit()].into_boxed_slice()),
-                                )
-                                .await,
-                        );
+                        q.push_back(scope.io(
+                            100,
+                            Box::leak(vec![MaybeUninit::uninit()].into_boxed_slice()),
+                        ));
 
                         if q.len() >= 4096 / 16 {
                             q.pop_front()
@@ -562,13 +565,10 @@ mod tests {
             while start.elapsed() < Duration::from_millis(MILLIS) {
                 cnt += 1;
 
-                q.push_back(
-                    io.io(
-                        100,
-                        Box::leak(vec![MaybeUninit::uninit()].into_boxed_slice()),
-                    )
-                    .await,
-                );
+                q.push_back(io.io(
+                    100,
+                    Box::leak(vec![MaybeUninit::uninit()].into_boxed_slice()),
+                ));
 
                 if q.len() >= 4096 * 4 {
                     q.pop_front()

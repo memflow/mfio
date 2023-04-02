@@ -1,33 +1,84 @@
-use crate::heap::{AllocHandle, Release};
+use crate::heap::Release;
 use crate::shared_future::SharedFuture;
+use crate::util::ReadOnly;
 use core::future::Future;
-use core::marker::PhantomData;
+use core::marker::{PhantomData, PhantomPinned};
 use core::mem::ManuallyDrop;
 use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicIsize, Ordering};
 use core::task::{Context, Poll, Waker};
 use futures::stream::Stream;
+use multistack::MultiStack;
 use parking_lot::Mutex;
-use std::collections::VecDeque;
 use tarc::{Arc, BaseArc};
 
 type Output<'a, DataType> = (PacketObj<'a, DataType>, Option<()>);
 
 pub type BoxedFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
+#[derive(Debug)]
+pub struct PacketId<'a, Perms: PacketPerms, Param> {
+    inner: ReadOnly<PacketIdInner>,
+    stream: &'a PacketStream<'a, Perms, Param>,
+}
+
+impl<'a, Perms: PacketPerms, Param> Drop for PacketId<'a, Perms, Param> {
+    fn drop(&mut self) {
+        self.stream
+            .ctx
+            .output
+            .stack
+            .lock()
+            .free_stack(self.inner.id);
+    }
+}
+
+impl<'a, Perms: PacketPerms, Param> PacketId<'a, Perms, Param> {
+    pub fn project_inner<'b>(self: Pin<&'b Self>) -> Pin<&'b PacketIdInner> {
+        let this: &'b Self = self.get_ref();
+        unsafe { Pin::new_unchecked(&this.inner) }
+    }
+    pub fn send_io(self: Pin<&Self>, param: Param, packet: impl Into<Packet<'a, Perms>>) {
+        self.stream
+            .send_io(self.project_inner(), param, packet.into())
+    }
+}
+
+impl<'a, Perms: PacketPerms, Param> Stream for PacketId<'a, Perms, Param> {
+    type Item = Output<'a, Perms::DataType>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        let this = self.into_ref();
+        this.stream.poll_id(this, cx)
+    }
+}
+
+impl<'a, Perms: PacketPerms, Param> core::ops::Deref for PacketId<'a, Perms, Param> {
+    type Target = PacketIdInner;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.inner
+    }
+}
+
+#[derive(Debug)]
+pub struct PacketIdInner {
+    id: usize,
+    size: AtomicIsize,
+    wake: Mutex<Option<Waker>>,
+    _pinned: PhantomPinned,
+}
+
 pub trait PacketIo<Perms: PacketPerms, Param>: Sized {
     fn separate_thread_state(&mut self);
 
-    fn try_alloc_stream<'a>(
-        &'a self,
-        context: &mut Context,
-    ) -> Option<Pin<AllocHandle<PacketStream<'a, Perms, Param>>>>;
+    fn try_new_id<'a>(&'a self, context: &mut Context) -> Option<PacketId<'a, Perms, Param>>;
 
-    fn alloc_stream(&self) -> AllocStreamFut<Self, Perms, Param> {
-        AllocStreamFut {
+    fn new_id(&self) -> NewIdFut<Self, Perms, Param> {
+        NewIdFut {
             this: self,
-            poll_fn: Self::try_alloc_stream,
+            _phantom: PhantomData,
         }
     }
 
@@ -36,48 +87,60 @@ pub trait PacketIo<Perms: PacketPerms, Param>: Sized {
         param: Param,
         packet: impl Into<Packet<'a, Perms>>,
     ) -> IoFut<'a, Self, Perms, Param> {
-        IoFut {
-            this: self,
-            poll_fn: Self::try_alloc_stream,
-            state: Some((param, packet.into())),
-        }
+        IoFut::NewId(self, param, packet.into())
     }
 }
 
-pub struct IoFut<'a, T: PacketIo<Perms, Param>, Perms: PacketPerms, Param> {
-    this: &'a T,
-    poll_fn: fn(&'a T, &mut Context) -> Option<<Self as Future>::Output>,
-    state: Option<(Param, Packet<'a, Perms>)>,
+pub enum IoFut<'a, T, Perms: PacketPerms, Param> {
+    NewId(&'a T, Param, Packet<'a, Perms>),
+    InProgress(PacketId<'a, Perms, Param>),
 }
 
-impl<'a, T: PacketIo<Perms, Param>, Perms: PacketPerms, Param> Future
+impl<'a, T: PacketIo<Perms, Param>, Perms: PacketPerms, Param> Stream
     for IoFut<'a, T, Perms, Param>
 {
-    type Output = <AllocStreamFut<'a, T, Perms, Param> as Future>::Output;
+    type Item = Output<'a, Perms::DataType>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
-        if let Some(stream) = (this.poll_fn)(this.this, cx) {
-            let (param, buffer) = this.state.take().unwrap();
-            stream.send_io(param, buffer);
-            Poll::Ready(stream)
-        } else {
-            Poll::Pending
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        let state = unsafe { self.get_unchecked_mut() };
+        loop {
+            match state {
+                IoFut::NewId(this, _, _) => {
+                    if let Some(packet_id) = (*this).try_new_id(cx) {
+                        let in_progress = IoFut::InProgress(packet_id);
+                        let prev = core::mem::replace(state, in_progress);
+                        match (&mut *state, prev) {
+                            (IoFut::InProgress(packet_id), IoFut::NewId(_, param, packet)) => {
+                                unsafe { Pin::new_unchecked(&*packet_id) }.send_io(param, packet);
+                            }
+                            _ => unreachable!(),
+                        }
+                    } else {
+                        break Poll::Pending;
+                    }
+                }
+                IoFut::InProgress(packet_id) => {
+                    let packet_id = unsafe { Pin::new_unchecked(packet_id) };
+                    break packet_id.poll_next(cx);
+                }
+            }
         }
     }
 }
 
-pub struct AllocStreamFut<'a, T, Perms: PacketPerms, Param> {
+pub struct NewIdFut<'a, T, Perms: PacketPerms, Param> {
     this: &'a T,
-    poll_fn: fn(&'a T, &mut Context) -> Option<<Self as Future>::Output>,
+    _phantom: PhantomData<(Perms, Param)>,
 }
 
-impl<'a, T, Perms: PacketPerms, Param> Future for AllocStreamFut<'a, T, Perms, Param> {
-    type Output = Pin<AllocHandle<PacketStream<'a, Perms, Param>>>;
+impl<'a, T: PacketIo<Perms, Param>, Perms: PacketPerms, Param: 'a> Future
+    for NewIdFut<'a, T, Perms, Param>
+{
+    type Output = PacketId<'a, Perms, Param>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        if let Some(stream) = (self.poll_fn)(self.this, cx) {
-            Poll::Ready(stream)
+        if let Some(packet_id) = self.this.try_new_id(cx) {
+            Poll::Ready(packet_id)
         } else {
             Poll::Pending
         }
@@ -89,20 +152,28 @@ pub struct PacketStream<'a, Perms: PacketPerms, Param> {
     pub future: SharedFuture<BoxedFuture>,
 }
 
-impl<'a, Perms: PacketPerms, Param> Stream for PacketStream<'a, Perms, Param> {
-    type Item = Output<'a, Perms::DataType>;
+impl<'a, Perms: PacketPerms, Param: core::fmt::Debug> core::fmt::Debug
+    for PacketStream<'a, Perms, Param>
+{
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+        write!(fmt, "({:?})", self.ctx)
+    }
+}
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let this = self.as_ref();
-
-        let closed = this.ctx.output.size.load(Ordering::Relaxed) <= 0;
+impl<'a, Perms: PacketPerms, Param> PacketStream<'a, Perms, Param> {
+    pub fn poll_id(
+        &self,
+        id: Pin<&PacketId<'a, Perms, Param>>,
+        cx: &mut Context,
+    ) -> Poll<Option<Output<'a, Perms::DataType>>> {
+        let closed = id.inner.size.load(Ordering::Relaxed) <= 0;
 
         // Try polling the backend future if it should be run
         if !closed {
-            this.future.try_run_once_sync(cx);
+            self.future.try_run_once_sync(cx);
         }
 
-        match this.ctx.output.queue.lock().pop_front() {
+        match self.ctx.output.stack.lock().pop(id.inner.id) {
             Some(elem) => return Poll::Ready(Some(elem)),
             _ if closed => return Poll::Ready(None),
             _ => {}
@@ -110,17 +181,53 @@ impl<'a, Perms: PacketPerms, Param> Stream for PacketStream<'a, Perms, Param> {
 
         // Install the waker. Note that after this we must check for end condition once more to
         // avoid deadlocks.
-        *this.ctx.output.wake.lock() = Some(cx.waker().clone());
+        *id.inner.wake.lock() = Some(cx.waker().clone());
 
-        match this.ctx.output.queue.lock().pop_front() {
+        match self.ctx.output.stack.lock().pop(id.inner.id) {
             Some(elem) => return Poll::Ready(Some(elem)),
             // Check for one final time if we got closed while inserting the waker,
             // and if so, avoid returning Pending to avoid deadlock.
-            _ if this.ctx.output.size.load(Ordering::Acquire) <= 0 => return Poll::Ready(None),
+            _ if id.inner.size.load(Ordering::Acquire) <= 0 => return Poll::Ready(None),
             _ => {}
         }
 
         Poll::Pending
+    }
+
+    pub fn new_packet_id(&self) -> PacketId<Perms, Param> {
+        let id = self.ctx.output.stack.lock().new_stack();
+
+        // Shorten lifetime of the stream.
+        // This is "okay", because we do not allow to put any data into the stream with shorter
+        // lifetime, apart from the borrowed byte buffers, which are safe if the stream does not
+        // get forgotten. See mfio top level documentation about the safety guarantees.
+        let stream = unsafe { core::mem::transmute::<&Self, _>(self) };
+
+        PacketId {
+            inner: PacketIdInner {
+                id,
+                size: 0.into(),
+                wake: Default::default(),
+                _pinned: PhantomPinned,
+            }
+            .into(),
+            stream,
+        }
+        .into()
+    }
+
+    pub fn send_io<'b>(&self, id: Pin<&'b PacketIdInner>, param: Param, packet: Packet<'b, Perms>)
+    where
+        'a: 'b,
+    {
+        // Shorten lifetime of self.
+        // According to safety guarantees of the crate, this is valid.
+        // PacketId is pinned, thus it will be polled to completion, meaning no data of lifetime 'b
+        // will be left in the system by the time 'b is dropped.
+        let stream: &PacketStream<'b, Perms, Param> =
+            unsafe { core::mem::transmute::<&Self, _>(self) };
+        let packet = packet.bind(stream, id);
+        PacketIoHandle::send_input(&stream.ctx.io, param, packet);
     }
 }
 
@@ -144,26 +251,15 @@ impl<'a, Perms: PacketPerms, Param> Release for PacketStream<'a, Perms, Param> {
     }
 }
 
-impl<'a, Perms: PacketPerms, Param> PacketStream<'a, Perms, Param> {
-    pub fn send_io(&self, param: Param, packet: impl Into<Packet<'a, Perms>>) {
-        let packet = packet.into().bind(self);
-        PacketIoHandle::send_input(&self.ctx.io, param, packet);
-    }
-}
-
 #[derive(Debug)]
 pub struct PacketOutput<'a, Perms: PacketPerms> {
-    pub queue: Mutex<VecDeque<Output<'a, <Perms as PacketPerms>::DataType>>>,
-    pub size: AtomicIsize,
-    pub wake: Mutex<Option<Waker>>,
+    pub stack: Mutex<MultiStack<Output<'a, <Perms as PacketPerms>::DataType>>>,
 }
 
 impl<'a, Perms: PacketPerms> Default for PacketOutput<'a, Perms> {
     fn default() -> Self {
         Self {
-            queue: Default::default(),
-            wake: Default::default(),
-            size: 0.into(),
+            stack: Default::default(),
         }
     }
 }
@@ -485,13 +581,21 @@ impl core::ops::Deref for ReadPacketObj<'_> {
 }
 
 impl<'a, Perms: PacketPerms> Packet<'a, Perms> {
-    pub fn bind<Param>(self, stream: &PacketStream<'a, Perms, Param>) -> BoundPacket<'a, Perms> {
+    pub fn bind<'b, Param>(
+        self,
+        stream: &PacketStream<'b, Perms, Param>,
+        id: Pin<&'b PacketIdInner>,
+    ) -> BoundPacket<'b, Perms>
+    where
+        'a: 'b,
+    {
         let Packet { obj, vtable } = self;
-        stream.ctx.output.size.fetch_add(1, Ordering::Acquire);
+        id.size.fetch_add(1, Ordering::Acquire);
         BoundPacket {
             obj: BoundPacketObj {
                 buffer: ManuallyDrop::new(obj),
                 output: stream.ctx.clone().transpose(),
+                id,
             },
             vtable,
         }
@@ -503,16 +607,18 @@ impl<'a, Perms: PacketPerms> Packet<'a, Perms> {
 pub struct BoundPacketObj<'a, T: PacketPerms> {
     buffer: ManuallyDrop<PacketObj<'a, T::DataType>>,
     output: Arc<PacketOutput<'a, T>>,
+    id: Pin<&'a PacketIdInner>,
 }
 
 impl<'a, T: PacketPerms> Drop for BoundPacketObj<'a, T> {
     fn drop(&mut self) {
+        let id = self.id.id;
         self.output
-            .queue
+            .stack
             .lock()
-            .push_back((unsafe { ManuallyDrop::take(&mut self.buffer) }, None));
-        self.output.size.fetch_sub(1, Ordering::Release);
-        if let Some(wake) = self.output.wake.lock().take() {
+            .push(id, (unsafe { ManuallyDrop::take(&mut self.buffer) }, None));
+        self.id.size.fetch_sub(1, Ordering::Release);
+        if let Some(wake) = self.id.wake.lock().take() {
             wake.wake();
         }
     }

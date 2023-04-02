@@ -4,10 +4,12 @@ debug = true
 
 [workspace]
 members = [
-	"mfio"
+	"mfio",
+	"multistack",
 ]
 
 default-members = [
-	"mfio"
+	"mfio",
+	"multistack",
 ]
 

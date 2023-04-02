@@ -96,9 +96,8 @@ impl Drop for VolatileMem {
 
 #[derive(Clone)]
 pub struct IoThreadState {
-    read_io: BaseArc<IoThreadHandle<Write>>,
-    write_io: BaseArc<IoThreadHandle<Read>>,
-    future: SharedFuture<BoxedFuture>,
+    read_stream: BaseArc<PacketStream<'static, Write, Address>>,
+    write_stream: BaseArc<PacketStream<'static, Read, Address>>,
 }
 
 impl IoThreadState {
@@ -161,10 +160,19 @@ impl IoThreadState {
         }) as BoxedFuture;
         let future = SharedFuture::from(future);
 
+        let write_stream = BaseArc::from(PacketStream {
+            ctx: PacketCtx::new(write_io.clone()).into(),
+            future: future.clone(),
+        });
+
+        let read_stream = BaseArc::from(PacketStream {
+            ctx: PacketCtx::new(read_io.clone()).into(),
+            future: future.clone(),
+        });
+
         Self {
-            read_io,
-            write_io,
-            future,
+            write_stream,
+            read_stream,
         }
     }
 }
@@ -173,8 +181,6 @@ impl IoThreadState {
 pub struct SampleIo {
     mem: Arc<VolatileMem>,
     thread_state: IoThreadState,
-    read_streams: Arc<PinHeap<PacketStream<'static, Write, Address>>>,
-    write_streams: Arc<PinHeap<PacketStream<'static, Read, Address>>>,
 }
 
 impl Default for SampleIo {
@@ -192,98 +198,26 @@ impl SampleIo {
         Self {
             mem,
             thread_state,
-            read_streams: Default::default(),
-            write_streams: Default::default(),
         }
     }
 }
 
 impl PacketIo<Read, Address> for SampleIo {
     fn separate_thread_state(&mut self) {
-        self.write_streams = Default::default();
         self.thread_state = IoThreadState::new(&self.mem);
     }
 
-    fn try_alloc_stream(
-        &self,
-        _: &mut Context,
-    ) -> Option<Pin<AllocHandle<PacketStream<Read, Address>>>> {
-        let stream = PinHeap::alloc_or_cached(
-            self.write_streams.clone(),
-            || {
-                let stream = PacketStream {
-                    ctx: PacketCtx::new(self.thread_state.write_io.clone()).into(),
-                    future: self.thread_state.future.clone(),
-                };
-
-                unsafe { core::mem::transmute(stream) }
-            },
-            |e| {
-                // If queue is referenced somewhere else
-                if e.ctx.strong_count() > 1 {
-                    e.ctx = Arc::new(PacketCtx::new(self.thread_state.write_io.clone()));
-                    e.future = self.thread_state.future.clone();
-                } else {
-                    e.ctx.output.queue.lock().clear();
-                    *e.ctx.output.wake.lock() = None;
-                    e.ctx.output.size.store(0, Ordering::Relaxed);
-                }
-                // No need to clone the future - it's the same future!
-                //e.future = self.future.clone();
-            },
-        );
-
-        // Shorten lifetime of the stream.
-        // This is okay, because we do not allow to put any data into the stream with shorter
-        // lifetime, apart from the borrowed byte buffers, which are safe if the stream does not
-        // get forgotten. See mfio top level documentation about the safety guarantees.
-        let stream = unsafe { core::mem::transmute(Pin::from(stream)) };
-
-        Some(stream)
+    fn try_new_id<'a>(&'a self, _: &mut Context) -> Option<PacketId<'a, Read, Address>> {
+        Some(self.thread_state.write_stream.new_packet_id())
     }
 }
 
 impl PacketIo<Write, Address> for SampleIo {
     fn separate_thread_state(&mut self) {
-        self.read_streams = Default::default();
         self.thread_state = IoThreadState::new(&self.mem);
     }
 
-    fn try_alloc_stream(
-        &self,
-        _: &mut Context,
-    ) -> Option<Pin<AllocHandle<PacketStream<Write, Address>>>> {
-        let stream = PinHeap::alloc_or_cached(
-            self.read_streams.clone(),
-            || {
-                let stream = PacketStream {
-                    ctx: PacketCtx::new(self.thread_state.read_io.clone()).into(),
-                    future: self.thread_state.future.clone(),
-                };
-
-                unsafe { core::mem::transmute(stream) }
-            },
-            |e| {
-                // If queue is referenced somewhere else, or is pointing to different IO handle
-                if e.ctx.strong_count() > 1 || self.thread_state.read_io != *e.ctx {
-                    e.ctx = Arc::new(PacketCtx::new(self.thread_state.read_io.clone()));
-                    e.future = self.thread_state.future.clone();
-                } else {
-                    e.ctx.output.queue.lock().clear();
-                    *e.ctx.output.wake.lock() = None;
-                    e.ctx.output.size.store(0, Ordering::Relaxed);
-                }
-                // No need to clone the future - it's the same future!
-                //e.future = self.future.clone();
-            },
-        );
-
-        // Shorten lifetime of the stream.
-        // This is okay, because we do not allow to put any data into the stream with shorter
-        // lifetime, apart from the borrowed byte buffers, which are safe if the stream does not
-        // get forgotten. See mfio top level documentation about the safety guarantees.
-        let stream = unsafe { core::mem::transmute(Pin::from(stream)) };
-
-        Some(stream)
+    fn try_new_id<'a>(&'a self, _: &mut Context) -> Option<PacketId<'a, Write, Address>> {
+        Some(self.thread_state.read_stream.new_packet_id())
     }
 }

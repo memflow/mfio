@@ -1,3 +1,4 @@
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Waker;
 use parking_lot::Mutex;
@@ -35,5 +36,25 @@ impl Event {
             }
         })
         .await;
+    }
+}
+
+#[derive(Default, Debug)]
+pub struct ReadOnly<T>(UnsafeCell<T>);
+
+unsafe impl<T: Sync> Sync for ReadOnly<T> {}
+unsafe impl<T: Send> Send for ReadOnly<T> {}
+
+impl<T> core::ops::Deref for ReadOnly<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*(self.0.get() as *const _) }
+    }
+}
+
+impl<T> From<T> for ReadOnly<T> {
+    fn from(data: T) -> Self {
+        Self(data.into())
     }
 }
