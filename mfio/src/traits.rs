@@ -1,5 +1,5 @@
 use crate::packet::*;
-use crate::util::ReadOnly;
+
 use bytemuck::Pod;
 use core::future::Future;
 use core::mem::MaybeUninit;

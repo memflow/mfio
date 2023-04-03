@@ -1,6 +1,6 @@
 use core::mem::MaybeUninit;
-use core::pin::Pin;
-use core::sync::atomic::Ordering;
+
+
 use core::task::Context;
 
 use tarc::{Arc, BaseArc};
@@ -161,12 +161,12 @@ impl IoThreadState {
         let future = SharedFuture::from(future);
 
         let write_stream = BaseArc::from(PacketStream {
-            ctx: PacketCtx::new(write_io.clone()).into(),
+            ctx: PacketCtx::new(write_io).into(),
             future: future.clone(),
         });
 
         let read_stream = BaseArc::from(PacketStream {
-            ctx: PacketCtx::new(read_io.clone()).into(),
+            ctx: PacketCtx::new(read_io).into(),
             future: future.clone(),
         });
 

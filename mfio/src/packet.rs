@@ -58,7 +58,7 @@ impl<'a, Perms: PacketPerms, Param> core::ops::Deref for PacketId<'a, Perms, Par
     type Target = PacketIdInner;
 
     fn deref(&self) -> &Self::Target {
-        &*self.inner
+        &self.inner
     }
 }
 
@@ -213,7 +213,6 @@ impl<'a, Perms: PacketPerms, Param> PacketStream<'a, Perms, Param> {
             .into(),
             stream,
         }
-        .into()
     }
 
     pub fn send_io<'b>(&self, id: Pin<&'b PacketIdInner>, param: Param, packet: Packet<'b, Perms>)

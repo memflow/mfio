@@ -195,14 +195,13 @@
 //! {
 //!     let mut data = Box::leak(vec![MaybeUninit::uninit()].into_boxed_slice());
 //!
-//!     let mut stream = handle.new_id().await;
-//!     pin_mut!(stream);
+//!     let mut stream = Box::pin(handle.new_id().await);
 //!
 //!     stream.as_ref().send_io(0, data);
 //!
 //!     // Okay! Data has been leaked to the heap.
 //!     // In addition, we don't touch the data afterwards!
-//!     core::mem::forget(stream);
+//!     Box::leak(unsafe { Pin::into_inner_unchecked(stream) });
 //! }
 //!
 //! let mut data = [MaybeUninit::uninit()];
@@ -222,7 +221,7 @@ pub mod util;
 
 #[cfg(test)]
 mod sample {
-    use crate::heap::{AllocHandle, PinHeap};
+
     use crate::packet::*;
     use crate::shared_future::*;
     use crate::util::*;
