@@ -9,7 +9,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicIsize, Ordering};
 use core::task::{Context, Poll, Waker};
 use futures::stream::Stream;
-use multistack::MultiStack;
+use multistack::{MultiStack, StackHandle};
 use parking_lot::Mutex;
 use tarc::{Arc, BaseArc};
 
@@ -30,7 +30,7 @@ impl<'a, Perms: PacketPerms, Param> Drop for PacketId<'a, Perms, Param> {
             .output
             .stack
             .lock()
-            .free_stack(self.inner.id);
+            .free_stack(&self.inner.id);
     }
 }
 
@@ -64,7 +64,7 @@ impl<'a, Perms: PacketPerms, Param> core::ops::Deref for PacketId<'a, Perms, Par
 
 #[derive(Debug)]
 pub struct PacketIdInner {
-    id: usize,
+    id: StackHandle,
     size: AtomicIsize,
     wake: Mutex<Option<Waker>>,
     _pinned: PhantomPinned,
@@ -173,7 +173,7 @@ impl<'a, Perms: PacketPerms, Param> PacketStream<'a, Perms, Param> {
             self.future.try_run_once_sync(cx);
         }
 
-        match self.ctx.output.stack.lock().pop(id.inner.id) {
+        match self.ctx.output.stack.lock().pop(&id.inner.id) {
             Some(elem) => return Poll::Ready(Some(elem)),
             _ if closed => return Poll::Ready(None),
             _ => {}
@@ -183,7 +183,7 @@ impl<'a, Perms: PacketPerms, Param> PacketStream<'a, Perms, Param> {
         // avoid deadlocks.
         *id.inner.wake.lock() = Some(cx.waker().clone());
 
-        match self.ctx.output.stack.lock().pop(id.inner.id) {
+        match self.ctx.output.stack.lock().pop(&id.inner.id) {
             Some(elem) => return Poll::Ready(Some(elem)),
             // Check for one final time if we got closed while inserting the waker,
             // and if so, avoid returning Pending to avoid deadlock.
@@ -611,7 +611,7 @@ pub struct BoundPacketObj<'a, T: PacketPerms> {
 
 impl<'a, T: PacketPerms> Drop for BoundPacketObj<'a, T> {
     fn drop(&mut self) {
-        let id = self.id.id;
+        let id = &self.id.id;
         self.output
             .stack
             .lock()
