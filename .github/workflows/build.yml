@@ -124,3 +124,26 @@ jobs:
         run: |
           MIRIFLAGS="-Zmiri-ignore-leaks -Zmiri-symbolic-alignment-check" cargo miri test
 
+  build-coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          path: 'mfio-repo'
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: nightly-2023-02-24
+          override: true
+      - run: cargo install grcov
+      - name: Run tests with coverage
+        run: |
+          cd mfio-repo
+          export CARGO_INCREMENTAL=0
+          export RUSTFLAGS="-Zprofile -Ccodegen-units=1 -Copt-level=0 -Clink-dead-code -Coverflow-checks=off -Zpanic_abort_tests -Cpanic=abort"
+          export RUSTDOCFLAGS="-Cpanic=abort"
+          cargo build --workspace --all-features
+          cargo test --workspace --all-features
+          grcov ./target/debug/ -s . -t lcov --llvm --branch --ignore-not-existing -o ./target/debug/coverage
+          bash <(curl -s https://codecov.io/bash) -f ./target/debug/coverage -t ${{ secrets.CODECOV_TOKEN }};
+
