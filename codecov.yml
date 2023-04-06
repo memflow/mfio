@@ -1,0 +1,6 @@
+coverage:
+  status:
+    project:
+      default:
+        target: 70% # TODO: up this to at least 75%
+        threshold: 1% 
