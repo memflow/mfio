@@ -1,5 +1,6 @@
 use crate::packet::*;
 
+use crate::util::UsizeMath;
 use bytemuck::Pod;
 use core::future::Future;
 use core::mem::MaybeUninit;
@@ -157,15 +158,16 @@ pub enum ReadToEndFutState<'a, Io: PacketIo<Write, Param>, Param: 'a> {
         usize,
         usize,
         Option<usize>,
+        Option<()>,
         <NewIdFut<'a, Io, Write, Param> as Future>::Output,
     ),
     Finished,
 }
 
-impl<'a, Io: PacketIo<Write, Param>, Param: Copy + core::ops::AddAssign<usize>> Future
+impl<'a, Io: PacketIo<Write, Param>, Param: Copy + UsizeMath> Future
     for ReadToEndFut<'a, Io, Param>
 {
-    type Output = usize;
+    type Output = Option<usize>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
@@ -181,7 +183,7 @@ impl<'a, Io: PacketIo<Write, Param>, Param: Copy + core::ops::AddAssign<usize>> 
 
                         // Reserve enough for 32 bytes of data initially
                         if start_cap - start_len < 32 {
-                            this.buf.reserve(start_cap - start_len);
+                            this.buf.reserve(32 - (start_cap - start_len));
                         }
 
                         // Issue a read
@@ -194,10 +196,11 @@ impl<'a, Io: PacketIo<Write, Param>, Param: Copy + core::ops::AddAssign<usize>> 
                                 this.buf.capacity() - start_len,
                             )
                         };
-                        this.state = ReadToEndFutState::Read(start_len, start_cap, None, stream);
+                        this.state =
+                            ReadToEndFutState::Read(start_len, start_cap, None, None, stream);
 
                         match &mut this.state {
-                            ReadToEndFutState::Read(_, _, _, stream) => {
+                            ReadToEndFutState::Read(_, _, _, _, stream) => {
                                 unsafe { Pin::new_unchecked(&*stream) }.send_io(this.pos, data);
                             }
                             _ => unreachable!(),
@@ -206,14 +209,15 @@ impl<'a, Io: PacketIo<Write, Param>, Param: Copy + core::ops::AddAssign<usize>> 
                         break Poll::Pending;
                     }
                 }
-                ReadToEndFutState::Read(start_len, start_cap, final_cap, stream) => {
+                ReadToEndFutState::Read(start_len, start_cap, final_cap, error, stream) => {
                     match unsafe { Pin::new_unchecked(&mut *stream) }.poll_next(cx) {
                         Poll::Ready(Some((pkt, err))) => {
                             // We failed, thus cap the buffer length, complete queued I/O, but do not
                             // perform any further reads.
                             if err.is_some() {
-                                let new_end = pkt.end();
+                                let new_end = pkt.start() + (this.buf.len() - *start_len);
                                 let end = final_cap.get_or_insert(new_end);
+                                *error = err;
                                 *end = core::cmp::min(*end, new_end);
                             }
                         }
@@ -224,7 +228,12 @@ impl<'a, Io: PacketIo<Write, Param>, Param: Copy + core::ops::AddAssign<usize>> 
                                 Some(cap) => {
                                     // SAFETY: these bytes have been successfully read
                                     unsafe { this.buf.set_len(*start_len + *cap) };
-                                    break Poll::Ready(*cap);
+                                    this.pos.add_assign(this.buf.len() - *start_len);
+                                    if error.is_some() && *cap == 0 {
+                                        break Poll::Ready(None);
+                                    } else {
+                                        break Poll::Ready(Some(*cap));
+                                    }
                                 }
                                 _ => {
                                     // SAFETY: all these bytes have been successfully read
@@ -246,9 +255,8 @@ impl<'a, Io: PacketIo<Write, Param>, Param: Copy + core::ops::AddAssign<usize>> 
                                         )
                                     };
 
-                                    this.pos += this.buf.len() - *start_len;
-
-                                    unsafe { Pin::new_unchecked(&*stream) }.send_io(this.pos, data);
+                                    unsafe { Pin::new_unchecked(&*stream) }
+                                        .send_io(this.pos.add(this.buf.len()), data);
                                 }
                             }
                         }

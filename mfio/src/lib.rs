@@ -217,8 +217,11 @@ pub mod heap;
 pub(crate) mod multistack;
 pub mod packet;
 pub mod shared_future;
+pub mod stdeq;
 pub mod traits;
 pub mod util;
+
+pub use tarc;
 
 #[cfg(test)]
 mod sample {

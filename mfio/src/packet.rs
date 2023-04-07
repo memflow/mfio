@@ -149,7 +149,7 @@ impl<'a, T: PacketIo<Perms, Param>, Perms: PacketPerms, Param: 'a> Future
 
 pub struct PacketStream<'a, Perms: PacketPerms, Param> {
     pub ctx: Arc<PacketCtx<'a, Perms, Param>>,
-    pub future: SharedFuture<BoxedFuture>,
+    pub future: Option<SharedFuture<BoxedFuture>>,
 }
 
 impl<'a, Perms: PacketPerms, Param: core::fmt::Debug> core::fmt::Debug
@@ -170,7 +170,7 @@ impl<'a, Perms: PacketPerms, Param> PacketStream<'a, Perms, Param> {
 
         // Try polling the backend future if it should be run
         if !closed {
-            self.future.try_run_once_sync(cx);
+            let _ = self.future.as_ref().map(|f| f.try_run_once_sync(cx));
         }
 
         match self.ctx.output.stack.lock().pop(&id.inner.id) {
@@ -422,6 +422,30 @@ impl<'a, DataType: Copy> PacketObj<'a, DataType> {
     pub fn data(&self) -> DataType {
         self.data
     }
+
+    pub fn split_local(self, pos: usize) -> (Self, Self) {
+        assert!(pos < self.len());
+        let Self {
+            data,
+            start,
+            end,
+            _phantom,
+        } = self;
+        (
+            Self {
+                data,
+                start,
+                end: start + pos,
+                _phantom,
+            },
+            Self {
+                data,
+                start: start + pos,
+                end,
+                _phantom,
+            },
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -524,6 +548,27 @@ pub struct ReadWritePacketObj<'a> {
     buffer: BoundPacketObj<'a, ReadWrite>,
 }
 
+impl<'a> ReadWritePacketObj<'a> {
+    pub fn split_at(self, len: usize) -> (Self, Self) {
+        let (b1, b2) = self.buffer.split_at(len);
+
+        (
+            Self {
+                alloced_packet: self.alloced_packet,
+                buffer: b1,
+            },
+            Self {
+                alloced_packet: unsafe { self.alloced_packet.add(len) },
+                buffer: b2,
+            },
+        )
+    }
+
+    pub fn error(self, err: Option<()>) {
+        self.buffer.error(err)
+    }
+}
+
 impl core::ops::Deref for ReadWritePacketObj<'_> {
     type Target = [u8];
 
@@ -544,6 +589,27 @@ unsafe impl<'a> Send for ReadWritePacketObj<'a> {}
 pub struct WritePacketObj<'a> {
     alloced_packet: *mut MaybeUninit<u8>,
     buffer: BoundPacketObj<'a, Write>,
+}
+
+impl<'a> WritePacketObj<'a> {
+    pub fn split_at(self, len: usize) -> (Self, Self) {
+        let (b1, b2) = self.buffer.split_at(len);
+
+        (
+            Self {
+                alloced_packet: self.alloced_packet,
+                buffer: b1,
+            },
+            Self {
+                alloced_packet: unsafe { self.alloced_packet.add(len) },
+                buffer: b2,
+            },
+        )
+    }
+
+    pub fn error(self, err: Option<()>) {
+        self.buffer.error(err)
+    }
 }
 
 impl core::ops::Deref for WritePacketObj<'_> {
@@ -569,6 +635,27 @@ unsafe impl<'a, DataType> Sync for PacketObj<'a, DataType> {}
 pub struct ReadPacketObj<'a> {
     alloced_packet: *const u8,
     buffer: BoundPacketObj<'a, Read>,
+}
+
+impl<'a> ReadPacketObj<'a> {
+    pub fn split_at(self, len: usize) -> (Self, Self) {
+        let (b1, b2) = self.buffer.split_at(len);
+
+        (
+            Self {
+                alloced_packet: self.alloced_packet,
+                buffer: b1,
+            },
+            Self {
+                alloced_packet: unsafe { self.alloced_packet.add(len) },
+                buffer: b2,
+            },
+        )
+    }
+
+    pub fn error(self, err: Option<()>) {
+        self.buffer.error(err)
+    }
 }
 
 impl core::ops::Deref for ReadPacketObj<'_> {
@@ -611,14 +698,50 @@ pub struct BoundPacketObj<'a, T: PacketPerms> {
 
 impl<'a, T: PacketPerms> Drop for BoundPacketObj<'a, T> {
     fn drop(&mut self) {
+        self.output(None)
+    }
+}
+
+impl<'a, T: PacketPerms> BoundPacketObj<'a, T> {
+    fn output(&mut self, err: Option<()>) {
         let id = &self.id.id;
         self.output
             .stack
             .lock()
-            .push(id, (unsafe { ManuallyDrop::take(&mut self.buffer) }, None));
+            .push(id, (unsafe { ManuallyDrop::take(&mut self.buffer) }, err));
         self.id.size.fetch_sub(1, Ordering::Release);
         if let Some(wake) = self.id.wake.lock().take() {
             wake.wake();
+        }
+    }
+
+    pub fn split_at(self, len: usize) -> (Self, Self) {
+        let mut this = ManuallyDrop::new(self);
+        let buffer = unsafe { ManuallyDrop::take(&mut this.buffer) };
+        let (b1, b2) = buffer.split_local(len);
+
+        (
+            Self {
+                buffer: ManuallyDrop::new(b1),
+                output: this.output.clone(),
+                id: this.id,
+            },
+            Self {
+                buffer: ManuallyDrop::new(b2),
+                // SAFETY:
+                // we are doing this, because otherwise the Arc would leak.
+                output: unsafe { core::ptr::read(&this.output) },
+                id: this.id,
+            },
+        )
+    }
+
+    pub fn error(mut self, err: Option<()>) {
+        self.output(err);
+        // Manually drop the output arc, but nothing else
+        let mut this = MaybeUninit::new(self);
+        unsafe {
+            core::ptr::drop_in_place(&mut this.assume_init_mut().output);
         }
     }
 }

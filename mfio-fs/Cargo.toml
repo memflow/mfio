@@ -1,0 +1,11 @@
+[package]
+name = "mfio-fs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mfio = { version = "0.1", path = "../mfio" }
+futures-io = "0.3"
+
+[dev-dependencies]
+pollster = "0.3.0"

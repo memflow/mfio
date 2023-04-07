@@ -162,12 +162,12 @@ impl IoThreadState {
 
         let write_stream = BaseArc::from(PacketStream {
             ctx: PacketCtx::new(write_io).into(),
-            future: future.clone(),
+            future: Some(future.clone()),
         });
 
         let read_stream = BaseArc::from(PacketStream {
             ctx: PacketCtx::new(read_io).into(),
-            future: future.clone(),
+            future: Some(future),
         });
 
         Self {

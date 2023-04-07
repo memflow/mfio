@@ -58,3 +58,28 @@ impl<T> From<T> for ReadOnly<T> {
         Self(data.into())
     }
 }
+
+pub(crate) trait UsizeMath {
+    fn add_assign(&mut self, val: usize);
+    fn add(self, val: usize) -> Self;
+}
+
+impl UsizeMath for usize {
+    fn add_assign(&mut self, val: usize) {
+        *self += val;
+    }
+
+    fn add(self, val: usize) -> Self {
+        self + val
+    }
+}
+
+impl UsizeMath for u64 {
+    fn add_assign(&mut self, val: usize) {
+        *self += val as u64;
+    }
+
+    fn add(self, val: usize) -> Self {
+        self + val as u64
+    }
+}

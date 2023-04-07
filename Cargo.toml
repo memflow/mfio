@@ -5,9 +5,11 @@ debug = true
 [workspace]
 members = [
 	"mfio",
+	"mfio-fs",
 ]
 
 default-members = [
 	"mfio",
+	"mfio-fs",
 ]
 
