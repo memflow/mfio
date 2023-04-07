@@ -5,11 +5,9 @@ debug = true
 [workspace]
 members = [
 	"mfio",
-	"multistack",
 ]
 
 default-members = [
 	"mfio",
-	"multistack",
 ]
 

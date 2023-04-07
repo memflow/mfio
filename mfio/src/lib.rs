@@ -214,6 +214,7 @@
 //! ```
 
 pub mod heap;
+pub(crate) mod multistack;
 pub mod packet;
 pub mod shared_future;
 pub mod traits;

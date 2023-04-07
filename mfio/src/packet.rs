@@ -1,4 +1,5 @@
 use crate::heap::Release;
+use crate::multistack::{MultiStack, StackHandle};
 use crate::shared_future::SharedFuture;
 use crate::util::ReadOnly;
 use core::future::Future;
@@ -9,7 +10,6 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicIsize, Ordering};
 use core::task::{Context, Poll, Waker};
 use futures::stream::Stream;
-use multistack::{MultiStack, StackHandle};
 use parking_lot::Mutex;
 use tarc::{Arc, BaseArc};
 

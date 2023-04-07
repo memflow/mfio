@@ -22,7 +22,6 @@ parking_lot = "0.12"
 pin-project = "1.0"
 tarc = "0.1"
 bytemuck = "1"
-multistack = { version = "0.1", path = "../multistack" }
 
 [dev-dependencies]
 tokio = { version = "1.24", features = ["rt", "macros", "rt-multi-thread"] }
