@@ -5,13 +5,18 @@ use std::thread::{self, JoinHandle};
 use core::mem::ManuallyDrop;
 use core::task::Context;
 
-#[cfg(unix)]
+#[cfg(all(unix, not(miri)))]
 use std::os::unix::fs::FileExt;
-#[cfg(windows)]
+#[cfg(all(windows, not(miri)))]
 use std::os::windows::fs::FileExt;
 
 use mfio::packet::*;
 use mfio::tarc::BaseArc;
+
+#[cfg(miri)]
+type FileInner = std::sync::Mutex<File>;
+#[cfg(not(miri))]
+type FileInner = File;
 
 struct IoThreadHandle<Perms: PacketPerms> {
     handle: PacketIoHandle<'static, Perms, u64>,
@@ -39,22 +44,42 @@ impl<Perms: PacketPerms> PacketIoHandleable<'static, Perms, u64> for IoThreadHan
     }
 }
 
-fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
-    #[cfg(unix)]
-    return file.read_at(buf, offset);
-    #[cfg(windows)]
-    return file.seek_read(buf, offset);
+fn read_at(file: &FileInner, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(miri)]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = file.lock().unwrap();
+        file.seek(SeekFrom::Start(offset))?;
+        return file.read(buf);
+    }
+    #[cfg(not(miri))]
+    {
+        #[cfg(unix)]
+        return file.read_at(buf, offset);
+        #[cfg(windows)]
+        return file.seek_read(buf, offset);
+    }
 }
 
-fn write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
-    #[cfg(unix)]
-    return file.write_at(buf, offset);
-    #[cfg(windows)]
-    return file.seek_write(buf, offset);
+fn write_at(file: &FileInner, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(miri)]
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = file.lock().unwrap();
+        file.seek(SeekFrom::Start(offset))?;
+        return file.write(buf);
+    }
+    #[cfg(not(miri))]
+    {
+        #[cfg(unix)]
+        return file.write_at(buf, offset);
+        #[cfg(windows)]
+        return file.seek_write(buf, offset);
+    }
 }
 
 pub struct FileWrapper {
-    file: BaseArc<File>,
+    file: BaseArc<FileInner>,
     read_stream: ManuallyDrop<BaseArc<PacketStream<'static, Write, u64>>>,
     write_stream: ManuallyDrop<BaseArc<PacketStream<'static, Read, u64>>>,
     read_thread: Option<JoinHandle<()>>,
@@ -74,19 +99,20 @@ impl Drop for FileWrapper {
 
 impl From<File> for FileWrapper {
     fn from(file: File) -> Self {
-        Self::from(BaseArc::from(file))
+        #[allow(clippy::useless_conversion)]
+        Self::from(BaseArc::from(FileInner::from(file)))
     }
 }
 
-impl From<BaseArc<File>> for FileWrapper {
-    fn from(file: BaseArc<File>) -> Self {
+impl From<BaseArc<FileInner>> for FileWrapper {
+    fn from(file: BaseArc<FileInner>) -> Self {
         let (read_tx, read_rx) = mpsc::channel();
         let read_io = BaseArc::new(IoThreadHandle::<Write>::new(read_tx));
 
         let read_thread = Some(thread::spawn({
             let file = file.clone();
             move || {
-                for (pos, buf) in read_rx.into_iter() {
+                for (pos, buf) in read_rx {
                     let mut pkt = buf.get_mut();
                     let buf = &mut pkt[..];
                     if !buf.is_empty() {
@@ -117,7 +143,7 @@ impl From<BaseArc<File>> for FileWrapper {
         let write_thread = Some(thread::spawn({
             let file = file.clone();
             move || {
-                for (pos, buf) in write_rx.into_iter() {
+                for (pos, buf) in write_rx {
                     let pkt = buf.get();
                     if pkt.len() > 0 {
                         match write_at(&file, &pkt, pos) {

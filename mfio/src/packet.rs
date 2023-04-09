@@ -2,6 +2,7 @@ use crate::heap::Release;
 use crate::multistack::{MultiStack, StackHandle};
 use crate::shared_future::SharedFuture;
 use crate::util::ReadOnly;
+use core::cell::UnsafeCell;
 use core::future::Future;
 use core::marker::{PhantomData, PhantomPinned};
 use core::mem::ManuallyDrop;
@@ -25,6 +26,7 @@ pub struct PacketId<'a, Perms: PacketPerms, Param> {
 
 impl<'a, Perms: PacketPerms, Param> Drop for PacketId<'a, Perms, Param> {
     fn drop(&mut self) {
+        assert!(self.inner.size.load(Ordering::SeqCst) <= 0);
         self.stream
             .ctx
             .output
@@ -66,9 +68,16 @@ impl<'a, Perms: PacketPerms, Param> core::ops::Deref for PacketId<'a, Perms, Par
 pub struct PacketIdInner {
     id: StackHandle,
     size: AtomicIsize,
-    wake: Mutex<Option<Waker>>,
+    wake: UnsafeCell<Option<Waker>>,
     _pinned: PhantomPinned,
 }
+
+// SAFETY: we are handling synchronization for the unsafe cell that is making this type not
+// implement Send + Sync
+unsafe impl Send for PacketIdInner {}
+// SAFETY: we are handling synchronization for the unsafe cell that is making this type not
+// implement Send + Sync
+unsafe impl Sync for PacketIdInner {}
 
 pub trait PacketIo<Perms: PacketPerms, Param>: Sized {
     fn separate_thread_state(&mut self);
@@ -173,25 +182,27 @@ impl<'a, Perms: PacketPerms, Param> PacketStream<'a, Perms, Param> {
             let _ = self.future.as_ref().map(|f| f.try_run_once_sync(cx));
         }
 
-        match self.ctx.output.stack.lock().pop(&id.inner.id) {
-            Some(elem) => return Poll::Ready(Some(elem)),
-            _ if closed => return Poll::Ready(None),
-            _ => {}
-        }
+        let mut output_stack = self.ctx.output.stack.lock();
 
-        // Install the waker. Note that after this we must check for end condition once more to
-        // avoid deadlocks.
-        *id.inner.wake.lock() = Some(cx.waker().clone());
+        let ret = match output_stack.pop(&id.inner.id) {
+            Some(elem) => Poll::Ready(Some(elem)),
+            _ if closed => Poll::Ready(None),
+            _ => {
+                // Install the waker. Normally we'd want to check the output queue afterwards to avoid
+                // deadlocks, but since we are holding output queue lock, we don't have to do that.
+                // SAFETY: we are holding the lock to the output stack. The only other place where this
+                // waker is being accessed from, also does so holding the output stack lock.
+                unsafe {
+                    *id.inner.wake.get() = Some(cx.waker().clone());
+                }
 
-        match self.ctx.output.stack.lock().pop(&id.inner.id) {
-            Some(elem) => return Poll::Ready(Some(elem)),
-            // Check for one final time if we got closed while inserting the waker,
-            // and if so, avoid returning Pending to avoid deadlock.
-            _ if id.inner.size.load(Ordering::Acquire) <= 0 => return Poll::Ready(None),
-            _ => {}
-        }
+                Poll::Pending
+            }
+        };
 
-        Poll::Pending
+        core::mem::drop(output_stack);
+
+        ret
     }
 
     pub fn new_packet_id(&self) -> PacketId<Perms, Param> {
@@ -204,13 +215,12 @@ impl<'a, Perms: PacketPerms, Param> PacketStream<'a, Perms, Param> {
         let stream = unsafe { core::mem::transmute::<&Self, _>(self) };
 
         PacketId {
-            inner: PacketIdInner {
+            inner: ReadOnly::from(PacketIdInner {
                 id,
                 size: 0.into(),
                 wake: Default::default(),
                 _pinned: PhantomPinned,
-            }
-            .into(),
+            }),
             stream,
         }
     }
@@ -227,26 +237,6 @@ impl<'a, Perms: PacketPerms, Param> PacketStream<'a, Perms, Param> {
             unsafe { core::mem::transmute::<&Self, _>(self) };
         let packet = packet.bind(stream, id);
         PacketIoHandle::send_input(&stream.ctx.io, param, packet);
-    }
-}
-
-fn release_stream<Perms: PacketPerms, Param>(stream: &mut PacketStream<Perms, Param>) {
-    assert_eq!(
-        1,
-        stream.ctx.strong_count(),
-        "Packet stream dropped strong_count > 1"
-    );
-}
-
-impl<'a, Perms: PacketPerms, Param> Drop for PacketStream<'a, Perms, Param> {
-    fn drop(&mut self) {
-        release_stream(self)
-    }
-}
-
-impl<'a, Perms: PacketPerms, Param> Release for PacketStream<'a, Perms, Param> {
-    fn release(&mut self) {
-        release_stream(self)
     }
 }
 
@@ -698,6 +688,7 @@ pub struct BoundPacketObj<'a, T: PacketPerms> {
 
 impl<'a, T: PacketPerms> Drop for BoundPacketObj<'a, T> {
     fn drop(&mut self) {
+        // FIXME: output failure by default.
         self.output(None)
     }
 }
@@ -705,20 +696,27 @@ impl<'a, T: PacketPerms> Drop for BoundPacketObj<'a, T> {
 impl<'a, T: PacketPerms> BoundPacketObj<'a, T> {
     fn output(&mut self, err: Option<()>) {
         let id = &self.id.id;
-        self.output
-            .stack
-            .lock()
-            .push(id, (unsafe { ManuallyDrop::take(&mut self.buffer) }, err));
+        let mut output_stack = self.output.stack.lock();
+        output_stack.push(id, (unsafe { ManuallyDrop::take(&mut self.buffer) }, err));
         self.id.size.fetch_sub(1, Ordering::Release);
-        if let Some(wake) = self.id.wake.lock().take() {
-            wake.wake();
+        {
+            // We need to keep holding the lock to the output stack in this block to prevent
+            // situations where wakee reads from the output queue and drops this waker all while we
+            // are making changes (and vice-versa).
+            if let Some(wake) = unsafe { &mut *self.id.wake.get() }.take() {
+                //lock().take() {
+                wake.wake();
+            }
         }
+        core::mem::drop(output_stack);
     }
 
     pub fn split_at(self, len: usize) -> (Self, Self) {
         let mut this = ManuallyDrop::new(self);
         let buffer = unsafe { ManuallyDrop::take(&mut this.buffer) };
         let (b1, b2) = buffer.split_local(len);
+
+        this.id.size.fetch_add(1, Ordering::Release);
 
         (
             Self {
@@ -736,12 +734,15 @@ impl<'a, T: PacketPerms> BoundPacketObj<'a, T> {
         )
     }
 
-    pub fn error(mut self, err: Option<()>) {
-        self.output(err);
-        // Manually drop the output arc, but nothing else
-        let mut this = MaybeUninit::new(self);
+    pub fn error(self, err: Option<()>) {
+        let mut this = ManuallyDrop::new(self);
+        this.output(err);
+        // Manually drop all the fields, without invoking our actual drop implementation.
+        // Note that `buffer` is being taken out by the `output` function.
+        // SAFETY: this function is consuming `self`, thus the data will not be touched again.
         unsafe {
-            core::ptr::drop_in_place(&mut this.assume_init_mut().output);
+            core::ptr::drop_in_place(&mut this.output);
+            core::ptr::drop_in_place(&mut this.id);
         }
     }
 }

@@ -163,3 +163,117 @@ impl Fs for NativeFs {
         FileWrapper::from(file).into()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! There is not much to test here! But it is invaluable to use say thread pool based
+    //! implementation to verify data races when using miri/tsan. `mfio-fs` proves to be incredibly
+    //! valuable in doing that!
+
+    use super::*;
+    use core::mem::MaybeUninit;
+    use futures::stream::StreamExt;
+    use mfio::stdeq::*;
+    use mfio::traits::*;
+    use std::fs::write;
+    use std::io::Seek;
+
+    #[pollster::test]
+    async fn simple_io() {
+        // Running this test under miri verifies correctness of basic
+        // cross-thread communication.
+        let test_string = "Test test 42";
+        let mut filepath = std::env::temp_dir();
+        filepath.push("mfio-fs-test-simple-io");
+
+        write(&filepath, test_string.as_bytes()).unwrap();
+
+        let fs = NativeFs;
+
+        let fh = fs.open(&filepath, OpenOptions::new().read(true));
+
+        let mut d = [MaybeUninit::uninit(); 8];
+
+        let stream = fh.read_raw(0, &mut d[..]);
+        stream.count().await;
+    }
+
+    #[pollster::test]
+    async fn read_all() {
+        // Running this test under miri verifies correctness of basic
+        // cross-thread communication.
+        let test_string = "Test test 42";
+        let mut filepath = std::env::temp_dir();
+        filepath.push("mfio-fs-test-read-all");
+
+        write(&filepath, test_string.as_bytes()).unwrap();
+
+        let fs = NativeFs;
+
+        let fh = fs.open(&filepath, OpenOptions::new().read(true));
+
+        let mut d = [MaybeUninit::uninit(); 8];
+
+        fh.read_all(0, &mut d[..]).await;
+    }
+
+    #[pollster::test]
+    async fn write_test() {
+        let mut test_data = vec![];
+
+        for i in 0u8..128 {
+            test_data.extend(i.to_ne_bytes());
+        }
+
+        let mut filepath = std::env::temp_dir();
+        filepath.push("mfio-fs-test-write");
+
+        // Create mfio's filesystem
+        let fs = NativeFs;
+
+        let mut fh = fs.open(
+            &filepath,
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true),
+        );
+
+        AsyncWrite::write(&mut fh, &test_data).await.unwrap();
+
+        assert_eq!(test_data.len(), fh.get_pos() as usize);
+
+        fh.rewind().unwrap();
+
+        // Read the data back out
+        let mut output = vec![];
+        AsyncRead::read_to_end(&mut fh, &mut output).await.unwrap();
+
+        assert_eq!(test_data.len(), fh.get_pos() as usize);
+        assert_eq!(test_data, output);
+
+        core::mem::drop(fh);
+    }
+
+    #[pollster::test]
+    async fn read_to_end() {
+        let test_string = "Test test 42";
+        let mut filepath = std::env::temp_dir();
+        filepath.push("mfio-fs-test-read-to-end");
+
+        // Create a test file:
+        write(&filepath, test_string.as_bytes()).unwrap();
+
+        // Create mfio's filesystem
+        let fs = NativeFs;
+
+        let mut fh = fs.open(&filepath, OpenOptions::new().read(true));
+
+        let mut output = vec![];
+        AsyncRead::read_to_end(&mut fh, &mut output).await.unwrap();
+
+        assert_eq!(test_string.len(), fh.get_pos() as usize);
+        assert_eq!(test_string.as_bytes(), output);
+    }
+}

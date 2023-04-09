@@ -3,6 +3,7 @@ use crate::packet::*;
 use crate::util::UsizeMath;
 use bytemuck::Pod;
 use core::future::Future;
+use core::mem::ManuallyDrop;
 use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::task::{Context, Poll};
@@ -91,7 +92,7 @@ pub enum IoFullFut<'a, Io: PacketIo<Perms, Param>, Perms: PacketPerms, Param: 'a
     NewId(Param, Packet<'a, Perms>, NewIdFut<'a, Io, Perms, Param>),
     Read(
         Option<()>,
-        <NewIdFut<'a, Io, Perms, Param> as Future>::Output,
+        ManuallyDrop<<NewIdFut<'a, Io, Perms, Param> as Future>::Output>,
     ),
     Finished,
 }
@@ -110,10 +111,11 @@ impl<'a, Io: PacketIo<Perms, Param>, Perms: PacketPerms, Param> Future
                     let alloc = unsafe { Pin::new_unchecked(alloc) };
 
                     if let Poll::Ready(id) = alloc.poll(cx) {
-                        let prev = core::mem::replace(this, Self::Read(None, id));
+                        let prev =
+                            core::mem::replace(this, Self::Read(None, ManuallyDrop::new(id)));
                         match (prev, &mut *this) {
                             (Self::NewId(param, packet, _), Self::Read(_, id)) => {
-                                unsafe { Pin::new_unchecked(&*id) }.send_io(param, packet)
+                                unsafe { Pin::new_unchecked(&**id) }.send_io(param, packet)
                             }
                             _ => unreachable!(),
                         }
@@ -123,14 +125,13 @@ impl<'a, Io: PacketIo<Perms, Param>, Perms: PacketPerms, Param> Future
                         break Poll::Pending;
                     }
                 }
-                Self::Read(err, id) => match unsafe { Pin::new_unchecked(id) }.poll_next(cx) {
+                Self::Read(err, id) => match unsafe { Pin::new_unchecked(&mut **id) }.poll_next(cx)
+                {
                     Poll::Ready(None) => {
-                        let prev = core::mem::replace(this, Self::Finished);
-
-                        match prev {
-                            Self::Read(err, _) => break Poll::Ready(err),
-                            _ => unreachable!(),
-                        }
+                        let err = err.take();
+                        unsafe { ManuallyDrop::drop(id) };
+                        *this = Self::Finished;
+                        break Poll::Ready(err);
                     }
                     Poll::Ready(Some((_, nerr))) => {
                         if let Some(nerr) = nerr {
@@ -154,12 +155,14 @@ pub struct ReadToEndFut<'a, Io: PacketIo<Write, Param>, Param> {
 
 pub enum ReadToEndFutState<'a, Io: PacketIo<Write, Param>, Param: 'a> {
     NewId(NewIdFut<'a, Io, Write, Param>),
+    // TODO: change this to a struct
     Read(
         usize,
         usize,
         Option<usize>,
+        usize,
         Option<()>,
-        <NewIdFut<'a, Io, Write, Param> as Future>::Output,
+        ManuallyDrop<<NewIdFut<'a, Io, Write, Param> as Future>::Output>,
     ),
     Finished,
 }
@@ -196,12 +199,18 @@ impl<'a, Io: PacketIo<Write, Param>, Param: Copy + UsizeMath> Future
                                 this.buf.capacity() - start_len,
                             )
                         };
-                        this.state =
-                            ReadToEndFutState::Read(start_len, start_cap, None, None, stream);
+                        this.state = ReadToEndFutState::Read(
+                            start_len,
+                            start_cap,
+                            None,
+                            0,
+                            None,
+                            ManuallyDrop::new(stream),
+                        );
 
                         match &mut this.state {
-                            ReadToEndFutState::Read(_, _, _, _, stream) => {
-                                unsafe { Pin::new_unchecked(&*stream) }.send_io(this.pos, data);
+                            ReadToEndFutState::Read(_, _, _, _, _, stream) => {
+                                unsafe { Pin::new_unchecked(&**stream) }.send_io(this.pos, data);
                             }
                             _ => unreachable!(),
                         }
@@ -209,8 +218,15 @@ impl<'a, Io: PacketIo<Write, Param>, Param: Copy + UsizeMath> Future
                         break Poll::Pending;
                     }
                 }
-                ReadToEndFutState::Read(start_len, start_cap, final_cap, error, stream) => {
-                    match unsafe { Pin::new_unchecked(&mut *stream) }.poll_next(cx) {
+                ReadToEndFutState::Read(
+                    start_len,
+                    start_cap,
+                    final_cap,
+                    max_cap,
+                    error,
+                    stream,
+                ) => {
+                    match unsafe { Pin::new_unchecked(&mut **stream) }.poll_next(cx) {
                         Poll::Ready(Some((pkt, err))) => {
                             // We failed, thus cap the buffer length, complete queued I/O, but do not
                             // perform any further reads.
@@ -219,13 +235,24 @@ impl<'a, Io: PacketIo<Write, Param>, Param: Copy + UsizeMath> Future
                                 let end = final_cap.get_or_insert(new_end);
                                 *error = err;
                                 *end = core::cmp::min(*end, new_end);
+                            } else {
+                                let new_end = pkt.end() + (this.buf.len() - *start_len);
+                                *max_cap = core::cmp::max(*max_cap, new_end);
                             }
                         }
                         Poll::Ready(None) => {
+                            // If we got no successful output, cap the capacity to 0
+                            // so that we don't end up in a deadlock if the backend does no I/O
+                            // processing.
+                            if *max_cap == 0 {
+                                *final_cap = Some(0);
+                            }
                             // If we read all bytes successfully, grow the buffer and keep going.
                             // Otherwise, return finished state.
                             match final_cap {
                                 Some(cap) => {
+                                    let cap = core::cmp::min(cap, max_cap);
+                                    unsafe { ManuallyDrop::drop(stream) };
                                     // SAFETY: these bytes have been successfully read
                                     unsafe { this.buf.set_len(*start_len + *cap) };
                                     this.pos.add_assign(this.buf.len() - *start_len);
@@ -255,7 +282,7 @@ impl<'a, Io: PacketIo<Write, Param>, Param: Copy + UsizeMath> Future
                                         )
                                     };
 
-                                    unsafe { Pin::new_unchecked(&*stream) }
+                                    unsafe { Pin::new_unchecked(&**stream) }
                                         .send_io(this.pos.add(this.buf.len()), data);
                                 }
                             }
@@ -273,7 +300,7 @@ pub enum IoReadFut<'a, Io: PacketIo<Write, Param>, Param: 'a, T> {
     NewId(Param, NewIdFut<'a, Io, Write, Param>),
     Read(
         MaybeUninit<T>,
-        <NewIdFut<'a, Io, Write, Param> as Future>::Output,
+        ManuallyDrop<<NewIdFut<'a, Io, Write, Param> as Future>::Output>,
     ),
     Finished,
 }
@@ -291,8 +318,10 @@ impl<'a, Io: PacketIo<Write, Param>, Param, T> Future for IoReadFut<'a, Io, Para
                         let alloc = unsafe { Pin::new_unchecked(alloc) };
 
                         if let Poll::Ready(stream) = alloc.poll(cx) {
-                            let prev =
-                                core::mem::replace(this, Self::Read(MaybeUninit::uninit(), stream));
+                            let prev = core::mem::replace(
+                                this,
+                                Self::Read(MaybeUninit::uninit(), ManuallyDrop::new(stream)),
+                            );
                             match (prev, &mut *this) {
                                 (Self::NewId(param, _), Self::Read(data, stream)) => {
                                     //let data = data.get_mut();
@@ -302,7 +331,7 @@ impl<'a, Io: PacketIo<Write, Param>, Param, T> Future for IoReadFut<'a, Io, Para
                                             core::mem::size_of::<T>(),
                                         )
                                     };
-                                    unsafe { Pin::new_unchecked(&*stream) }.send_io(param, buf)
+                                    unsafe { Pin::new_unchecked(&**stream) }.send_io(param, buf)
                                 }
                                 _ => unreachable!(),
                             }
@@ -313,8 +342,9 @@ impl<'a, Io: PacketIo<Write, Param>, Param, T> Future for IoReadFut<'a, Io, Para
                         }
                     }
                     Self::Read(_, stream) => {
-                        match unsafe { Pin::new_unchecked(stream) }.poll_next(cx) {
+                        match unsafe { Pin::new_unchecked(&mut **stream) }.poll_next(cx) {
                             Poll::Ready(None) => {
+                                unsafe { ManuallyDrop::drop(stream) };
                                 let prev = core::mem::replace(this, Self::Finished);
 
                                 match prev {

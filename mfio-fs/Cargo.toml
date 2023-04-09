@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 mfio = { version = "0.1", path = "../mfio" }
 futures-io = "0.3"
+async-channel = "1.8.0"
+futures = "0.3.28"
 
 [dev-dependencies]
-pollster = "0.3.0"
+pollster = { version = "0.3.0", features = ["macro"] }
