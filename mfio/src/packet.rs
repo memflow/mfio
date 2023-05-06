@@ -1,4 +1,3 @@
-use crate::heap::Release;
 use crate::multistack::{MultiStack, StackHandle};
 use crate::shared_future::SharedFuture;
 use crate::util::ReadOnly;
@@ -179,7 +178,7 @@ impl<'a, Perms: PacketPerms, Param> PacketStream<'a, Perms, Param> {
 
         // Try polling the backend future if it should be run
         if !closed {
-            let _ = self.future.as_ref().map(|f| f.try_run_once_sync(cx));
+            self.future.as_ref().and_then(|f| f.try_run_once_sync(cx));
         }
 
         let mut output_stack = self.ctx.output.stack.lock();
@@ -331,8 +330,14 @@ impl<'a, Perms: PacketPerms, Param> PacketIoHandle<'a, Perms, Param> {
     }
 }
 
+pub type AllocFn<T> =
+    for<'a> unsafe extern "C" fn(BoundPacketObj<'a, T>) -> <T as PacketPerms>::Alloced<'a>;
+
 pub trait PacketPerms: 'static + core::fmt::Debug + Clone + Copy {
     type DataType: Clone + Copy + core::fmt::Debug;
+    type Alloced<'a>: AllocatedPacket + 'a;
+
+    fn alloc_fn(&self) -> AllocFn<Self>;
 }
 
 #[repr(C)]
@@ -349,6 +354,11 @@ impl core::fmt::Debug for ReadWrite {
 
 impl PacketPerms for ReadWrite {
     type DataType = *mut ();
+    type Alloced<'a> = ReadWritePacketObj<'a>;
+
+    fn alloc_fn(&self) -> AllocFn<Self> {
+        self.get_mut
+    }
 }
 
 #[repr(C)]
@@ -365,6 +375,11 @@ impl core::fmt::Debug for Write {
 
 impl PacketPerms for Write {
     type DataType = *mut ();
+    type Alloced<'a> = WritePacketObj<'a>;
+
+    fn alloc_fn(&self) -> AllocFn<Self> {
+        self.get_mut
+    }
 }
 
 #[repr(C)]
@@ -381,6 +396,11 @@ impl core::fmt::Debug for Read {
 
 impl PacketPerms for Read {
     type DataType = *const ();
+    type Alloced<'a> = ReadPacketObj<'a>;
+
+    fn alloc_fn(&self) -> AllocFn<Self> {
+        self.get
+    }
 }
 
 #[derive(Debug)]
@@ -437,6 +457,9 @@ impl<'a, DataType: Copy> PacketObj<'a, DataType> {
         )
     }
 }
+
+unsafe impl<'a, DataType> Send for PacketObj<'a, DataType> {}
+unsafe impl<'a, DataType> Sync for PacketObj<'a, DataType> {}
 
 #[derive(Debug)]
 pub struct Packet<'a, Perms: PacketPerms> {
@@ -532,14 +555,30 @@ impl<'a, T: AsRef<[u8]> + ?Sized> From<&'a T> for Packet<'a, Read> {
     }
 }
 
+pub trait AllocatedPacket: Sized {
+    type Pointer: Copy;
+
+    fn split_at(self, len: usize) -> (Self, Self);
+    fn error(self, err: Option<()>);
+    fn as_ptr(&self) -> Self::Pointer;
+    fn len(&self) -> usize;
+    fn id(&self) -> *const ();
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 #[repr(C)]
 pub struct ReadWritePacketObj<'a> {
     alloced_packet: *mut u8,
     buffer: BoundPacketObj<'a, ReadWrite>,
 }
 
-impl<'a> ReadWritePacketObj<'a> {
-    pub fn split_at(self, len: usize) -> (Self, Self) {
+impl<'a> AllocatedPacket for ReadWritePacketObj<'a> {
+    type Pointer = *mut u8;
+
+    fn split_at(self, len: usize) -> (Self, Self) {
         let (b1, b2) = self.buffer.split_at(len);
 
         (
@@ -554,10 +593,24 @@ impl<'a> ReadWritePacketObj<'a> {
         )
     }
 
-    pub fn error(self, err: Option<()>) {
+    fn error(self, err: Option<()>) {
         self.buffer.error(err)
     }
+
+    fn as_ptr(&self) -> Self::Pointer {
+        self.alloced_packet
+    }
+
+    fn len(&self) -> usize {
+        self.buffer.buffer.len()
+    }
+
+    fn id(&self) -> *const () {
+        self.buffer.id.get_ref() as *const _ as *const ()
+    }
 }
+
+unsafe impl<'a> Send for ReadWritePacketObj<'a> {}
 
 impl core::ops::Deref for ReadWritePacketObj<'_> {
     type Target = [u8];
@@ -573,16 +626,16 @@ impl core::ops::DerefMut for ReadWritePacketObj<'_> {
     }
 }
 
-unsafe impl<'a> Send for ReadWritePacketObj<'a> {}
-
 #[repr(C)]
 pub struct WritePacketObj<'a> {
     alloced_packet: *mut MaybeUninit<u8>,
     buffer: BoundPacketObj<'a, Write>,
 }
 
-impl<'a> WritePacketObj<'a> {
-    pub fn split_at(self, len: usize) -> (Self, Self) {
+impl<'a> AllocatedPacket for WritePacketObj<'a> {
+    type Pointer = *mut MaybeUninit<u8>;
+
+    fn split_at(self, len: usize) -> (Self, Self) {
         let (b1, b2) = self.buffer.split_at(len);
 
         (
@@ -597,10 +650,24 @@ impl<'a> WritePacketObj<'a> {
         )
     }
 
-    pub fn error(self, err: Option<()>) {
+    fn error(self, err: Option<()>) {
         self.buffer.error(err)
     }
+
+    fn as_ptr(&self) -> Self::Pointer {
+        self.alloced_packet
+    }
+
+    fn len(&self) -> usize {
+        self.buffer.buffer.len()
+    }
+
+    fn id(&self) -> *const () {
+        self.buffer.id.get_ref() as *const _ as *const ()
+    }
 }
+
+unsafe impl<'a> Send for WritePacketObj<'a> {}
 
 impl core::ops::Deref for WritePacketObj<'_> {
     type Target = [MaybeUninit<u8>];
@@ -616,19 +683,16 @@ impl core::ops::DerefMut for WritePacketObj<'_> {
     }
 }
 
-unsafe impl<'a> Send for WritePacketObj<'a> {}
-
-unsafe impl<'a, DataType> Send for PacketObj<'a, DataType> {}
-unsafe impl<'a, DataType> Sync for PacketObj<'a, DataType> {}
-
 #[repr(C)]
 pub struct ReadPacketObj<'a> {
     alloced_packet: *const u8,
     buffer: BoundPacketObj<'a, Read>,
 }
 
-impl<'a> ReadPacketObj<'a> {
-    pub fn split_at(self, len: usize) -> (Self, Self) {
+impl<'a> AllocatedPacket for ReadPacketObj<'a> {
+    type Pointer = *const u8;
+
+    fn split_at(self, len: usize) -> (Self, Self) {
         let (b1, b2) = self.buffer.split_at(len);
 
         (
@@ -643,10 +707,24 @@ impl<'a> ReadPacketObj<'a> {
         )
     }
 
-    pub fn error(self, err: Option<()>) {
+    fn error(self, err: Option<()>) {
         self.buffer.error(err)
     }
+
+    fn as_ptr(&self) -> Self::Pointer {
+        self.alloced_packet
+    }
+
+    fn len(&self) -> usize {
+        self.buffer.buffer.len()
+    }
+
+    fn id(&self) -> *const () {
+        self.buffer.id.get_ref() as *const _ as *const ()
+    }
 }
+
+unsafe impl<'a> Send for ReadPacketObj<'a> {}
 
 impl core::ops::Deref for ReadPacketObj<'_> {
     type Target = [u8];
@@ -752,6 +830,32 @@ impl<'a, T: PacketPerms> BoundPacketObj<'a, T> {
 pub struct BoundPacket<'a, T: PacketPerms> {
     vtable: &'static T,
     obj: BoundPacketObj<'a, T>,
+}
+
+impl<'a, T: PacketPerms> BoundPacket<'a, T> {
+    pub fn split_at(self, len: usize) -> (Self, Self) {
+        let (b1, b2) = self.obj.split_at(len);
+
+        (
+            Self {
+                vtable: self.vtable,
+                obj: b1,
+            },
+            Self {
+                vtable: self.vtable,
+                obj: b2,
+            },
+        )
+    }
+
+    pub fn error(self, err: Option<()>) {
+        self.obj.error(err)
+    }
+
+    pub fn alloc(self) -> T::Alloced<'a> {
+        let BoundPacket { obj, vtable } = self;
+        unsafe { (vtable.alloc_fn())(obj) }
+    }
 }
 
 impl<'a> BoundPacket<'a, ReadWrite> {

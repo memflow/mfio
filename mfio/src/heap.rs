@@ -13,21 +13,15 @@ pub struct PinHeap<T: Release> {
     cached_elems_len: AtomicUsize,
     cached_elems: Mutex<VecDeque<(usize, usize)>>,
     free_elems: Mutex<VecDeque<(usize, usize)>>,
+    cache_size: usize,
 }
 
 unsafe impl<T: Release> Send for PinHeap<T> {}
 unsafe impl<T: Release> Sync for PinHeap<T> {}
 
 impl<T: Release> Default for PinHeap<T> {
-    #[allow(clippy::uninit_assumed_init)]
     fn default() -> Self {
-        Self {
-            data: [(); 32].map(|_| UnsafeCell::new(None)),
-            shards: Mutex::new(0),
-            cached_elems_len: Default::default(),
-            cached_elems: Default::default(),
-            free_elems: Default::default(),
-        }
+        Self::new(4096)
     }
 }
 
@@ -57,6 +51,18 @@ impl<T: Release> Drop for PinHeap<T> {
 }
 
 impl<T: Release> PinHeap<T> {
+    #[allow(clippy::uninit_assumed_init)]
+    pub fn new(cache_size: usize) -> Self {
+        Self {
+            data: [(); 32].map(|_| UnsafeCell::new(None)),
+            shards: Mutex::new(0),
+            cached_elems_len: Default::default(),
+            cached_elems: Default::default(),
+            free_elems: Default::default(),
+            cache_size,
+        }
+    }
+
     pub fn alloc_pin(this: Arc<Self>, value: T) -> Pin<AllocHandle<T>> {
         Self::alloc(this, value).into()
     }
@@ -161,7 +167,7 @@ impl<T: Release> PinHeap<T> {
     }
 
     fn release(this: Arc<Self>, location: (usize, usize), data: *mut T) {
-        if this.cached_elems_len.load(Ordering::Relaxed) >= 4096 {
+        if this.cached_elems_len.load(Ordering::Relaxed) >= this.cache_size {
             unsafe { core::ptr::drop_in_place(data) };
             this.free_elems.lock().push_back(location);
         } else {

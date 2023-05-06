@@ -85,7 +85,9 @@ impl<T> MultiStack<T> {
             self.elems.push(new_node);
             self.elems.len()
         } else {
-            self.elems[new_head - 1] = new_node;
+            let elem = &mut self.elems[new_head - 1];
+            self.free_list.head = elem.prev;
+            *elem = new_node;
             new_head
         };
 
