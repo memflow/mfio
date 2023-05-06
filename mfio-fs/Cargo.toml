@@ -2,12 +2,43 @@
 name = "mfio-fs"
 version = "0.1.0"
 edition = "2021"
+authors = ["Aurimas Blažulionis <0x60@pm.me>"]
+license = "MIT"
+repository = "https://github.com/memflow/mfio"
+description = "filesystem implementation on mfio"
+
+[lib]
+bench = false
+
+[[bench]]
+name = "main"
+harness = false
 
 [dependencies]
 mfio = { version = "0.1", path = "../mfio" }
 futures-io = "0.3"
 async-channel = "1.8.0"
 futures = "0.3.28"
+once_cell = "1"
+parking_lot = "0.12"
+cfg-if = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rio = { version = "0.9", optional = true }
 
 [dev-dependencies]
 pollster = { version = "0.3.0", features = ["macro"] }
+criterion = { version = "0.4", git = "https://github.com/h33p/criterion.rs", branch = "tput2", features = ["async_tokio", "async_smol", "async_futures"] }
+rand = "0.8"
+nuclei = "0.2"
+flume = "0.10"
+tokio = { version = "1.24", features = ["full"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rio = "0.9"
+# We need git version to compile on alpine
+glommio = { version = "0.8", git = "https://github.com/DataDog/glommio", rev = "517326bb2b63b6f6ddcf5deec7a283ee510f44df" }
+
+[features]
+default = []
+gpl = ["rio"]
