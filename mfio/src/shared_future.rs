@@ -3,11 +3,11 @@ use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use parking_lot::Mutex;
 use tarc::BaseArc;
 
 struct ManualLock<F: ?Sized> {
-    locked: AtomicBool,
-    waker: UnsafeCell<Option<Waker>>,
+    wakers: Mutex<Vec<Waker>>,
     data: UnsafeCell<F>,
 }
 
@@ -17,8 +17,7 @@ unsafe impl<T: ?Sized + Send> Sync for ManualLock<T> {}
 impl<T> ManualLock<T> {
     pub fn new(data: T) -> Self {
         Self {
-            locked: AtomicBool::new(false),
-            waker: UnsafeCell::new(None),
+            wakers: Mutex::new(vec![]),
             data: UnsafeCell::new(data),
         }
     }
@@ -36,17 +35,17 @@ impl<T: ?Sized> ManualLock<T> {
     /// acquiring it again, leading to mutable aliasing. Thus, users must ensure such scenario does
     /// not occur.
     ///
-    unsafe fn acquire(&self) -> Option<&mut T> {
-        if !self.locked.swap(true, Ordering::Acquire) {
-            self.data.get().as_mut()
-        } else {
-            None
-        }
-    }
+    unsafe fn acquire(&self, waker: &Waker) -> Option<&mut T> {
+        let mut wakers = self.wakers.lock();
 
-    /// Release the lock
-    fn release(&self) {
-        self.locked.store(false, Ordering::Release);
+        if wakers.is_empty() {
+            wakers.push(waker.clone());
+            return unsafe { self.data.get().as_mut() };
+        } else if !wakers.last().unwrap().will_wake(waker) {
+            wakers.push(waker.clone());
+        }
+
+        None
     }
 }
 
@@ -60,12 +59,13 @@ impl<F> SharedFutureContext<F> {
 
     unsafe fn wake(this: *const ()) {
         let this = BaseArc::from_raw(this as *const Self);
-        let waker = &mut *this.future.waker.get();
-        // TODO: which is better, wake by ref, or always install waker?
-        if let Some(waker) = waker {
-            waker.wake_by_ref();
+
+        let mut wakers = this.future.wakers.lock();
+        for w in wakers.drain(0..) {
+            w.wake();
         }
-        this.future.release();
+
+        core::mem::drop(wakers);
     }
 
     unsafe fn wake_by_ref(this: *const ()) {
@@ -123,37 +123,22 @@ impl<F: Future> From<F> for SharedFuture<F> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum SharedFutureOutput<T> {
+pub enum SharedFutureOutput<F: Future> {
     AlreadyFinished,
-    JustFinished(T),
+    JustFinished(F::Output),
     Running,
 }
 
 impl<F: Future> SharedFuture<F> {
-    pub fn try_run_once_sync(
-        &self,
-        cx: &mut Context<'_>,
-    ) -> Option<Poll<SharedFutureOutput<F::Output>>> {
+    pub fn try_run_once_sync(&self, cx: &mut Context<'_>) -> Option<SharedFutureOutput<F>> {
         // SAFETY: we do not re-enter this method while borrowing
         // At least we shouldn't, it could happen with self referencing, TODO: look into that
         // TODO: fairness - if there is a starved task that we know will poll this future near
         // immediately, let them poll it!
-        let data = unsafe { self.inner.future.acquire() };
+        let data = unsafe { self.inner.future.acquire(cx.waker()) };
         if let Some(future_cont) = data {
-            if let Some(future) = future_cont.as_mut() {
-                // Install the waker
-                if match unsafe { &*self.inner.future.waker.get() } {
-                    Some(waker) if !waker.will_wake(cx.waker()) => true,
-                    None => true,
-                    _ => false,
-                } {
-                    //println!("Install waker");
-                    unsafe {
-                        *self.inner.future.waker.get() = Some(cx.waker().clone());
-                    }
-                }
-
+            //println!("Acquired");
+            let ret = if let Some(future) = future_cont.as_mut() {
                 // Wrap the waker
                 let inner = unsafe { Pin::into_inner_unchecked(self.inner.clone()) };
                 let waker = unsafe { Waker::from_raw(SharedFutureContext::waker(&inner)) };
@@ -164,31 +149,21 @@ impl<F: Future> SharedFuture<F> {
                 let pin = unsafe { Pin::new_unchecked(&mut *future) };
                 let poll = pin.poll(&mut context);
                 match poll {
-                    Poll::Pending => Some(Poll::Ready(SharedFutureOutput::Running)),
+                    Poll::Pending => Some(SharedFutureOutput::Running),
                     Poll::Ready(val) => {
                         *future_cont = None;
-                        Some(Poll::Ready(SharedFutureOutput::JustFinished(val)))
+                        Some(SharedFutureOutput::JustFinished(val))
                     }
                 }
             } else {
-                Some(Poll::Ready(SharedFutureOutput::AlreadyFinished))
-            }
+                Some(SharedFutureOutput::AlreadyFinished)
+            };
+
+            ret
         } else if self.inner.finished.load(Ordering::Acquire) {
-            Some(Poll::Ready(SharedFutureOutput::AlreadyFinished))
+            Some(SharedFutureOutput::AlreadyFinished)
         } else {
             None
         }
-    }
-}
-
-impl<F: Future> Future for &'_ SharedFuture<F> {
-    type Output = SharedFutureOutput<F::Output>;
-
-    #[inline(always)]
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.as_ref();
-
-        this.try_run_once_sync(cx)
-            .unwrap_or(Poll::Ready(SharedFutureOutput::Running))
     }
 }
