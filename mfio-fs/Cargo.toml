@@ -23,9 +23,6 @@ once_cell = "1"
 parking_lot = "0.12"
 cfg-if = "1"
 
-[target.'cfg(target_os = "linux")'.dependencies]
-rio = { version = "0.9", optional = true }
-
 [dev-dependencies]
 pollster = { version = "0.3.0", features = ["macro"] }
 criterion = { version = "0.4", git = "https://github.com/h33p/criterion.rs", branch = "tput2", features = ["async_tokio", "async_smol", "async_futures"] }
@@ -43,4 +40,3 @@ glommio = { version = "0.8", git = "https://github.com/DataDog/glommio", rev = "
 
 [features]
 default = []
-gpl = ["rio"]
