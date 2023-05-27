@@ -133,6 +133,7 @@ fn file_read(c: &mut Criterion) {
         });
     }
 
+    #[cfg(unix)]
     for size in sizes {
         use futures::AsyncReadExt;
         use futures::AsyncSeekExt;

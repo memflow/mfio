@@ -27,11 +27,13 @@ cfg-if = "1"
 pollster = { version = "0.3.0", features = ["macro"] }
 criterion = { version = "0.4", git = "https://github.com/h33p/criterion.rs", branch = "tput2", features = ["async_tokio", "async_smol", "async_futures"] }
 rand = "0.8"
-nuclei = "0.2"
 flume = "0.10"
 
 [target.'cfg(not(miri))'.dependencies]
-tokio = { version = "1.24", features = ["full"] }
+tokio = { version = "1.24", features = ["rt", "fs", "io-util"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+nuclei = "0.2"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 rio = "0.9"
