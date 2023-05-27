@@ -21,6 +21,15 @@ pin-project = "1.0"
 tarc = "0.1"
 bytemuck = "1"
 
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.26", features = ["poll"] }
+# incompatible with miri
+tokio = { version = "1", optional = true, features = ["net"] }
+async-io = { version = "1", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.48", features = ["Win32_System_Threading", "Win32_Foundation"] }
+
 [dev-dependencies]
 tokio = { version = "1.24", features = ["rt", "macros", "rt-multi-thread"] }
 criterion = { version = "0.4", git = "https://github.com/h33p/criterion.rs", branch = "tput2", features = ["async_tokio", "async_smol", "async_futures"] }

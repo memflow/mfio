@@ -1,5 +1,4 @@
 use crate::multistack::{MultiStack, StackHandle};
-use crate::shared_future::SharedFuture;
 use crate::util::ReadOnly;
 use core::cell::UnsafeCell;
 use core::future::Future;
@@ -157,7 +156,6 @@ impl<'a, T: PacketIo<Perms, Param>, Perms: PacketPerms, Param: 'a> Future
 
 pub struct PacketStream<'a, Perms: PacketPerms, Param> {
     pub ctx: Arc<PacketCtx<'a, Perms, Param>>,
-    pub future: Option<SharedFuture<BoxedFuture>>,
 }
 
 impl<'a, Perms: PacketPerms, Param: core::fmt::Debug> core::fmt::Debug
@@ -175,11 +173,6 @@ impl<'a, Perms: PacketPerms, Param> PacketStream<'a, Perms, Param> {
         cx: &mut Context,
     ) -> Poll<Option<Output<'a, Perms::DataType>>> {
         let closed = id.inner.size.load(Ordering::Relaxed) <= 0;
-
-        // Try polling the backend future if it should be run
-        if !closed {
-            self.future.as_ref().and_then(|f| f.try_run_once_sync(cx));
-        }
 
         let mut output_stack = self.ctx.output.stack.lock();
 

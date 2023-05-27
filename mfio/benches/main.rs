@@ -4,16 +4,17 @@ use criterion::async_executor::*;
 use criterion::measurement::Measurement;
 use criterion::*;
 use futures::{pin_mut, StreamExt};
+use mfio::backend::*;
 use mfio::packet::*;
+use std::cell::RefCell;
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime as TokioRuntime;
 
 use sample::*;
 
 mod sample {
-
+    use mfio::backend::*;
     use mfio::packet::*;
-    use mfio::shared_future::*;
     use mfio::util::Event;
     include!("../src/sample.rs");
 }
@@ -101,20 +102,23 @@ fn allocations(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("alloc", size), move |b| {
             b.to_async(PollsterExecutor)
                 .iter_custom(move |iters| async move {
-                    let scope = SampleIo::default();
-                    let mut elapsed = Duration::default();
-                    for _ in 0..iters {
-                        let streams = (0..size)
-                            .into_iter()
-                            .map(|_| PacketIo::<Write, _>::new_id(&scope))
-                            .collect::<Vec<_>>();
-                        let futures = futures::future::join_all(streams);
+                    let mut scope = SampleIo::default();
+                    Null::run_with_mut(&mut scope, |scope| async move {
+                        let mut elapsed = Duration::default();
+                        for _ in 0..iters {
+                            let streams = (0..size)
+                                .into_iter()
+                                .map(|_| PacketIo::<Write, _>::new_id(scope))
+                                .collect::<Vec<_>>();
+                            let futures = futures::future::join_all(streams);
 
-                        let start = Instant::now();
-                        black_box(futures.await);
-                        elapsed += start.elapsed();
-                    }
-                    elapsed
+                            let start = Instant::now();
+                            black_box(futures.await);
+                            elapsed += start.elapsed();
+                        }
+                        elapsed
+                    })
+                    .await
                 })
         });
     }
@@ -131,7 +135,7 @@ fn singlestream_reads(c: &mut Criterion) {
         group: &mut BenchmarkGroup<impl Measurement<Value = Duration>>,
     ) {
         for size in [1, 4, 16, 64, 256, 1024, 4096, 16384, 65536] {
-            let handle = &SampleIo::default();
+            let mut handle = SampleIo::default();
 
             group.throughput(Throughput::Elements(size as u64));
 
@@ -143,30 +147,34 @@ fn singlestream_reads(c: &mut Criterion) {
                     ),
                     size,
                 ),
-                |b| {
+                #[allow(clippy::await_holding_refcell_ref)]
+                move |b| {
+                    let handle = &RefCell::new(&mut handle);
+
                     b.to_async(T::executor()).iter_custom(|iters| async move {
                         let mut bufs = vec![[MaybeUninit::uninit()]; size];
 
-                        let scope = handle.clone();
+                        Null::run_with_mut(*handle.borrow_mut(), |scope| async move {
+                            let mut elapsed = Duration::default();
 
-                        let mut elapsed = Duration::default();
+                            for _ in 0..iters {
+                                let start = Instant::now();
 
-                        for _ in 0..iters {
-                            let start = Instant::now();
+                                let stream = scope.new_id().await;
+                                pin_mut!(stream);
 
-                            let stream = scope.new_id().await;
-                            pin_mut!(stream);
+                                for b in &mut bufs {
+                                    stream.as_ref().send_io(0, b);
+                                }
 
-                            for b in &mut bufs {
-                                stream.as_ref().send_io(0, b);
+                                black_box(stream.count().await);
+
+                                elapsed += start.elapsed();
                             }
 
-                            black_box(stream.count().await);
-
-                            elapsed += start.elapsed();
-                        }
-
-                        elapsed
+                            elapsed
+                        })
+                        .await
                     });
                 },
             );
@@ -190,7 +198,7 @@ fn reads(c: &mut Criterion) {
         group: &mut BenchmarkGroup<impl Measurement<Value = Duration>>,
     ) {
         for size in [1, 4, 16, 64, 256, 1024, 4096, 16384, 65536] {
-            let handle = &SampleIo::default();
+            let mut handle = SampleIo::default();
 
             group.throughput(Throughput::Elements(size as u64));
 
@@ -202,31 +210,35 @@ fn reads(c: &mut Criterion) {
                     ),
                     size,
                 ),
+                #[allow(clippy::await_holding_refcell_ref)]
                 |b| {
+                    let handle = &RefCell::new(&mut handle);
+
                     b.to_async(T::executor()).iter_custom(|iters| async move {
                         let mut bufs = vec![[MaybeUninit::uninit()]; size];
 
-                        let scope = handle.clone();
+                        Null::run_with_mut(*handle.borrow_mut(), |scope| async move {
+                            let mut elapsed = Duration::default();
 
-                        let mut elapsed = Duration::default();
+                            for _ in 0..iters {
+                                let futures = bufs
+                                    .iter_mut()
+                                    .map(|b| async { scope.io(0, b) })
+                                    .collect::<Vec<_>>();
 
-                        for _ in 0..iters {
-                            let futures = bufs
-                                .iter_mut()
-                                .map(|b| async { scope.io(0, b) })
-                                .collect::<Vec<_>>();
+                                let futures = futures::future::join_all(futures).await;
+                                let streams = futures::stream::iter(futures).flatten();
 
-                            let futures = futures::future::join_all(futures).await;
-                            let streams = futures::stream::iter(futures).flatten();
+                                let start = Instant::now();
 
-                            let start = Instant::now();
+                                black_box(streams.count().await);
 
-                            black_box(streams.count().await);
+                                elapsed += start.elapsed();
+                            }
 
-                            elapsed += start.elapsed();
-                        }
-
-                        elapsed
+                            elapsed
+                        })
+                        .await
                     });
                 },
             );
@@ -275,31 +287,35 @@ fn reads_tasked(c: &mut Criterion) {
                                     let mut bufs = vec![[MaybeUninit::uninit()]; size as _];
 
                                     let mut scope = handle.clone();
-                                    PacketIo::<Write, _>::separate_thread_state(&mut scope);
 
                                     async move {
-                                        let mut subtract = subtract.elapsed();
+                                        Null::run_with_mut(&mut scope, move |scope| async move {
+                                            let mut subtract = subtract.elapsed();
 
-                                        for _ in 0..iters {
-                                            let s2 = Instant::now();
-                                            let futures = bufs
-                                                .iter_mut()
-                                                .map(|b| async { scope.io(0, b) })
-                                                .collect::<Vec<_>>();
+                                            for _ in 0..iters {
+                                                let s2 = Instant::now();
+                                                let futures = bufs
+                                                    .iter_mut()
+                                                    .map(|b| async { scope.io(0, b) })
+                                                    .collect::<Vec<_>>();
 
-                                            let futures = futures::future::join_all(futures).await;
-                                            let streams = futures::stream::iter(futures).flatten();
+                                                let futures =
+                                                    futures::future::join_all(futures).await;
+                                                let streams =
+                                                    futures::stream::iter(futures).flatten();
 
-                                            subtract += s2.elapsed();
+                                                subtract += s2.elapsed();
 
-                                            //let start = Instant::now();
+                                                //let start = Instant::now();
 
-                                            black_box(streams.count().await);
+                                                black_box(streams.count().await);
 
-                                            //elapsed += start.elapsed();
-                                        }
+                                                //elapsed += start.elapsed();
+                                            }
 
-                                        subtract
+                                            subtract
+                                        })
+                                        .await
                                     }
                                 })
                             });

@@ -29,7 +29,6 @@ fn file_read(c: &mut Criterion) {
     const SPARSE: usize = 256 * 4;
 
     let test_buf = &(0..(MB * SPARSE))
-        .into_iter()
         .map(|i| (i % 256) as u8)
         .collect::<Vec<u8>>();
     let mut temp_path = std::path::PathBuf::from("/");
@@ -47,18 +46,16 @@ fn file_read(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(MB as u64));
 
         group.bench_function(BenchmarkId::new("mfio", size), |b| {
-            b.to_async(PollsterExecutor)
-                .iter_custom(|iters| async move {
-                    let num_chunks = MB / size;
-                    let mut bufs = vec![vec![MaybeUninit::uninit(); size]; num_chunks];
+            b.iter_custom(|iters| {
+                let num_chunks = MB / size;
+                let mut bufs = vec![vec![MaybeUninit::uninit(); size]; num_chunks];
 
-                    write(temp_path, test_buf).unwrap();
+                write(temp_path, test_buf).unwrap();
 
-                    let mut elapsed = Duration::default();
+                let mut elapsed = Duration::default();
 
-                    let fs = NativeFs;
-
-                    let file = fs.open(&temp_path, OpenOptions::new().read(true));
+                NativeFs::default().run(|fs| async move {
+                    let file = fs.open(temp_path, OpenOptions::new().read(true));
                     unsafe { FH = &file as *const _ };
 
                     for _ in 0..iters {
@@ -80,7 +77,8 @@ fn file_read(c: &mut Criterion) {
                     }
 
                     elapsed
-                });
+                })
+            });
         });
     }
 
@@ -107,7 +105,7 @@ fn file_read(c: &mut Criterion) {
 
                 write(temp_path, test_buf).unwrap();
 
-                let file = &BufferedFile::open(&temp_path).await.unwrap();
+                let file = &BufferedFile::open(temp_path).await.unwrap();
 
                 let mut elapsed = Duration::default();
 
@@ -158,7 +156,7 @@ fn file_read(c: &mut Criterion) {
 
                 write(temp_path, test_buf).unwrap();
 
-                let file = File::open(&temp_path).unwrap();
+                let file = File::open(temp_path).unwrap();
                 let file = &mut Handle::<File>::new(file).unwrap();
 
                 let mut elapsed = Duration::default();
@@ -195,7 +193,7 @@ fn file_read(c: &mut Criterion) {
 
                     write(temp_path, test_buf).await.unwrap();
 
-                    let mut file = File::open(&temp_path).await.unwrap();
+                    let mut file = File::open(temp_path).await.unwrap();
 
                     let mut elapsed = Duration::default();
 
@@ -233,7 +231,7 @@ fn file_read(c: &mut Criterion) {
 
                     let mut elapsed = Duration::default();
 
-                    let mut file = File::open(&temp_path).unwrap();
+                    let mut file = File::open(temp_path).unwrap();
 
                     for _ in 0..iters {
                         file.rewind().unwrap();
@@ -267,7 +265,7 @@ fn file_read(c: &mut Criterion) {
 
                     write(temp_path, test_buf).unwrap();
 
-                    let file = File::open(&temp_path).unwrap();
+                    let file = File::open(temp_path).unwrap();
 
                     let mut elapsed = Duration::default();
 

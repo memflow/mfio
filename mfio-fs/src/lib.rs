@@ -1,3 +1,6 @@
+use core::future::Future;
+use core::task::Waker;
+use mfio::backend::*;
 use mfio::stdeq::{AsyncRead, AsyncWrite, Seekable};
 use std::fs;
 use std::path::Path;
@@ -51,7 +54,7 @@ impl OpenOptions {
     }
 }
 
-pub trait Fs {
+pub trait Fs: IoBackend {
     type FileHandle: FileHandle;
 
     fn open(&self, path: &Path, options: OpenOptions) -> Self::FileHandle;
@@ -82,7 +85,7 @@ impl<T: AsyncRead<u64> + AsyncWrite<u64>> FileHandle for T {}
 /// write(&filepath, test_string.as_bytes())?;
 ///
 /// // Create mfio's filesystem
-/// let fs = NativeFs;
+/// let fs = NativeFs::default();
 ///
 /// let mut fh = fs.open(&filepath, OpenOptions::new().read(true));
 ///
@@ -117,7 +120,7 @@ impl<T: AsyncRead<u64> + AsyncWrite<u64>> FileHandle for T {}
 /// filepath.push("mfio-fs-test-write");
 ///
 /// // Create mfio's filesystem
-/// let fs = NativeFs;
+/// let fs = NativeFs::default();
 ///
 /// let mut fh = fs.open(
 ///     &filepath,
@@ -145,7 +148,8 @@ impl<T: AsyncRead<u64> + AsyncWrite<u64>> FileHandle for T {}
 /// # })
 /// # }
 /// ```
-pub struct NativeFs;
+#[derive(Default)]
+pub struct NativeFs(impls::NativeFs);
 
 impl Fs for NativeFs {
     type FileHandle = Seekable<FileWrapper, u64>;
@@ -164,6 +168,27 @@ impl Fs for NativeFs {
     }
 }
 
+impl IoBackend for NativeFs {
+    type Backend = <impls::NativeFs as IoBackend>::Backend;
+
+    fn polling_handle(&self) -> Option<(DefaultHandle, Waker)> {
+        self.0.polling_handle()
+    }
+
+    fn get_backend(&self) -> BackendHandle<Self::Backend> {
+        self.0.get_backend()
+    }
+}
+
+impl NativeFs {
+    pub fn run<'a, Func: FnOnce(&'a NativeFs) -> F, F: Future>(
+        &'a mut self,
+        func: Func,
+    ) -> F::Output {
+        self.block_on(func(self))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! There is not much to test here! But it is invaluable to use say thread pool based
@@ -178,8 +203,8 @@ mod tests {
     use std::fs::write;
     use std::io::Seek;
 
-    #[pollster::test]
-    async fn simple_io() {
+    #[test]
+    fn simple_io() {
         // Running this test under miri verifies correctness of basic
         // cross-thread communication.
         let test_string = "Test test 42";
@@ -188,18 +213,18 @@ mod tests {
 
         write(&filepath, test_string.as_bytes()).unwrap();
 
-        let fs = NativeFs;
+        NativeFs::default().run(|fs| async move {
+            let fh = fs.open(&filepath, OpenOptions::new().read(true));
 
-        let fh = fs.open(&filepath, OpenOptions::new().read(true));
+            let mut d = [MaybeUninit::uninit(); 8];
 
-        let mut d = [MaybeUninit::uninit(); 8];
-
-        let stream = fh.read_raw(0, &mut d[..]);
-        stream.count().await;
+            let stream = fh.read_raw(0, &mut d[..]);
+            stream.count().await;
+        });
     }
 
-    #[pollster::test]
-    async fn read_all() {
+    #[test]
+    fn read_all() {
         // Running this test under miri verifies correctness of basic
         // cross-thread communication.
         let test_string = "Test test 42";
@@ -208,17 +233,17 @@ mod tests {
 
         write(&filepath, test_string.as_bytes()).unwrap();
 
-        let fs = NativeFs;
+        NativeFs::default().run(|fs| async move {
+            let fh = fs.open(&filepath, OpenOptions::new().read(true));
 
-        let fh = fs.open(&filepath, OpenOptions::new().read(true));
+            let mut d = [MaybeUninit::uninit(); 8];
 
-        let mut d = [MaybeUninit::uninit(); 8];
-
-        fh.read_all(0, &mut d[..]).await;
+            fh.read_all(0, &mut d[..]).await;
+        });
     }
 
-    #[pollster::test]
-    async fn write_test() {
+    #[test]
+    fn write_test() {
         let mut test_data = vec![];
 
         for i in 0u8..128 {
@@ -228,36 +253,35 @@ mod tests {
         let mut filepath = std::env::temp_dir();
         filepath.push("mfio-fs-test-write");
 
-        // Create mfio's filesystem
-        let fs = NativeFs;
+        NativeFs::default().run(|fs| async move {
+            let mut fh = fs.open(
+                &filepath,
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true),
+            );
 
-        let mut fh = fs.open(
-            &filepath,
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true),
-        );
+            AsyncWrite::write(&mut fh, &test_data).await.unwrap();
 
-        AsyncWrite::write(&mut fh, &test_data).await.unwrap();
+            assert_eq!(test_data.len(), fh.get_pos() as usize);
 
-        assert_eq!(test_data.len(), fh.get_pos() as usize);
+            fh.rewind().unwrap();
 
-        fh.rewind().unwrap();
+            // Read the data back out
+            let mut output = vec![];
+            AsyncRead::read_to_end(&mut fh, &mut output).await.unwrap();
 
-        // Read the data back out
-        let mut output = vec![];
-        AsyncRead::read_to_end(&mut fh, &mut output).await.unwrap();
+            assert_eq!(test_data.len(), fh.get_pos() as usize);
+            assert_eq!(test_data, output);
 
-        assert_eq!(test_data.len(), fh.get_pos() as usize);
-        assert_eq!(test_data, output);
-
-        core::mem::drop(fh);
+            core::mem::drop(fh);
+        });
     }
 
-    #[pollster::test]
-    async fn read_to_end() {
+    #[test]
+    fn read_to_end() {
         let test_string = "Test test 42";
         let mut filepath = std::env::temp_dir();
         filepath.push("mfio-fs-test-read-to-end");
@@ -265,15 +289,14 @@ mod tests {
         // Create a test file:
         write(&filepath, test_string.as_bytes()).unwrap();
 
-        // Create mfio's filesystem
-        let fs = NativeFs;
+        NativeFs::default().run(|fs| async move {
+            let mut fh = fs.open(&filepath, OpenOptions::new().read(true));
 
-        let mut fh = fs.open(&filepath, OpenOptions::new().read(true));
+            let mut output = vec![];
+            AsyncRead::read_to_end(&mut fh, &mut output).await.unwrap();
 
-        let mut output = vec![];
-        AsyncRead::read_to_end(&mut fh, &mut output).await.unwrap();
-
-        assert_eq!(test_string.len(), fh.get_pos() as usize);
-        assert_eq!(test_string.as_bytes(), output);
+            assert_eq!(test_string.len(), fh.get_pos() as usize);
+            assert_eq!(test_string.as_bytes(), output);
+        });
     }
 }

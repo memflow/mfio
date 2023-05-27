@@ -2,14 +2,16 @@ use std::fs::File;
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
 
+use core::future::pending;
 use core::mem::ManuallyDrop;
-use core::task::Context;
+use core::task::{Context, Waker};
 
 #[cfg(all(unix, not(miri)))]
 use std::os::unix::fs::FileExt;
 #[cfg(all(windows, not(miri)))]
 use std::os::windows::fs::FileExt;
 
+use mfio::backend::*;
 use mfio::packet::*;
 use mfio::tarc::BaseArc;
 
@@ -161,12 +163,10 @@ impl From<BaseArc<FileInner>> for FileWrapper {
 
         let write_stream = ManuallyDrop::new(BaseArc::from(PacketStream {
             ctx: PacketCtx::new(write_io).into(),
-            future: None,
         }));
 
         let read_stream = ManuallyDrop::new(BaseArc::from(PacketStream {
             ctx: PacketCtx::new(read_io).into(),
-            future: None,
         }));
 
         Self {
@@ -196,5 +196,29 @@ impl PacketIo<Write, u64> for FileWrapper {
 
     fn try_new_id<'a>(&'a self, _: &mut Context) -> Option<PacketId<'a, Write, u64>> {
         Some(self.read_stream.new_packet_id())
+    }
+}
+
+pub struct NativeFs {
+    backend: BackendContainer<DynBackend>,
+}
+
+impl Default for NativeFs {
+    fn default() -> Self {
+        Self {
+            backend: BackendContainer::new_dyn(pending()),
+        }
+    }
+}
+
+impl IoBackend for NativeFs {
+    type Backend = DynBackend;
+
+    fn polling_handle(&self) -> Option<(DefaultHandle, Waker)> {
+        None
+    }
+
+    fn get_backend(&self) -> BackendHandle<Self::Backend> {
+        self.backend.acquire()
     }
 }

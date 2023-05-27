@@ -1,7 +1,7 @@
 use core::mem::MaybeUninit;
 
-
 use core::task::Context;
+use core::task::Waker;
 
 use tarc::{Arc, BaseArc};
 
@@ -94,10 +94,10 @@ impl Drop for VolatileMem {
     }
 }
 
-#[derive(Clone)]
 pub struct IoThreadState {
     read_stream: BaseArc<PacketStream<'static, Write, Address>>,
     write_stream: BaseArc<PacketStream<'static, Read, Address>>,
+    backend: BackendContainer<DynBackend>,
 }
 
 impl IoThreadState {
@@ -155,32 +155,44 @@ impl IoThreadState {
             }
         };
 
-        let future = Box::pin(async move {
+        let future = async move {
             tokio::join!(read, write);
-        }) as BoxedFuture;
-        let future = SharedFuture::from(future);
+        };
+
+        let backend = BackendContainer::new_dyn(future);
 
         let write_stream = BaseArc::from(PacketStream {
             ctx: PacketCtx::new(write_io).into(),
-            future: Some(future.clone()),
         });
 
         let read_stream = BaseArc::from(PacketStream {
             ctx: PacketCtx::new(read_io).into(),
-            future: Some(future),
         });
 
         Self {
             write_stream,
             read_stream,
+            backend,
         }
     }
 }
 
-#[derive(Clone)]
+//#[derive(Clone)]
 pub struct SampleIo {
     mem: Arc<VolatileMem>,
     thread_state: IoThreadState,
+}
+
+impl Clone for SampleIo {
+    fn clone(&self) -> Self {
+        let mem = self.mem.clone();
+        let thread_state = IoThreadState::new(&mem);
+
+        Self {
+            mem,
+            thread_state,
+        }
+    }
 }
 
 impl Default for SampleIo {
@@ -195,10 +207,7 @@ impl SampleIo {
 
         let thread_state = IoThreadState::new(&mem);
 
-        Self {
-            mem,
-            thread_state,
-        }
+        Self { mem, thread_state }
     }
 }
 
@@ -219,5 +228,17 @@ impl PacketIo<Write, Address> for SampleIo {
 
     fn try_new_id<'a>(&'a self, _: &mut Context) -> Option<PacketId<'a, Write, Address>> {
         Some(self.thread_state.read_stream.new_packet_id())
+    }
+}
+
+impl IoBackend for SampleIo {
+    type Backend = DynBackend;
+
+    fn polling_handle(&self) -> Option<(DefaultHandle, Waker)> {
+        None
+    }
+
+    fn get_backend(&self) -> BackendHandle<Self::Backend> {
+        self.thread_state.backend.acquire()
     }
 }
