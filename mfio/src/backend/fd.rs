@@ -1,4 +1,4 @@
-use core::task::{RawWaker, RawWakerVTable};
+use core::task::{RawWaker, RawWakerVTable, Waker};
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
@@ -51,6 +51,10 @@ impl FdWaker {
             Self::raw_drop,
         );
         RawWaker::new(data, vtbl)
+    }
+
+    pub fn into_waker(self) -> Waker {
+        unsafe { Waker::from_raw(self.into_raw_waker()) }
     }
 
     unsafe fn raw_wake(data: *const ()) {

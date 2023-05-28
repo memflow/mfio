@@ -164,7 +164,7 @@ impl Fs for NativeFs {
             .open(path)
             .unwrap();
 
-        FileWrapper::from(file).into()
+        self.0.register_file(file).into()
     }
 }
 

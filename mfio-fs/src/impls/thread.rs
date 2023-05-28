@@ -222,3 +222,9 @@ impl IoBackend for NativeFs {
         self.backend.acquire()
     }
 }
+
+impl NativeFs {
+    pub fn register_file(&self, file: File) -> FileWrapper {
+        FileWrapper::from(file).into()
+    }
+}

@@ -1,5 +1,6 @@
 use std::os::fd::RawFd;
 use tokio::io::unix::AsyncFd;
+use tokio::io::Interest;
 
 use super::super::*;
 use super::{BorrowingFn, Integration};
@@ -69,19 +70,19 @@ impl<'a, B: LinksIoBackend + 'a, Func: BorrowingFn<B::Link>> Future
                         fut,
                         h.map(|(h, w)| {
                             (
-                                AsyncFd::new(h).expect("Could not register the IO resource"),
+                                AsyncFd::with_interest(h, Interest::READABLE)
+                                    .expect("Could not register the IO resource"),
                                 w,
                             )
                         }),
                     );
                 }
                 TokioState::Loaded(wb, fd) => {
-                    if let Some((fd, waker)) = fd {
+                    if let Some((fd, _)) = fd {
                         if let Poll::Ready(Ok(mut guard)) = fd.poll_read_ready(cx) {
                             // We clear the ready flag, because the backend is expected to consume
                             // all I/O until it blocks without waking anything.
                             guard.clear_ready();
-                            waker.wake_by_ref();
                         }
                     }
 

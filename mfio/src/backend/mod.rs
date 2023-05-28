@@ -200,7 +200,7 @@ fn block_on_handle<F: Future>(_: F, _: DefaultHandle, _: Waker) -> F::Output {
 fn block_on_handle<F: Future>(mut fut: F, handle: RawFd, waker: Waker) -> F::Output {
     use nix::poll::*;
 
-    let fd = PollFd::new(handle, PollFlags::all());
+    let fd = PollFd::new(handle, PollFlags::POLLIN);
 
     let mut cx = Context::from_waker(&waker);
 

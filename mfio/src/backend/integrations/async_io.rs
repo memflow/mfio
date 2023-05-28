@@ -71,6 +71,10 @@ impl<'a, B: LinksIoBackend + 'a, Func: BorrowingFn<B::Link>> Future
                         fut,
                         h.map(|(h, w)| {
                             (
+                                // FIXME: we need to make `Async` not set nonblocking mode, as it
+                                // is unsupported on kqueues. We should talk with upstream to
+                                // enable our usage.
+                                // Async::with_nonblocking_mode(h, false)
                                 Async::new(h).expect("Could not register the IO resource"),
                                 w,
                             )
@@ -78,10 +82,11 @@ impl<'a, B: LinksIoBackend + 'a, Func: BorrowingFn<B::Link>> Future
                     );
                 }
                 AsyncIoState::Loaded(wb, fd) => {
-                    if let Some((fd, waker)) = fd {
-                        if let Poll::Ready(Ok(_)) = fd.poll_readable(cx) {
-                            waker.wake_by_ref();
-                        }
+                    if let Some((fd, _)) = fd {
+                        // We don't care about the outcome, we only want async-io to wake us up
+                        // when the fd is readable, as the backend is responsible for consuming all
+                        // outstanding events upon it being polled.
+                        let _ = fd.poll_readable(cx);
                     }
 
                     break unsafe { Pin::new_unchecked(wb) }.poll(cx);
