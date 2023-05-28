@@ -70,7 +70,6 @@ impl<T: AsyncRead<u64> + AsyncWrite<u64>> FileHandle for T {}
 /// Read a file:
 /// ```
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// # pollster::block_on(async move {
 /// use mfio::packet::*;
 /// use mfio::stdeq::*;
 /// use mfio_fs::*;
@@ -85,18 +84,17 @@ impl<T: AsyncRead<u64> + AsyncWrite<u64>> FileHandle for T {}
 /// write(&filepath, test_string.as_bytes())?;
 ///
 /// // Create mfio's filesystem
-/// let fs = NativeFs::default();
+/// NativeFs::default().run(|fs| async move {
+///     let fh = fs.open(&filepath, OpenOptions::new().read(true));
 ///
-/// let mut fh = fs.open(&filepath, OpenOptions::new().read(true));
+///     let mut output = vec![];
+///     fh.read_to_end(&mut output).await.unwrap();
 ///
-/// let mut output = vec![];
-/// fh.read_to_end(&mut output).await.unwrap();
-///
-/// assert_eq!(test_string.len(), fh.get_pos() as usize);
-/// assert_eq!(test_string.as_bytes(), output);
+///     assert_eq!(test_string.len(), fh.get_pos() as usize);
+///     assert_eq!(test_string.as_bytes(), output);
+/// });
 ///
 /// # Ok(())
-/// # })
 /// # }
 /// ```
 ///
@@ -120,30 +118,29 @@ impl<T: AsyncRead<u64> + AsyncWrite<u64>> FileHandle for T {}
 /// filepath.push("mfio-fs-test-write");
 ///
 /// // Create mfio's filesystem
-/// let fs = NativeFs::default();
+/// NativeFs::default().run(|fs| async move {
+///     let mut fh = fs.open(
+///         &filepath,
+///         OpenOptions::new()
+///             .read(true)
+///             .write(true)
+///             .create(true)
+///             .truncate(true)
+///         );
 ///
-/// let mut fh = fs.open(
-///     &filepath,
-///     OpenOptions::new()
-///         .read(true)
-///         .write(true)
-///         .create(true)
-///         .truncate(true)
-///     );
+///     fh.write(&test_data).await;
 ///
-/// fh.write(&test_data).await;
+///     assert_eq!(test_data.len(), fh.get_pos() as usize);
 ///
-/// assert_eq!(test_data.len(), fh.get_pos() as usize);
+///     fh.rewind();
 ///
-/// fh.rewind();
+///     // Read the data back out
+///     let mut output = vec![];
+///     fh.read_to_end(&mut output).await.unwrap();
 ///
-/// // Read the data back out
-/// let mut output = vec![];
-/// fh.read_to_end(&mut output).await.unwrap();
-///
-/// assert_eq!(test_data.len(), fh.get_pos() as usize);
-/// assert_eq!(test_data, output);
-///
+///     assert_eq!(test_data.len(), fh.get_pos() as usize);
+///     assert_eq!(test_data, output);
+/// });
 /// # Ok(())
 /// # })
 /// # }
@@ -263,7 +260,7 @@ mod tests {
                     .truncate(true),
             );
 
-            AsyncWrite::write(&mut fh, &test_data).await.unwrap();
+            AsyncWrite::write(&fh, &test_data).await.unwrap();
 
             assert_eq!(test_data.len(), fh.get_pos() as usize);
 
@@ -271,7 +268,7 @@ mod tests {
 
             // Read the data back out
             let mut output = vec![];
-            AsyncRead::read_to_end(&mut fh, &mut output).await.unwrap();
+            AsyncRead::read_to_end(&fh, &mut output).await.unwrap();
 
             assert_eq!(test_data.len(), fh.get_pos() as usize);
             assert_eq!(test_data, output);
@@ -290,10 +287,10 @@ mod tests {
         write(&filepath, test_string.as_bytes()).unwrap();
 
         NativeFs::default().run(|fs| async move {
-            let mut fh = fs.open(&filepath, OpenOptions::new().read(true));
+            let fh = fs.open(&filepath, OpenOptions::new().read(true));
 
             let mut output = vec![];
-            AsyncRead::read_to_end(&mut fh, &mut output).await.unwrap();
+            AsyncRead::read_to_end(&fh, &mut output).await.unwrap();
 
             assert_eq!(test_string.len(), fh.get_pos() as usize);
             assert_eq!(test_string.as_bytes(), output);

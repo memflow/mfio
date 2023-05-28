@@ -155,13 +155,9 @@ pub trait IoBackend {
     /// This function uses mfio's mini-executor that is able to resolve an arbitrary future that is
     /// either awoken externally, or through exported handle's readiness events.
     fn block_on<F: Future>(&self, fut: F) -> F::Output {
-        let (fut, handle) = self.with_backend(fut);
-
-        if let Some((handle, waker)) = handle {
-            block_on_handle(fut, handle, waker)
-        } else {
-            crate::poller::block_on(fut)
-        }
+        let backend = self.get_backend();
+        let polling = self.polling_handle();
+        block_on::<F, Self>(fut, backend, polling)
     }
 }
 
@@ -188,6 +184,20 @@ impl<'a, T: IoBackend + ?Sized> LinksIoBackend for RefLink<'a, T> {
 
     fn get_mut(&self) -> &Self::Link {
         self.0
+    }
+}
+
+pub fn block_on<F: Future, B: IoBackend + ?Sized>(
+    future: F,
+    backend: BackendHandle<B::Backend>,
+    polling: Option<PollingHandle>,
+) -> F::Output {
+    let fut = WithBackend { backend, future };
+
+    if let Some((handle, waker)) = polling {
+        block_on_handle(fut, handle, waker)
+    } else {
+        crate::poller::block_on(fut)
     }
 }
 

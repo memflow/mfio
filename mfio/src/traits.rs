@@ -1,5 +1,6 @@
 use crate::packet::*;
 
+use crate::backend::IoBackend;
 use crate::util::UsizeMath;
 use bytemuck::Pod;
 use core::future::Future;
@@ -369,4 +370,43 @@ impl<'a, Io: PacketIo<Write, Param>, Param, T> Future for IoReadFut<'a, Io, Para
         };
         f()
     }
+}
+
+pub mod sync {
+    use super::*;
+
+    pub trait SyncIoRead<Pos: 'static>: IoRead<Pos> + IoBackend {
+        fn read_all<'a>(&'a self, pos: Pos, packet: impl Into<Packet<'a, Write>>) -> Option<()> {
+            self.block_on(IoRead::read_all(self, pos, packet))
+        }
+
+        fn read_into<'a, T: Pod>(&'a self, pos: Pos, data: &'a mut MaybeUninit<T>) -> Option<()> {
+            self.block_on(IoRead::read_into(self, pos, data))
+        }
+
+        fn read<T: Pod>(&self, pos: Pos) -> T {
+            self.block_on(IoRead::read(self, pos))
+        }
+
+        fn read_to_end<'a>(&'a self, pos: Pos, buf: &'a mut Vec<u8>) -> Option<usize>
+        where
+            ReadToEndFut<'a, Self, Pos>: Future<Output = Option<usize>>,
+        {
+            self.block_on(IoRead::read_to_end(self, pos, buf))
+        }
+    }
+
+    impl<T: IoRead<Pos> + IoBackend, Pos: 'static> SyncIoRead<Pos> for T {}
+
+    pub trait SyncIoWrite<Pos: 'static>: IoWrite<Pos> + IoBackend {
+        fn write_all<'a>(&'a self, pos: Pos, packet: impl Into<Packet<'a, Read>>) -> Option<()> {
+            self.block_on(IoWrite::write_all(self, pos, packet))
+        }
+
+        fn write<'a, T>(&'a self, pos: Pos, data: &'a T) -> Option<()> {
+            self.block_on(IoWrite::write(self, pos, data))
+        }
+    }
+
+    impl<T: IoWrite<Pos> + IoBackend, Pos: 'static> SyncIoWrite<Pos> for T {}
 }

@@ -12,7 +12,7 @@ use futures::stream::Stream;
 use parking_lot::Mutex;
 use tarc::{Arc, BaseArc};
 
-type Output<'a, DataType> = (PacketObj<'a, DataType>, Option<()>);
+pub type Output<'a, DataType> = (PacketObj<'a, DataType>, Option<()>);
 
 pub type BoxedFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 

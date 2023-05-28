@@ -8,12 +8,15 @@ use core::marker::PhantomData;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use futures::Stream;
+use parking_lot::Mutex;
 use std::io;
 
 pub trait StreamPos<Param> {
-    fn set_pos(&mut self, pos: Param);
+    fn set_pos(&self, pos: Param);
 
     fn get_pos(&self) -> Param;
+
+    fn update_pos<F: FnOnce(Param) -> Param>(&self, f: F);
 
     fn end(&self) -> Option<Param> {
         None
@@ -21,9 +24,9 @@ pub trait StreamPos<Param> {
 }
 
 pub trait AsyncRead<Param>: IoRead<Param> + StreamPos<Param> {
-    fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> AsyncIoFut<'a, Self, Write, Param> {
+    fn read<'a>(&'a self, buf: &'a mut [u8]) -> AsyncIoFut<'a, Self, Write, Param> {
         AsyncIoFut {
-            io: self as *mut Self,
+            io: self,
             pos: self.get_pos(),
             len: buf.len(),
             state: AsyncIoFutState::NewId(buf.into(), self.new_id()),
@@ -31,9 +34,9 @@ pub trait AsyncRead<Param>: IoRead<Param> + StreamPos<Param> {
         }
     }
 
-    fn read_to_end<'a>(&'a mut self, buf: &'a mut Vec<u8>) -> StdReadToEndFut<'a, Self, Param> {
+    fn read_to_end<'a>(&'a self, buf: &'a mut Vec<u8>) -> StdReadToEndFut<'a, Self, Param> {
         StdReadToEndFut {
-            io: self as *mut Self,
+            io: self,
             fut: <Self as IoRead<Param>>::read_to_end(self, self.get_pos(), buf),
         }
     }
@@ -42,9 +45,9 @@ pub trait AsyncRead<Param>: IoRead<Param> + StreamPos<Param> {
 impl<T: IoRead<Param> + StreamPos<Param>, Param> AsyncRead<Param> for T {}
 
 pub trait AsyncWrite<Param>: IoWrite<Param> + StreamPos<Param> {
-    fn write<'a>(&'a mut self, buf: &'a [u8]) -> AsyncIoFut<'a, Self, Read, Param> {
+    fn write<'a>(&'a self, buf: &'a [u8]) -> AsyncIoFut<'a, Self, Read, Param> {
         AsyncIoFut {
-            io: self as *mut Self,
+            io: self,
             pos: self.get_pos(),
             len: buf.len(),
             state: AsyncIoFutState::NewId(buf.into(), self.new_id()),
@@ -56,7 +59,7 @@ pub trait AsyncWrite<Param>: IoWrite<Param> + StreamPos<Param> {
 impl<T: IoWrite<Param> + StreamPos<Param>, Param> AsyncWrite<Param> for T {}
 
 pub struct AsyncIoFut<'a, Io: PacketIo<Perms, Param>, Perms: PacketPerms, Param> {
-    io: *mut Io,
+    io: *const Io,
     pos: Param,
     len: usize,
     state: AsyncIoFutState<'a, Io, Perms, Param>,
@@ -147,7 +150,7 @@ impl<
 }
 
 pub struct StdReadToEndFut<'a, Io: PacketIo<Write, Param>, Param> {
-    io: *mut Io,
+    io: &'a Io,
     fut: ReadToEndFut<'a, Io, Param>,
 }
 
@@ -161,11 +164,7 @@ impl<'a, Io: PacketIo<Write, Param> + StreamPos<Param>, Param: Copy + UsizeMath>
 
         match unsafe { Pin::new_unchecked(&mut this.fut) }.poll(cx) {
             Poll::Ready(Some(r)) => {
-                // SAFETY: there are no more shared references to io.
-                unsafe {
-                    let io = &mut *this.io;
-                    io.set_pos(io.get_pos().add(r));
-                }
+                this.io.update_pos(|pos| pos.add(r));
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(None) => Poll::Ready(Err(io::ErrorKind::Other.into())),
@@ -176,10 +175,13 @@ impl<'a, Io: PacketIo<Write, Param> + StreamPos<Param>, Param: Copy + UsizeMath>
 }
 
 #[macro_export]
-/// Implement io::Seek on type implementing `StreamPos<u64>`
-macro_rules! seek_impl_on_pos {
+/// Implements `Read`+`Write`+`Seek` traits on compatible type.
+///
+/// Implements `io::Seek` on type implementing `StreamPos<u64>`, `io::Write` on type implementing
+/// `AsyncWrite<u64>` and `io::Read` on type implementing `AsyncRead<u64>`.
+macro_rules! stdio_impl {
     (<$($ty2:ident),*> $t:ident <$($ty:ident),*> @ $($tt:tt)*) => {
-        impl<$($ty2),*> std::io::Seek for $t<$($ty),*> $($tt)* {
+        impl<$($ty2),*> std::io::Seek for $t<$($ty),*> where $($tt)* {
             fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
                 match pos {
                     std::io::SeekFrom::Start(val) => {
@@ -223,14 +225,39 @@ macro_rules! seek_impl_on_pos {
                 Ok(())
             }
         }
+
+        impl<$($ty2),*> std::io::Read for $t<$($ty),*> where $t<$($ty),*>: $crate::stdeq::AsyncRead<u64> + $crate::backend::IoBackend, $($tt)* {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                use $crate::backend::IoBackend;
+                self.block_on($crate::stdeq::AsyncRead::read(self, buf))
+            }
+
+            fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+                use $crate::backend::IoBackend;
+                let len = buf.len();
+                self.block_on($crate::stdeq::AsyncRead::read_to_end(self, buf))?;
+                Ok(buf.len() - len)
+            }
+        }
+
+        impl<$($ty2),*> std::io::Write for $t<$($ty),*> where $t<$($ty),*>: $crate::stdeq::AsyncWrite<u64> + $crate::backend::IoBackend, $($tt)* {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                use $crate::backend::IoBackend;
+                self.block_on(AsyncWrite::write(self, buf))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
     };
     ($t:ident @ $($tt:tt)*) => {
-        $crate::seek_impl!($t<> @ $($tt)*);
+        $crate::stdio_impl!($t<> @ $($tt)*);
     }
 }
 
 pub struct Seekable<T, Param> {
-    pos: Param,
+    pos: Mutex<Param>,
     handle: T,
 }
 
@@ -257,12 +284,17 @@ impl<T: PacketIo<Perms, Param>, Perms: PacketPerms, Param> PacketIo<Perms, Param
 
 impl<T, Param: Copy> StreamPos<Param> for Seekable<T, Param> {
     fn get_pos(&self) -> Param {
-        self.pos
+        *self.pos.lock()
     }
 
-    fn set_pos(&mut self, pos: Param) {
-        self.pos = pos;
+    fn set_pos(&self, pos: Param) {
+        *self.pos.lock() = pos;
+    }
+
+    fn update_pos<F: FnOnce(Param) -> Param>(&self, f: F) {
+        let mut pos = self.pos.lock();
+        *pos = f(*pos);
     }
 }
 
-seek_impl_on_pos!(<T> Seekable<T, u64> @);
+stdio_impl!(<T> Seekable<T, u64> @);
