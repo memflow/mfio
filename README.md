@@ -19,6 +19,7 @@ I/O chain as simple as possible:
 2. Automatic batching
 3. Fragmentation
 4. Partial success
+5. Lack of color (full sync support)
 
 ## Further reading
 

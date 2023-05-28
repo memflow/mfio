@@ -9,6 +9,7 @@
 //! 2. Automatic batching
 //! 3. Fragmentation
 //! 4. Partial success
+//! 5. Lack of color (full sync support)
 //!
 //! One could view mfio as _programmable I/O_, because native fragmentation support allows one to
 //! map non-linear I/O space into a linear space. This is incredibly useful for interpretation of
@@ -53,6 +54,34 @@
 //!     let int = handle.read::<u32>(0).await;
 //!     assert_eq!(u32::from_ne_bytes([0, 1, 1, 2]), int);
 //! });
+//! ```
+//!
+//! Read primitive values synchronously:
+//!
+//! ```rust
+//! # mod sample {
+//! #     use mfio::heap::{AllocHandle, PinHeap};
+//! #     use mfio::packet::*;
+//! #     use mfio::backend::*;
+//! #     use mfio::util::*;
+//! #     include!("sample.rs");
+//! # }
+//! # use sample::SampleIo;
+//! use mfio::packet::{PacketIo, Write};
+//! use mfio::backend::*;
+//! use mfio::traits::sync::*;
+//! use core::mem::MaybeUninit;
+//! use futures::{Stream, StreamExt};
+//!
+//! let handle = SampleIo::new(vec![0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144]);
+//!
+//! // Read a single byte
+//! let byte = handle.read::<u8>(3);
+//! assert_eq!(2, byte);
+//!
+//! // Read an integer
+//! let int = handle.read::<u32>(0);
+//! assert_eq!(u32::from_ne_bytes([0, 1, 1, 2]), int);
 //! ```
 //!
 //! Read structures:
