@@ -267,6 +267,7 @@ pub use tarc;
 
 #[cfg(test)]
 mod sample {
+    use crate as mfio;
     use crate::backend::*;
     use crate::packet::*;
     use crate::util::*;

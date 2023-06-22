@@ -4,7 +4,7 @@ use std::thread::{self, JoinHandle};
 
 use core::future::pending;
 use core::mem::ManuallyDrop;
-use core::task::{Context, Waker};
+use core::task::Waker;
 
 #[cfg(all(unix, not(miri)))]
 use std::os::unix::fs::FileExt;
@@ -184,7 +184,7 @@ impl PacketIo<Read, u64> for FileWrapper {
         *self = Self::from(self.file.clone());
     }
 
-    fn try_new_id<'a>(&'a self, _: &mut Context) -> Option<PacketId<'a, Read, u64>> {
+    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, Read, u64>> {
         Some(self.write_stream.new_packet_id())
     }
 }
@@ -194,7 +194,7 @@ impl PacketIo<Write, u64> for FileWrapper {
         *self = Self::from(self.file.clone());
     }
 
-    fn try_new_id<'a>(&'a self, _: &mut Context) -> Option<PacketId<'a, Write, u64>> {
+    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, Write, u64>> {
         Some(self.read_stream.new_packet_id())
     }
 }

@@ -40,6 +40,7 @@ impl Event {
 }
 
 #[derive(Default, Debug)]
+#[repr(transparent)]
 pub struct ReadOnly<T>(UnsafeCell<T>);
 
 unsafe impl<T: Sync> Sync for ReadOnly<T> {}

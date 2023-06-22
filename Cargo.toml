@@ -6,10 +6,12 @@ debug = true
 members = [
 	"mfio",
 	"mfio-fs",
+	"mfio-derive",
 ]
 
 default-members = [
 	"mfio",
 	"mfio-fs",
+	"mfio-derive",
 ]
 

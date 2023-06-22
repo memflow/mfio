@@ -1,6 +1,7 @@
 use core::mem::MaybeUninit;
 
-use core::task::Context;
+use mfio_derive::*;
+
 use core::task::Waker;
 
 use tarc::{Arc, BaseArc};
@@ -177,7 +178,7 @@ impl IoThreadState {
     }
 }
 
-//#[derive(Clone)]
+#[derive(SyncIoRead, SyncIoWrite)]
 pub struct SampleIo {
     mem: Arc<VolatileMem>,
     thread_state: IoThreadState,
@@ -216,7 +217,7 @@ impl PacketIo<Read, Address> for SampleIo {
         self.thread_state = IoThreadState::new(&self.mem);
     }
 
-    fn try_new_id<'a>(&'a self, _: &mut Context) -> Option<PacketId<'a, Read, Address>> {
+    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, Read, Address>> {
         Some(self.thread_state.write_stream.new_packet_id())
     }
 }
@@ -226,7 +227,7 @@ impl PacketIo<Write, Address> for SampleIo {
         self.thread_state = IoThreadState::new(&self.mem);
     }
 
-    fn try_new_id<'a>(&'a self, _: &mut Context) -> Option<PacketId<'a, Write, Address>> {
+    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, Write, Address>> {
         Some(self.thread_state.read_stream.new_packet_id())
     }
 }

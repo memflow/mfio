@@ -8,11 +8,11 @@ use parking_lot::Mutex;
 use slab::Slab;
 
 use core::future::poll_fn;
-use core::task::{Context, Poll, Waker};
+use core::task::{Poll, Waker};
 
 use mfio::backend::fd::FdWaker;
 use mfio::backend::*;
-use mfio::packet::{Read as RdPerm, Write as WrPerm, *};
+use mfio::packet::{FastCWaker, Read as RdPerm, Write as WrPerm, *};
 use mfio::tarc::BaseArc;
 
 const RW_INTERESTS: Interest = Interest::READABLE.add(Interest::WRITABLE);
@@ -227,7 +227,7 @@ impl PacketIo<RdPerm, u64> for FileWrapper {
         //*self = Self::from(self.file.clone());
     }
 
-    fn try_new_id<'a>(&'a self, _: &mut Context) -> Option<PacketId<'a, RdPerm, u64>> {
+    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, RdPerm, u64>> {
         Some(self.write_stream.new_packet_id())
     }
 }
@@ -237,7 +237,7 @@ impl PacketIo<WrPerm, u64> for FileWrapper {
         //*self = Self::from(self.file.clone());
     }
 
-    fn try_new_id<'a>(&'a self, _: &mut Context) -> Option<PacketId<'a, WrPerm, u64>> {
+    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, WrPerm, u64>> {
         Some(self.read_stream.new_packet_id())
     }
 }

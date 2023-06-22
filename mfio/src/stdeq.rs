@@ -1,13 +1,16 @@
 //! `std::io` equivalent Read/Write traits.
 
+use crate as mfio;
 use crate::packet::*;
 use crate::traits::*;
 use crate::util::UsizeMath;
+use cglue::task::FastCWaker;
 use core::future::Future;
 use core::marker::PhantomData;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use futures::Stream;
+use mfio_derive::*;
 use parking_lot::Mutex;
 use std::io;
 
@@ -23,7 +26,7 @@ pub trait StreamPos<Param> {
     }
 }
 
-pub trait AsyncRead<Param>: IoRead<Param> + StreamPos<Param> {
+pub trait AsyncRead<Param: 'static>: IoRead<Param> + StreamPos<Param> {
     fn read<'a>(&'a self, buf: &'a mut [u8]) -> AsyncIoFut<'a, Self, Write, Param> {
         AsyncIoFut {
             io: self,
@@ -42,7 +45,7 @@ pub trait AsyncRead<Param>: IoRead<Param> + StreamPos<Param> {
     }
 }
 
-impl<T: IoRead<Param> + StreamPos<Param>, Param> AsyncRead<Param> for T {}
+impl<T: IoRead<Param> + StreamPos<Param>, Param: 'static> AsyncRead<Param> for T {}
 
 pub trait AsyncWrite<Param>: IoWrite<Param> + StreamPos<Param> {
     fn write<'a>(&'a self, buf: &'a [u8]) -> AsyncIoFut<'a, Self, Read, Param> {
@@ -256,6 +259,7 @@ macro_rules! stdio_impl {
     }
 }
 
+#[derive(SyncIoWrite, SyncIoRead)]
 pub struct Seekable<T, Param> {
     pos: Mutex<Param>,
     handle: T,
@@ -277,7 +281,7 @@ impl<T: PacketIo<Perms, Param>, Perms: PacketPerms, Param> PacketIo<Perms, Param
         self.handle.separate_thread_state();
     }
 
-    fn try_new_id<'a>(&'a self, context: &mut Context) -> Option<PacketId<'a, Perms, Param>> {
+    fn try_new_id<'a>(&'a self, context: &mut FastCWaker) -> Option<PacketId<'a, Perms, Param>> {
         self.handle.try_new_id(context)
     }
 }

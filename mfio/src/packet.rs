@@ -1,5 +1,7 @@
 use crate::multistack::{MultiStack, StackHandle};
 use crate::util::ReadOnly;
+use cglue::option::COption;
+pub use cglue::task::{CWaker, FastCWaker};
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::marker::{PhantomData, PhantomPinned};
@@ -7,7 +9,7 @@ use core::mem::ManuallyDrop;
 use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicIsize, Ordering};
-use core::task::{Context, Poll, Waker};
+use core::task::{Context, Poll};
 use futures::stream::Stream;
 use parking_lot::Mutex;
 use tarc::{Arc, BaseArc};
@@ -17,6 +19,7 @@ pub type Output<'a, DataType> = (PacketObj<'a, DataType>, Option<()>);
 pub type BoxedFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 #[derive(Debug)]
+#[repr(C)]
 pub struct PacketId<'a, Perms: PacketPerms, Param> {
     inner: ReadOnly<PacketIdInner>,
     stream: &'a PacketStream<'a, Perms, Param>,
@@ -63,11 +66,12 @@ impl<'a, Perms: PacketPerms, Param> core::ops::Deref for PacketId<'a, Perms, Par
 }
 
 #[derive(Debug)]
+#[repr(C)]
 pub struct PacketIdInner {
     id: StackHandle,
     size: AtomicIsize,
-    wake: UnsafeCell<Option<Waker>>,
-    _pinned: PhantomPinned,
+    wake: UnsafeCell<COption<CWaker>>,
+    _pinned: PhantomData<PhantomPinned>,
 }
 
 // SAFETY: we are handling synchronization for the unsafe cell that is making this type not
@@ -77,11 +81,15 @@ unsafe impl Send for PacketIdInner {}
 // implement Send + Sync
 unsafe impl Sync for PacketIdInner {}
 
+use cglue::prelude::v1::*;
+
+#[cglue_trait]
 pub trait PacketIo<Perms: PacketPerms, Param>: Sized {
     fn separate_thread_state(&mut self);
 
-    fn try_new_id<'a>(&'a self, context: &mut Context) -> Option<PacketId<'a, Perms, Param>>;
+    fn try_new_id<'a>(&'a self, context: &mut FastCWaker) -> Option<PacketId<'a, Perms, Param>>;
 
+    #[skip_func]
     fn new_id(&self) -> NewIdFut<Self, Perms, Param> {
         NewIdFut {
             this: self,
@@ -89,6 +97,7 @@ pub trait PacketIo<Perms: PacketPerms, Param>: Sized {
         }
     }
 
+    #[skip_func]
     fn io<'a>(
         &'a self,
         param: Param,
@@ -113,7 +122,7 @@ impl<'a, T: PacketIo<Perms, Param>, Perms: PacketPerms, Param> Stream
         loop {
             match state {
                 IoFut::NewId(this, _, _) => {
-                    if let Some(packet_id) = (*this).try_new_id(cx) {
+                    if let Some(packet_id) = (*this).try_new_id(&mut cx.waker().into()) {
                         let in_progress = IoFut::InProgress(packet_id);
                         let prev = core::mem::replace(state, in_progress);
                         match (&mut *state, prev) {
@@ -146,7 +155,7 @@ impl<'a, T: PacketIo<Perms, Param>, Perms: PacketPerms, Param: 'a> Future
     type Output = PacketId<'a, Perms, Param>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        if let Some(packet_id) = self.this.try_new_id(cx) {
+        if let Some(packet_id) = self.this.try_new_id(&mut cx.waker().into()) {
             Poll::Ready(packet_id)
         } else {
             Poll::Pending
@@ -185,7 +194,7 @@ impl<'a, Perms: PacketPerms, Param> PacketStream<'a, Perms, Param> {
                 // SAFETY: we are holding the lock to the output stack. The only other place where this
                 // waker is being accessed from, also does so holding the output stack lock.
                 unsafe {
-                    *id.inner.wake.get() = Some(cx.waker().clone());
+                    *id.inner.wake.get() = Some(cx.waker().clone().into()).into();
                 }
 
                 Poll::Pending
@@ -211,7 +220,7 @@ impl<'a, Perms: PacketPerms, Param> PacketStream<'a, Perms, Param> {
                 id,
                 size: 0.into(),
                 wake: Default::default(),
-                _pinned: PhantomPinned,
+                _pinned: PhantomData,
             }),
             stream,
         }
@@ -455,6 +464,7 @@ unsafe impl<'a, DataType> Send for PacketObj<'a, DataType> {}
 unsafe impl<'a, DataType> Sync for PacketObj<'a, DataType> {}
 
 #[derive(Debug)]
+#[repr(C)]
 pub struct Packet<'a, Perms: PacketPerms> {
     vtable: &'static Perms,
     obj: PacketObj<'a, Perms::DataType>,

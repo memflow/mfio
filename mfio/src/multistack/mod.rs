@@ -19,11 +19,13 @@ impl<T> StackNode<T> {
 }
 
 #[derive(Debug, Default, Clone, Copy)]
+#[repr(C)]
 pub struct StackHandleInner {
     head: usize,
 }
 
 #[derive(Debug)]
+#[repr(C)]
 pub struct StackHandle {
     inner: UnsafeCell<StackHandleInner>,
     stack: *const (),
