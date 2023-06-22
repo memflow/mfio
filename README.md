@@ -2,8 +2,8 @@
 
 [![Build and test]][workflows] [![Rustc 1.66]][rust] [![codecov]][codecov-link]
 
-[Build and test]: https://github.com/h33p/cglue/actions/workflows/build.yml/badge.svg
-[workflows]: https://github.com/h33p/cglue/actions/workflows/build.yml
+[Build and test]: https://github.com/memflow/mfio/actions/workflows/build.yml/badge.svg
+[workflows]: https://github.com/memflow/mfio/actions/workflows/build.yml
 [MIT licensed]: https://img.shields.io/badge/license-MIT-blue.svg
 [Rustc 1.66]: https://img.shields.io/badge/rustc-1.66+-lightgray.svg
 [rust]: https://blog.rust-lang.org/2022/12/15/Rust-1.66.0.html
