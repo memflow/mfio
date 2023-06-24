@@ -15,6 +15,8 @@ use mfio::backend::*;
 use mfio::packet::{FastCWaker, Read as RdPerm, Write as WrPerm, *};
 use mfio::tarc::BaseArc;
 
+use super::{io_err, State};
+
 const RW_INTERESTS: Interest = Interest::READABLE.add(Interest::WRITABLE);
 
 enum Operation {
@@ -50,10 +52,16 @@ impl FileInner {
                         self.ops.push_front((pos, op));
                         return true;
                     }
-                    _ => {
+                    v => {
+                        let err = if let Err(e) = v {
+                            io_err(e.kind().into())
+                        } else {
+                            io_err(State::Other)
+                        };
+
                         match op {
-                            Operation::Read(pkt) => pkt.error(Some(())),
-                            Operation::Write(pkt) => pkt.error(Some(())),
+                            Operation::Read(pkt) => pkt.error(err),
+                            Operation::Write(pkt) => pkt.error(err),
                         }
                         continue;
                     }
@@ -77,7 +85,7 @@ impl FileInner {
                                     pkt = pkt.split_at(l).1;
                                     self.pos += l as u64;
                                 } else {
-                                    pkt.error(Some(()));
+                                    pkt.error(io_err(State::Nop));
                                     break;
                                 }
                             }
@@ -85,8 +93,8 @@ impl FileInner {
                                 self.ops.push_front((self.pos, Operation::Read(pkt)));
                                 return true;
                             }
-                            Err(_e) => {
-                                pkt.error(Some(()));
+                            Err(e) => {
+                                pkt.error(io_err(e.kind().into()));
                                 break;
                             }
                         }
@@ -105,7 +113,7 @@ impl FileInner {
                                 pkt = pkt.split_at(l).1;
                                 self.pos += l as u64;
                             } else {
-                                pkt.error(Some(()));
+                                pkt.error(io_err(State::Nop));
                                 break;
                             }
                         }
@@ -113,8 +121,8 @@ impl FileInner {
                             self.ops.push_front((self.pos, Operation::Write(pkt)));
                             return true;
                         }
-                        Err(_e) => {
-                            pkt.error(Some(()));
+                        Err(e) => {
+                            pkt.error(io_err(e.kind().into()));
                             break;
                         }
                     }

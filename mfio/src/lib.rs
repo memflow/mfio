@@ -1,12 +1,12 @@
 //! # mfio
 //!
-//! ## Completion based I/O primitives
+//! ## Async completion I/O with non-sequential results
 //!
 //! mfio is memflow's async completion based I/O base. It aims to make the following aspects of an
 //! I/O chain as simple as possible:
 //!
 //! 1. Async
-//! 2. Automatic batching
+//! 2. Automatic batching (vectoring)
 //! 3. Fragmentation
 //! 4. Partial success
 //! 5. Lack of color (full sync support)
@@ -29,13 +29,10 @@
 //!
 //! ```rust
 //! # mod sample {
-//! #     use mfio::heap::{AllocHandle, PinHeap};
-//! #     use mfio::packet::*;
-//! #     use mfio::backend::*;
-//! #     use mfio::util::*;
 //! #     include!("sample.rs");
 //! # }
 //! # use sample::SampleIo;
+//! # fn work() -> mfio::error::Result<()> {
 //! use mfio::packet::{PacketIo, Write};
 //! use mfio::backend::*;
 //! use mfio::traits::*;
@@ -47,26 +44,26 @@
 //! // mfio includes a lightweight executor
 //! handle.block_on(async {
 //!     // Read a single byte
-//!     let byte = handle.read::<u8>(3).await;
+//!     let byte = handle.read::<u8>(3).await?;
 //!     assert_eq!(2, byte);
 //!
 //!     // Read an integer
-//!     let int = handle.read::<u32>(0).await;
+//!     let int = handle.read::<u32>(0).await?;
 //!     assert_eq!(u32::from_ne_bytes([0, 1, 1, 2]), int);
-//! });
+//!     Ok(())
+//! })
+//! # }
+//! # work().unwrap();
 //! ```
 //!
 //! Read primitive values synchronously:
 //!
 //! ```rust
 //! # mod sample {
-//! #     use mfio::heap::{AllocHandle, PinHeap};
-//! #     use mfio::packet::*;
-//! #     use mfio::backend::*;
-//! #     use mfio::util::*;
 //! #     include!("sample.rs");
 //! # }
 //! # use sample::SampleIo;
+//! # fn work() -> mfio::error::Result<()> {
 //! use mfio::packet::{PacketIo, Write};
 //! use mfio::backend::*;
 //! use mfio::traits::sync::*;
@@ -76,25 +73,25 @@
 //! let handle = SampleIo::new(vec![0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144]);
 //!
 //! // Read a single byte
-//! let byte = handle.read::<u8>(3);
+//! let byte = handle.read::<u8>(3)?;
 //! assert_eq!(2, byte);
 //!
 //! // Read an integer
-//! let int = handle.read::<u32>(0);
+//! let int = handle.read::<u32>(0)?;
 //! assert_eq!(u32::from_ne_bytes([0, 1, 1, 2]), int);
+//! # Ok(())
+//! # }
+//! # work().unwrap();
 //! ```
 //!
 //! Read structures:
 //!
 //! ```rust
 //! # mod sample {
-//! #     use mfio::heap::{AllocHandle, PinHeap};
-//! #     use mfio::packet::*;
-//! #     use mfio::backend::*;
-//! #     use mfio::util::*;
 //! #     include!("sample.rs");
 //! # }
 //! # use sample::SampleIo;
+//! # fn work() -> mfio::error::Result<()> {
 //! # pollster::block_on(async move {
 //! use mfio::packet::{PacketIo, Write};
 //! use mfio::backend::*;
@@ -124,10 +121,13 @@
 //! // There is also `AsyncIo` - for smol, async-std and friends.
 //! Null::run_with_mut(&mut handle, |handle| async move {
 //!     // Read value
-//!     let val = handle.read(0).await;
+//!     let val = handle.read(0).await?;
 //!     assert_eq!(sample, val);
-//! }).await;
-//! # });
+//!     Ok(())
+//! }).await
+//! # })
+//! # }
+//! # work().unwrap();
 //! ```
 //!
 //! ## Safety
@@ -141,13 +141,10 @@
 //!
 //! ```rust no_run
 //! # mod sample {
-//! #     use mfio::heap::{AllocHandle, PinHeap};
-//! #     use mfio::packet::*;
-//! #     use mfio::backend::*;
-//! #     use mfio::util::*;
 //! #     include!("sample.rs");
 //! # }
 //! # use sample::SampleIo;
+//! # fn work() -> mfio::error::Result<()> {
 //! use mfio::packet::{PacketIo, Write};
 //! use mfio::backend::*;
 //! use core::mem::MaybeUninit;
@@ -176,14 +173,13 @@
 //!     // This will process both I/O streams, even though the previous one was forgotten.
 //!     let _ = handle.io(0, &mut data).count().await;
 //! });
+//! # Ok(())
+//! # }
+//! # work().unwrap()
 //! ```
 //!
 //! ```rust no_run
 //! # mod sample {
-//! #     use mfio::heap::{AllocHandle, PinHeap};
-//! #     use mfio::packet::*;
-//! #     use mfio::backend::*;
-//! #     use mfio::util::*;
 //! #     include!("sample.rs");
 //! # }
 //! # use sample::SampleIo;
@@ -218,10 +214,6 @@
 //!
 //! ```rust
 //! # mod sample {
-//! #     use mfio::heap::{AllocHandle, PinHeap};
-//! #     use mfio::packet::*;
-//! #     use mfio::backend::*;
-//! #     use mfio::util::*;
 //! #     include!("sample.rs");
 //! # }
 //! # use sample::SampleIo;
@@ -255,6 +247,7 @@
 //! ```
 
 pub mod backend;
+pub mod error;
 pub mod heap;
 pub(crate) mod multistack;
 pub mod packet;
@@ -268,9 +261,6 @@ pub use tarc;
 #[cfg(test)]
 mod sample {
     use crate as mfio;
-    use crate::backend::*;
-    use crate::packet::*;
-    use crate::util::*;
     include!("sample.rs");
 }
 
@@ -282,10 +272,46 @@ mod tests {
     use super::traits::*;
     use super::*;
     use crate::backend::*;
+    use crate::error::*;
     use crate::sample::SampleIo;
     use bytemuck::{Pod, Zeroable};
     use core::mem::MaybeUninit;
     use futures::StreamExt;
+
+    #[tokio::test]
+    async fn oobe() {
+        let mut handle = SampleIo::new((0..200).collect::<Vec<_>>());
+        let mut value = [MaybeUninit::uninit(); 2];
+
+        Null::run_with_mut(&mut handle, |handle| async move {
+            let stream = handle.io(200, &mut value[..]);
+
+            let output = stream.map(|(_, b)| b).collect::<Vec<_>>().await;
+
+            assert_eq!(output[0].unwrap().state, State::Outside);
+        })
+        .await;
+
+        core::mem::drop(handle);
+    }
+
+    #[tokio::test]
+    async fn split_oobe() {
+        let mut handle = SampleIo::new((0..200).collect::<Vec<_>>());
+        let mut value = [MaybeUninit::uninit(); 2];
+
+        Null::run_with_mut(&mut handle, |handle| async move {
+            let stream = handle.io(199, &mut value[..]);
+
+            let output = stream.map(|(_, b)| b).collect::<Vec<_>>().await;
+
+            assert_eq!(output[0], None);
+            assert_eq!(output[1].unwrap().state, State::Outside);
+        })
+        .await;
+
+        core::mem::drop(handle);
+    }
 
     #[tokio::test]
     async fn single_elem_read() {
@@ -354,13 +380,13 @@ mod tests {
         let write = [42u8];
 
         Null::run_with_mut(&mut handle, |handle| async move {
-            handle.write_all(100, &write[..]).await;
+            handle.write_all(100, &write[..]).await.unwrap();
 
             let mut read = (0..write.len())
                 .map(|_| MaybeUninit::uninit())
                 .collect::<Vec<_>>();
 
-            handle.read_all(100, &mut read[..]).await;
+            handle.read_all(100, &mut read[..]).await.unwrap();
 
             let read = read
                 .into_iter()
@@ -390,9 +416,9 @@ mod tests {
         };
 
         Null::run_with_mut(&mut handle, |handle| async move {
-            handle.write(100, &write).await;
+            handle.write(100, &write).await.unwrap();
 
-            let read = handle.read::<TestStruct>(100).await;
+            let read = handle.read::<TestStruct>(100).await.unwrap();
 
             assert_eq!(write, read);
         })
@@ -602,7 +628,7 @@ mod tests {
         let cnt = futures::future::join_all(jobs_in_flight)
             .await
             .into_iter()
-            .filter_map(Result::ok)
+            .filter_map(core::result::Result::ok)
             .sum::<f64>();
 
         println!("CNT: {cnt:.2}");

@@ -1,3 +1,14 @@
+use mfio::error::{Error, Location, State, Subject, INTERNAL_ERROR};
+
+fn io_err(state: State) -> Error {
+    Error {
+        code: INTERNAL_ERROR,
+        location: Location::Backend,
+        subject: Subject::Io,
+        state,
+    }
+}
+
 cfg_if::cfg_if! {
     if #[cfg(miri)] {
         // Force use thread impl if on miri

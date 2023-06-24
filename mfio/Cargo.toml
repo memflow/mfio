@@ -22,6 +22,7 @@ tarc = "0.1"
 bytemuck = "1"
 cglue = { version = "0.2", git = "https://github.com/h33p/cglue", features = ["task_unstable"] }
 mfio-derive = { version = "0.1", path = "../mfio-derive" }
+http = { version = "0.2", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.26", features = ["poll"] }
@@ -39,5 +40,5 @@ pollster = "0.2"
 bytemuck = { version = "1", features = ["derive"] }
 
 [features]
-default = ["std"]
+default = ["std", "http"]
 std = []

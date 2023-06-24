@@ -7,9 +7,6 @@ use std::time::{Duration, Instant};
 use sample::*;
 
 mod sample {
-    use mfio::backend::*;
-    use mfio::packet::*;
-    use mfio::util::Event;
     include!("../src/sample.rs");
 }
 

@@ -235,7 +235,7 @@ mod tests {
 
             let mut d = [MaybeUninit::uninit(); 8];
 
-            fh.read_all(0, &mut d[..]).await;
+            fh.read_all(0, &mut d[..]).await.unwrap();
         });
     }
 

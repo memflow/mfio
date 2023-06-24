@@ -1,6 +1,7 @@
 use crate::packet::*;
 
 use crate::backend::IoBackend;
+use crate::error::Error;
 use crate::util::UsizeMath;
 use bytemuck::Pod;
 use cglue::prelude::v1::*;
@@ -93,7 +94,7 @@ impl<Pos: 'static, T> IoWrite<Pos> for T where T: PacketIo<Read, Pos> {}
 pub enum IoFullFut<'a, Io: PacketIo<Perms, Param>, Perms: PacketPerms, Param: 'a> {
     NewId(Param, Packet<'a, Perms>, NewIdFut<'a, Io, Perms, Param>),
     Read(
-        Option<()>,
+        Option<Error>,
         ManuallyDrop<<NewIdFut<'a, Io, Perms, Param> as Future>::Output>,
     ),
     Finished,
@@ -102,7 +103,7 @@ pub enum IoFullFut<'a, Io: PacketIo<Perms, Param>, Perms: PacketPerms, Param: 'a
 impl<'a, Io: PacketIo<Perms, Param>, Perms: PacketPerms, Param> Future
     for IoFullFut<'a, Io, Perms, Param>
 {
-    type Output = Option<()>;
+    type Output = Result<(), Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
@@ -133,7 +134,7 @@ impl<'a, Io: PacketIo<Perms, Param>, Perms: PacketPerms, Param> Future
                         let err = err.take();
                         unsafe { ManuallyDrop::drop(id) };
                         *this = Self::Finished;
-                        break Poll::Ready(err);
+                        break Poll::Ready(err.map(Err).unwrap_or(Ok(())));
                     }
                     Poll::Ready(Some((_, nerr))) => {
                         if let Some(nerr) = nerr {
@@ -163,7 +164,7 @@ pub enum ReadToEndFutState<'a, Io: PacketIo<Write, Param>, Param: 'a> {
         usize,
         Option<usize>,
         usize,
-        Option<()>,
+        Option<Error>,
         ManuallyDrop<<NewIdFut<'a, Io, Write, Param> as Future>::Output>,
     ),
     Finished,
@@ -302,13 +303,14 @@ pub enum IoReadFut<'a, Io: PacketIo<Write, Param>, Param: 'a, T> {
     NewId(Param, NewIdFut<'a, Io, Write, Param>),
     Read(
         MaybeUninit<T>,
+        Option<Error>,
         ManuallyDrop<<NewIdFut<'a, Io, Write, Param> as Future>::Output>,
     ),
     Finished,
 }
 
 impl<'a, Io: PacketIo<Write, Param>, Param, T> Future for IoReadFut<'a, Io, Param, T> {
-    type Output = T;
+    type Output = Result<T, Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let f = move || {
@@ -322,10 +324,10 @@ impl<'a, Io: PacketIo<Write, Param>, Param, T> Future for IoReadFut<'a, Io, Para
                         if let Poll::Ready(stream) = alloc.poll(cx) {
                             let prev = core::mem::replace(
                                 this,
-                                Self::Read(MaybeUninit::uninit(), ManuallyDrop::new(stream)),
+                                Self::Read(MaybeUninit::uninit(), None, ManuallyDrop::new(stream)),
                             );
                             match (prev, &mut *this) {
-                                (Self::NewId(param, _), Self::Read(data, stream)) => {
+                                (Self::NewId(param, _), Self::Read(data, _, stream)) => {
                                     //let data = data.get_mut();
                                     let buf = unsafe {
                                         core::slice::from_raw_parts_mut(
@@ -343,21 +345,28 @@ impl<'a, Io: PacketIo<Write, Param>, Param, T> Future for IoReadFut<'a, Io, Para
                             break Poll::Pending;
                         }
                     }
-                    Self::Read(_, stream) => {
+                    Self::Read(_, err, stream) => {
                         match unsafe { Pin::new_unchecked(&mut **stream) }.poll_next(cx) {
                             Poll::Ready(None) => {
                                 unsafe { ManuallyDrop::drop(stream) };
                                 let prev = core::mem::replace(this, Self::Finished);
 
                                 match prev {
-                                    Self::Read(data, _) => {
-                                        break Poll::Ready(unsafe {
-                                            data /*.into_inner()*/
-                                                .assume_init()
-                                        });
+                                    Self::Read(data, err, _) => {
+                                        break Poll::Ready(err.map(Err).unwrap_or_else(|| {
+                                            Ok(unsafe {
+                                                data /*.into_inner()*/
+                                                    .assume_init()
+                                            })
+                                        }));
                                     }
                                     _ => unreachable!(),
                                 }
+                            }
+                            Poll::Ready(Some((_, Some(e)))) => {
+                                // TODO: what do we do here
+                                *err = Some(e);
+                                continue;
                             }
                             Poll::Ready(_) => {
                                 continue;
@@ -378,15 +387,23 @@ pub mod sync {
 
     #[cglue_trait]
     pub trait SyncIoRead<Pos: 'static>: IoRead<Pos> + IoBackend {
-        fn read_all<'a>(&'a self, pos: Pos, packet: impl Into<Packet<'a, Write>>) -> Option<()> {
+        fn read_all<'a>(
+            &'a self,
+            pos: Pos,
+            packet: impl Into<Packet<'a, Write>>,
+        ) -> Result<(), Error> {
             self.block_on(IoRead::read_all(self, pos, packet))
         }
 
-        fn read_into<'a, T: Pod>(&'a self, pos: Pos, data: &'a mut MaybeUninit<T>) -> Option<()> {
+        fn read_into<'a, T: Pod>(
+            &'a self,
+            pos: Pos,
+            data: &'a mut MaybeUninit<T>,
+        ) -> Result<(), Error> {
             self.block_on(IoRead::read_into(self, pos, data))
         }
 
-        fn read<T: Pod>(&self, pos: Pos) -> T {
+        fn read<T: Pod>(&self, pos: Pos) -> Result<T, Error> {
             self.block_on(IoRead::read(self, pos))
         }
 
@@ -401,11 +418,15 @@ pub mod sync {
 
     #[cglue_trait]
     pub trait SyncIoWrite<Pos: 'static>: IoWrite<Pos> + IoBackend {
-        fn write_all<'a>(&'a self, pos: Pos, packet: impl Into<Packet<'a, Read>>) -> Option<()> {
+        fn write_all<'a>(
+            &'a self,
+            pos: Pos,
+            packet: impl Into<Packet<'a, Read>>,
+        ) -> Result<(), Error> {
             self.block_on(IoWrite::write_all(self, pos, packet))
         }
 
-        fn write<'a, T>(&'a self, pos: Pos, data: &'a T) -> Option<()> {
+        fn write<'a, T>(&'a self, pos: Pos, data: &'a T) -> Result<(), Error> {
             self.block_on(IoWrite::write(self, pos, data))
         }
     }

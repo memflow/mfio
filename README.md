@@ -10,13 +10,13 @@
 [codecov]: https://codecov.io/gh/memflow/mfio/branch/main/graph/badge.svg?token=IJ1K4QPAIM
 [codecov-link]: https://codecov.io/gh/memflow/mfio
 
-## Completion based I/O primitives
+## Async completion I/O with non-sequential results
 
 mfio is memflow's async completion based I/O base. It aims to make the following aspects of an
 I/O chain as simple as possible:
 
 1. Async
-2. Automatic batching
+2. Automatic batching (vectoring)
 3. Fragmentation
 4. Partial success
 5. Lack of color (full sync support)

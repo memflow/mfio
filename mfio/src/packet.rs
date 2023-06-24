@@ -1,3 +1,4 @@
+use crate::error::Error;
 use crate::multistack::{MultiStack, StackHandle};
 use crate::util::ReadOnly;
 use cglue::option::COption;
@@ -14,7 +15,7 @@ use futures::stream::Stream;
 use parking_lot::Mutex;
 use tarc::{Arc, BaseArc};
 
-pub type Output<'a, DataType> = (PacketObj<'a, DataType>, Option<()>);
+pub type Output<'a, DataType> = (PacketObj<'a, DataType>, Option<Error>);
 
 pub type BoxedFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -562,7 +563,7 @@ pub trait AllocatedPacket: Sized {
     type Pointer: Copy;
 
     fn split_at(self, len: usize) -> (Self, Self);
-    fn error(self, err: Option<()>);
+    fn error(self, err: Error);
     fn as_ptr(&self) -> Self::Pointer;
     fn len(&self) -> usize;
     fn id(&self) -> *const ();
@@ -596,7 +597,7 @@ impl<'a> AllocatedPacket for ReadWritePacketObj<'a> {
         )
     }
 
-    fn error(self, err: Option<()>) {
+    fn error(self, err: Error) {
         self.buffer.error(err)
     }
 
@@ -653,7 +654,7 @@ impl<'a> AllocatedPacket for WritePacketObj<'a> {
         )
     }
 
-    fn error(self, err: Option<()>) {
+    fn error(self, err: Error) {
         self.buffer.error(err)
     }
 
@@ -710,7 +711,7 @@ impl<'a> AllocatedPacket for ReadPacketObj<'a> {
         )
     }
 
-    fn error(self, err: Option<()>) {
+    fn error(self, err: Error) {
         self.buffer.error(err)
     }
 
@@ -775,7 +776,7 @@ impl<'a, T: PacketPerms> Drop for BoundPacketObj<'a, T> {
 }
 
 impl<'a, T: PacketPerms> BoundPacketObj<'a, T> {
-    fn output(&mut self, err: Option<()>) {
+    fn output(&mut self, err: Option<Error>) {
         let id = &self.id.id;
         let mut output_stack = self.output.stack.lock();
         output_stack.push(id, (unsafe { ManuallyDrop::take(&mut self.buffer) }, err));
@@ -815,9 +816,9 @@ impl<'a, T: PacketPerms> BoundPacketObj<'a, T> {
         )
     }
 
-    pub fn error(self, err: Option<()>) {
+    pub fn error(self, err: Error) {
         let mut this = ManuallyDrop::new(self);
-        this.output(err);
+        this.output(Some(err));
         // Manually drop all the fields, without invoking our actual drop implementation.
         // Note that `buffer` is being taken out by the `output` function.
         // SAFETY: this function is consuming `self`, thus the data will not be touched again.
@@ -851,7 +852,7 @@ impl<'a, T: PacketPerms> BoundPacket<'a, T> {
         )
     }
 
-    pub fn error(self, err: Option<()>) {
+    pub fn error(self, err: Error) {
         self.obj.error(err)
     }
 

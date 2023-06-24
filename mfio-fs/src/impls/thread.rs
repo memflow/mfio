@@ -15,6 +15,8 @@ use mfio::backend::*;
 use mfio::packet::*;
 use mfio::tarc::BaseArc;
 
+use super::{io_err, State};
+
 #[cfg(miri)]
 type FileInner = std::sync::Mutex<File>;
 #[cfg(not(miri))]
@@ -129,9 +131,9 @@ impl From<BaseArc<FileInner>> for FileWrapper {
                         match read_at(&file, buf, pos) {
                             Ok(read) if read < buf.len() => {
                                 let (_, right) = pkt.split_at(read);
-                                right.error(Some(()));
+                                right.error(io_err(State::Nop));
                             }
-                            Err(_) => pkt.error(Some(())),
+                            Err(e) => pkt.error(io_err(e.kind().into())),
                             _ => (),
                         }
                     }
@@ -151,9 +153,9 @@ impl From<BaseArc<FileInner>> for FileWrapper {
                         match write_at(&file, &pkt, pos) {
                             Ok(written) if written < pkt.len() => {
                                 let (_, right) = pkt.split_at(written);
-                                right.error(Some(()));
+                                right.error(io_err(State::Nop));
                             }
-                            Err(_) => pkt.error(Some(())),
+                            Err(e) => pkt.error(io_err(e.kind().into())),
                             _ => (),
                         }
                     }

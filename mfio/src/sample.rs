@@ -1,5 +1,10 @@
 use core::mem::MaybeUninit;
 
+use mfio::backend::*;
+use mfio::error::{Error, Location, State, Subject, INTERNAL_ERROR};
+use mfio::packet::*;
+use mfio::util::*;
+
 use mfio_derive::*;
 
 use core::task::Waker;
@@ -47,8 +52,29 @@ struct VolatileMem {
 }
 
 impl VolatileMem {
-    fn read(&self, pos: usize, dest: &mut [MaybeUninit<u8>]) {
-        assert!(pos <= self.len - dest.len());
+    fn read(&self, pos: usize, dest: WritePacketObj) {
+        if pos >= self.len {
+            dest.error(Error {
+                code: INTERNAL_ERROR,
+                location: Location::Backend,
+                subject: Subject::Address,
+                state: State::Outside,
+            });
+            return;
+        }
+        let mut dest = if pos > self.len - dest.len() {
+            println!("{pos} {} {}", self.len, dest.len());
+            let (a, b) = dest.split_at(self.len - pos);
+            b.error(Error {
+                code: INTERNAL_ERROR,
+                location: Location::Backend,
+                subject: Subject::Address,
+                state: State::Outside,
+            });
+            a
+        } else {
+            dest
+        };
         unsafe {
             (self.buf as *mut MaybeUninit<u8>)
                 .add(pos)
@@ -56,7 +82,7 @@ impl VolatileMem {
         }
     }
 
-    fn write(&self, pos: usize, src: &[u8]) {
+    fn write(&self, pos: usize, src: ReadPacketObj) {
         println!(
             "{pos} {} {} {:?} {:?}",
             src.len(),
@@ -64,7 +90,27 @@ impl VolatileMem {
             src.as_ptr(),
             self.buf
         );
-        assert!(pos <= self.len - src.len());
+        if pos >= self.len {
+            src.error(Error {
+                code: INTERNAL_ERROR,
+                location: Location::Backend,
+                subject: Subject::Address,
+                state: State::Outside,
+            });
+            return;
+        }
+        let src = if pos > self.len - src.len() {
+            let (a, b) = src.split_at(self.len - pos);
+            b.error(Error {
+                code: INTERNAL_ERROR,
+                location: Location::Backend,
+                subject: Subject::Address,
+                state: State::Outside,
+            });
+            a
+        } else {
+            src
+        };
         unsafe {
             src.as_ptr()
                 .copy_to_nonoverlapping(self.buf.add(pos), src.len())
@@ -113,8 +159,8 @@ impl IoThreadState {
             async move {
                 loop {
                     let proc_inp = |(addr, buf): (usize, BoundPacket<'static, Write>)| {
-                        let mut pkt = buf.get_mut();
-                        mem.read(addr, &mut pkt);
+                        let pkt = buf.get_mut();
+                        mem.read(addr, pkt);
                     };
 
                     // try_pop here many elems
@@ -139,7 +185,7 @@ impl IoThreadState {
                 loop {
                     let proc_inp = |(pos, buf): (usize, BoundPacket<'static, Read>)| {
                         let pkt = buf.get();
-                        mem.write(pos, &pkt);
+                        mem.write(pos, pkt);
                     };
 
                     // try_pop here many elems
@@ -189,10 +235,7 @@ impl Clone for SampleIo {
         let mem = self.mem.clone();
         let thread_state = IoThreadState::new(&mem);
 
-        Self {
-            mem,
-            thread_state,
-        }
+        Self { mem, thread_state }
     }
 }
 

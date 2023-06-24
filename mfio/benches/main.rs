@@ -13,9 +13,6 @@ use tokio::runtime::Runtime as TokioRuntime;
 use sample::*;
 
 mod sample {
-    use mfio::backend::*;
-    use mfio::packet::*;
-    use mfio::util::Event;
     include!("../src/sample.rs");
 }
 
