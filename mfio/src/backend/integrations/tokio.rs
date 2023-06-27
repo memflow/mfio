@@ -78,15 +78,20 @@ impl<'a, B: LinksIoBackend + 'a, Func: BorrowingFn<B::Link>> Future
                     );
                 }
                 TokioState::Loaded(wb, fd) => {
-                    if let Some((fd, _)) = fd {
-                        if let Poll::Ready(Ok(mut guard)) = fd.poll_read_ready(cx) {
-                            // We clear the ready flag, because the backend is expected to consume
-                            // all I/O until it blocks without waking anything.
-                            guard.clear_ready();
+                    break loop {
+                        if let Poll::Ready(v) = unsafe { Pin::new_unchecked(&mut *wb) }.poll(cx) {
+                            break Poll::Ready(v);
                         }
-                    }
-
-                    break unsafe { Pin::new_unchecked(wb) }.poll(cx);
+                        if let Some((fd, _)) = fd {
+                            if let Poll::Ready(Ok(mut guard)) = fd.poll_read_ready(cx) {
+                                // We clear the ready flag, because the backend is expected to consume
+                                // all I/O until it blocks without waking anything.
+                                guard.clear_ready();
+                            } else {
+                                break Poll::Pending;
+                            }
+                        }
+                    };
                 }
                 TokioState::Finished => unreachable!(),
             }

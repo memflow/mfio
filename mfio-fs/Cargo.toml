@@ -29,6 +29,9 @@ mio = { version = "0.8", optional = true, features = ["os-poll", "os-ext"] }
 slab = "0.4"
 nix = "0.26"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.6", optional = true }
+
 [dev-dependencies]
 mfio = { version = "0.1", path = "../mfio" }
 pollster = { version = "0.3.0", features = ["macro"] }
@@ -41,8 +44,8 @@ env_logger = "0.10"
 [target.'cfg(not(miri))'.dependencies]
 tokio = { version = "1.24", features = ["rt", "rt-multi-thread", "fs", "io-util"] }
 
-[target.'cfg(unix)'.dev-dependencies]
-nuclei = "0.2"
+#[target.'cfg(unix)'.dev-dependencies]
+#nuclei = "0.2"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 rio = "0.9"
@@ -50,5 +53,5 @@ rio = "0.9"
 glommio = { version = "0.8", git = "https://github.com/DataDog/glommio", rev = "517326bb2b63b6f6ddcf5deec7a283ee510f44df" }
 
 [features]
-default = ["mio"]
+default = ["mio", "io-uring"]
 __bench = ["mfio/tokio", "mfio/async-io"]

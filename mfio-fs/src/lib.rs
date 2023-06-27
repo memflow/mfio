@@ -193,7 +193,9 @@ mod tests {
     //! valuable in doing that!
 
     use super::*;
+    use core::future::poll_fn;
     use core::mem::MaybeUninit;
+    use core::task::Poll;
     use futures::stream::StreamExt;
     use mfio::stdeq::*;
     use mfio::traits::*;
@@ -294,6 +296,32 @@ mod tests {
 
             assert_eq!(test_string.len(), fh.get_pos() as usize);
             assert_eq!(test_string.as_bytes(), output);
+        });
+    }
+
+    #[test]
+    fn wake_test() {
+        NativeFs::default().run(|fs| async move {
+            for i in 0..2 {
+                println!("{i}");
+                let mut signaled = false;
+                poll_fn(|cx| {
+                    println!("{signaled}");
+                    if signaled == true {
+                        Poll::Ready(())
+                    } else {
+                        signaled = true;
+                        let waker = cx.waker().clone();
+                        std::thread::spawn(|| {
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                            println!("WAKE");
+                            waker.wake();
+                        });
+                        Poll::Pending
+                    }
+                })
+                .await;
+            }
         });
     }
 }

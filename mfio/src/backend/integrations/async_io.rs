@@ -82,14 +82,17 @@ impl<'a, B: LinksIoBackend + 'a, Func: BorrowingFn<B::Link>> Future
                     );
                 }
                 AsyncIoState::Loaded(wb, fd) => {
-                    if let Some((fd, _)) = fd {
-                        // We don't care about the outcome, we only want async-io to wake us up
-                        // when the fd is readable, as the backend is responsible for consuming all
-                        // outstanding events upon it being polled.
-                        let _ = fd.poll_readable(cx);
-                    }
+                    break loop {
+                        if let Poll::Ready(v) = unsafe { Pin::new_unchecked(&mut *wb) }.poll(cx) {
+                            break Poll::Ready(v);
+                        }
 
-                    break unsafe { Pin::new_unchecked(wb) }.poll(cx);
+                        if let Some((fd, _)) = fd {
+                            if fd.poll_readable(cx).is_pending() {
+                                break Poll::Pending;
+                            }
+                        }
+                    }
                 }
                 AsyncIoState::Finished => unreachable!(),
             }

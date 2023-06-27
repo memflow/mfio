@@ -267,7 +267,7 @@ impl Default for MioState {
 pub struct NativeFs {
     state: BaseArc<Mutex<MioState>>,
     backend: BackendContainer<DynBackend>,
-    waker: FdWaker,
+    waker: FdWaker<OwnedFd>,
 }
 
 impl Default for NativeFs {

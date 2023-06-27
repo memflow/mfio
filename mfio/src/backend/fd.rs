@@ -9,9 +9,12 @@ use tarc::BaseArc;
 /// This waker simply writes a 8 byte value (little endian 1) to the provided file descriptor upon
 /// wakeup. Thus, this waking mechanism is not limited to just eventfd or pipes.
 #[repr(transparent)]
-pub struct FdWaker(*const OwnedFd);
+pub struct FdWaker<F: AsRawFd>(*const F);
 
-impl Clone for FdWaker {
+unsafe impl<F: AsRawFd + Send> Send for FdWaker<F> {}
+unsafe impl<F: AsRawFd + Send> Sync for FdWaker<F> {}
+
+impl<F: AsRawFd> Clone for FdWaker<F> {
     fn clone(&self) -> Self {
         unsafe {
             BaseArc::increment_strong_count(self.0);
@@ -20,7 +23,7 @@ impl Clone for FdWaker {
     }
 }
 
-impl Drop for FdWaker {
+impl<F: AsRawFd> Drop for FdWaker<F> {
     fn drop(&mut self) {
         unsafe {
             BaseArc::decrement_strong_count(self.0);
@@ -28,14 +31,14 @@ impl Drop for FdWaker {
     }
 }
 
-impl From<BaseArc<OwnedFd>> for FdWaker {
-    fn from(fd: BaseArc<OwnedFd>) -> Self {
+impl<F: AsRawFd> From<BaseArc<F>> for FdWaker<F> {
+    fn from(fd: BaseArc<F>) -> Self {
         Self(fd.into_raw())
     }
 }
 
-impl FdWaker {
-    fn wake_by_ref(&self) {
+impl<F: AsRawFd> FdWaker<F> {
+    pub fn wake_by_ref(&self) {
         let mut f = unsafe { File::from_raw_fd((*self.0).as_raw_fd()) };
         f.write_all(&1u64.to_ne_bytes())
             .expect("Could not wake the waker up");

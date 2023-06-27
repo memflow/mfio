@@ -8,6 +8,7 @@ use mfio::traits::*;
 use mfio_fs::*;
 use rand::prelude::*;
 use std::fs::{write, File};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 struct PollsterExecutor;
@@ -47,6 +48,18 @@ fn file_read(c: &mut Criterion) {
     order.shuffle(&mut rng);
     let order = &order;
 
+    let drop_cache = |path: &Path| {
+        std::process::Command::new("/usr/bin/dd")
+            .args([
+                &format!("if={}", path.to_str().unwrap()),
+                "iflag=nocache",
+                "count=0",
+            ])
+            .output()
+    };
+
+    write(temp_path, test_buf).unwrap();
+
     for size in sizes {
         group.throughput(Throughput::Bytes(size as u64));
 
@@ -55,11 +68,11 @@ fn file_read(c: &mut Criterion) {
                 let num_chunks = MB / size;
                 let mut bufs = vec![vec![MaybeUninit::uninit(); size]; num_chunks];
 
-                write(temp_path, test_buf).unwrap();
+                drop_cache(temp_path).unwrap();
 
                 let mut elapsed = Duration::default();
 
-                NativeFs::default().run(|fs| async move {
+                let ret = NativeFs::default().run(|fs| async move {
                     let file = fs.open(temp_path, OpenOptions::new().read(true));
                     unsafe { FH = &file as *const _ };
 
@@ -73,6 +86,9 @@ fn file_read(c: &mut Criterion) {
                             // Issue a direct read @ here, because we want to queue up multiple
                             // reads and have them all finish concurrently.
                             let fut = file.read_all((i * SPARSE) as u64, &mut b[..]);
+                            let fut = async move {
+                                fut.await;
+                            };
                             output.push(fut);
                         }
 
@@ -84,7 +100,8 @@ fn file_read(c: &mut Criterion) {
                     }
 
                     elapsed
-                })
+                });
+                ret
             });
         });
     }
@@ -99,7 +116,7 @@ fn file_read(c: &mut Criterion) {
                     let num_chunks = MB / size;
                     let mut bufs = vec![vec![MaybeUninit::uninit(); size]; num_chunks];
 
-                    write(temp_path, test_buf).unwrap();
+                    drop_cache(temp_path).unwrap();
 
                     let mut elapsed = Duration::default();
 
@@ -148,7 +165,7 @@ fn file_read(c: &mut Criterion) {
                     let num_chunks = MB / size;
                     let mut bufs = vec![vec![MaybeUninit::uninit(); size]; num_chunks];
 
-                    write(temp_path, test_buf).unwrap();
+                    drop_cache(temp_path).unwrap();
 
                     let mut elapsed = Duration::default();
 
@@ -191,56 +208,56 @@ fn file_read(c: &mut Criterion) {
         use glommio::io::BufferedFile;
         use glommio::LocalExecutor;
 
-        struct GlommioExecutor;
+        struct GlommioExecutor(LocalExecutor);
 
-        impl AsyncExecutor for GlommioExecutor {
+        impl<'a> AsyncExecutor for &'a GlommioExecutor {
             fn block_on<T>(&self, fut: impl core::future::Future<Output = T>) -> T {
-                let ex = LocalExecutor::default();
-                ex.run(fut)
+                self.0.run(fut)
             }
         }
+
+        let glommio = GlommioExecutor(LocalExecutor::default());
 
         group.throughput(Throughput::Bytes(size as u64));
 
         group.bench_function(BenchmarkId::new("glommio", size), |b| {
-            b.to_async(GlommioExecutor)
-                .iter_custom(|mut iters| async move {
-                    let num_chunks = MB / size;
-                    let mut bufs = vec![vec![0u8; size]; num_chunks];
+            b.to_async(&glommio).iter_custom(|mut iters| async move {
+                let num_chunks = MB / size;
+                let mut bufs = vec![vec![0u8; size]; num_chunks];
 
-                    write(temp_path, test_buf).unwrap();
+                drop_cache(temp_path).unwrap();
 
-                    let file = &BufferedFile::open(temp_path).await.unwrap();
+                let file = &BufferedFile::open(temp_path).await.unwrap();
 
-                    let mut elapsed = Duration::default();
+                let mut elapsed = Duration::default();
 
-                    while iters > 0 {
-                        let mut output = vec![];
-                        output.reserve(num_chunks);
+                while iters > 0 {
+                    let mut output = vec![];
+                    output.reserve(num_chunks);
 
-                        let start = Instant::now();
+                    let start = Instant::now();
 
-                        for (i, b) in order.iter().take(iters as _).copied().zip(bufs.iter_mut()) {
-                            let comp = async move {
-                                let res = file.read_at((i * SPARSE) as u64, b.len()).await.unwrap();
-                                b.copy_from_slice(&res[..]);
-                            };
-                            output.push(comp);
-                        }
-
-                        let _ = futures::future::join_all(output).await;
-
-                        elapsed += start.elapsed();
-
-                        iters = iters.saturating_sub(num_chunks as _);
+                    for (i, b) in order.iter().take(iters as _).copied().zip(bufs.iter_mut()) {
+                        let comp = async move {
+                            let res = file.read_at((i * SPARSE) as u64, b.len()).await.unwrap();
+                            b.copy_from_slice(&res[..]);
+                        };
+                        output.push(comp);
                     }
 
-                    elapsed
-                });
+                    let _ = futures::future::join_all(output).await;
+
+                    elapsed += start.elapsed();
+
+                    iters = iters.saturating_sub(num_chunks as _);
+                }
+
+                elapsed
+            });
         });
     }
 
-    #[cfg(unix)]
+    /*#[cfg(unix)]
     for size in sizes {
         use futures::AsyncReadExt;
         use futures::AsyncSeekExt;
@@ -263,7 +280,7 @@ fn file_read(c: &mut Criterion) {
                     let num_chunks = MB / size;
                     let mut bufs = vec![vec![0u8; size]; num_chunks];
 
-                    write(temp_path, test_buf).unwrap();
+                    drop_cache(temp_path).unwrap();
 
                     let file = File::open(temp_path).unwrap();
                     let file = &mut Handle::<File>::new(file).unwrap();
@@ -288,7 +305,7 @@ fn file_read(c: &mut Criterion) {
                     elapsed
                 });
         });
-    }
+    }*/
 
     for size in sizes {
         use tokio::fs::*;
@@ -302,7 +319,7 @@ fn file_read(c: &mut Criterion) {
                     let num_chunks = MB / size;
                     let mut bufs = vec![vec![0u8; size]; num_chunks];
 
-                    write(temp_path, test_buf).await.unwrap();
+                    drop_cache(temp_path).unwrap();
 
                     let mut file = File::open(temp_path).await.unwrap();
 
@@ -317,8 +334,6 @@ fn file_read(c: &mut Criterion) {
                                 .unwrap();
                             file.read_exact(&mut b[..]).await.unwrap();
                         }
-
-                        //let _ = futures::future::join_all(output).await;
 
                         elapsed += start.elapsed();
 
@@ -340,7 +355,7 @@ fn file_read(c: &mut Criterion) {
                     let num_chunks = MB / size;
                     let mut bufs = vec![vec![0u8; size]; num_chunks];
 
-                    write(temp_path, test_buf).unwrap();
+                    drop_cache(temp_path).unwrap();
 
                     let mut elapsed = Duration::default();
 
@@ -378,7 +393,7 @@ fn file_read(c: &mut Criterion) {
                     let num_chunks = MB / size;
                     let mut bufs = vec![vec![0u8; size]; num_chunks];
 
-                    write(temp_path, test_buf).unwrap();
+                    drop_cache(temp_path).unwrap();
 
                     let file = File::open(temp_path).unwrap();
 
