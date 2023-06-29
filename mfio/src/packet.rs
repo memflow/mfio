@@ -1,3 +1,79 @@
+//! Describes I/O packets.
+//!
+//! # Introduction
+//!
+//! A packet is a fungible unit of I/O operation. It is paired with an address and then is
+//! transferred  throughout the I/O chain, until it reaches the final I/O backend, completing the
+//! operation. Along the way, the packet may be split into smaller ones, parts of it may be
+//! rejected, while other parts may get forwarded, with potentially diverging addresses. In the
+//! end, all parts of the packet are collected back into one place.
+//!
+//! A packet represents an abstract source or destination for I/O operations. It is always
+//! parameterized with [`PacketPerms`](PacketPerms), describing how the underlying data of the
+//! packet can be accessed. Accessing the data means that the packet will no longer be forwarded,
+//! but before that point, the packet may be split up into smaller chunks, and sent to different
+//! I/O subsystems.
+//!
+//! # Lifecycle
+//!
+//! Most packet interactions can be traced back to [`PacketIo`](PacketIo) - a trait enabling the
+//! user to send packets to the I/O system. [`PacketIo::new_id`](PacketIo::new_id) is used to
+//! allocate a [`PacketId`](PacketId). This ID acts as an entrypoint for packets, and the place for
+//! their results to be collected. The packet then gets sent to the I/O system and its results are
+//! made available on the [`Stream`](futures::stream::Stream) that is implemented by the
+//! `PakcetId`. Complete flow is as follows:
+//!
+//! 1. A `PacketId` is allocated through [`PacketIo::new_id`](PacketIo::new_id).
+//!
+//! 2. Packets may be submitted to the system through [`PacketId::send_io`](PacketId::send_io)
+//!    function.
+//!
+//! 3. Packet gets directed to the I/O backend through [`PacketStream`](PacketStream::send_io), and
+//!    then [`PacketIoHandle::send_input`](PacketIoHandle::send_input).
+//!
+//! 4. The I/O backend stores the packet internally, and processes it.
+//!
+//! 5. Result is fed back to [`PacketOutput`](PacketOutput), which is accessible through
+//!    [`PacketId`].
+//!
+//! 6. Caller gets the packets and their respective results by invoking
+//!    [`Stream::poll_next`](futures::stream::Stream::poll_next).
+//!
+//! # Copy constraint negotiation
+//!
+//! I/O systems have various constraints on kinds of I/O operations possible. Some systems work by
+//! exposing a publicly accessible byte buffer, while in other systems those buffers are opaque and
+//! hidden behind hardware mechanisms or OS APIs. The simplest way to tackle varying requirements
+//! is to allocate intermediary buffers on the endpoints and expose those for I/O. However, that
+//! can be highly inefficient, because multiple copies may be involved, before data ends up at the
+//! final destination. Ideal scenario, for any I/O system, is to have only one copy per operation.
+//! And in I/O system where data is generated on-the-fly, ideal scenario would be to write output
+//! directly to the destination.
+//!
+//! To achieve this in mfio, we attach constraints to various parts of the I/O chain, and allocate
+//! temporary buffers only when needed. For any I/O end, we have the following constraint options:
+//!
+//! 1. Publicly exposed aligned byte-addressable buffer - this is the lower constraint tier, as
+//!    individual bytes can be modified at neglibible cost.
+//! 2. Accepts byte-addressable input - this is more constarined, because the caller must provide a
+//!    byte buffer, and cannot generate data on the fly. The callee takes this buffer and processes
+//!    it internally using opaque mechanisms.
+//!
+//! I/O has 2 ends - input and output. These constraint levels are similar on both ends. See how
+//! these levels are described in the context of input (caller):
+//!
+//! 1. Sends byte-addressable buffer - this is the lower constraint tier, because the callee can
+//!    process the input in any way possible.
+//! 2. Fills a byte-addressable buffer - this is more constrained, because the callee needs to
+//!    provide a buffer to write to. However, this may also mean that the caller generates data on
+//!    the fly, thus memory usage is lower.
+//!
+//! This is not exhaustive, but generally sufficient for most I/O cases. In practice, a backend
+//! that is able to access byte-addressable buffer directly will simply provide it to the packet,
+//! which will then process it. If the backend instead needs a buffer from the packet, it will
+//! call [`BoundPacket::try_alloc`](BoundPacket::try_alloc) with desired alignment parameters. If
+//! the allocation is not successful, it will then fall back to allocating an intermediary buffer.
+
 use crate::error::Error;
 use crate::multistack::{MultiStack, StackHandle};
 use crate::util::ReadOnly;
@@ -333,20 +409,59 @@ impl<'a, Perms: PacketPerms, Param> PacketIoHandle<'a, Perms, Param> {
     }
 }
 
-pub type AllocFn<T> =
-    for<'a> unsafe extern "C" fn(BoundPacketObj<'a, T>) -> <T as PacketPerms>::Alloced<'a>;
+/// Consumes `BoundPacketObj` and returns allocated version of it.
+///
+/// If the `alignment` constraint is met, this function consumes `packet`, fills `out_aligned`, and
+/// returns `true`. If the constraint cannot be satisfied, `false` is returned.
+///
+/// If this function returns `false`, the caller should consider allocating an intermediate buffer,
+/// and invoking [`TransferDataFn`](TransferDataFn) instead.
+///
+/// # Remarks
+///
+/// The caller should prefer [`TransferDataFn`](TransferDataFn), as opposed to this function, if
+/// they can access their internal buffer with zero allocations.
+pub type AllocFn<T> = for<'a, 'b> unsafe extern "C" fn(
+    packet: &'a mut ManuallyDrop<BoundPacketObj<'b, T>>,
+    alignment: usize,
+    out_alloced: &'a mut MaybeUninit<<T as PacketPerms>::Alloced<'b>>,
+) -> bool;
 
+/// Transfers data between a `BoundPacketObj` and reverse data type.
+///
+/// This function consumes `packet`, and transfers data between it and `input`. The caller must
+/// ensure that `input` bounds are sufficient for the size of the packet.
+///
+/// TODO: decide on whether this function can fail.
+pub type TransferDataFn<T> = for<'a, 'b> unsafe extern "C" fn(
+    packet: &'a mut BoundPacketObj<'b, T>,
+    input: <T as PacketPerms>::ReverseDataType,
+);
+
+pub type MaybeAlloced<'a, T> = Result<<T as PacketPerms>::Alloced<'a>, BoundPacket<'a, T>>;
+
+pub type AllocedOrTransferred<'a, T> =
+    Result<<T as PacketPerms>::Alloced<'a>, TransferredPacket<'a, T>>;
+
+/// Describes type constraints on packet operations.
 pub trait PacketPerms: 'static + core::fmt::Debug + Clone + Copy {
     type DataType: Clone + Copy + core::fmt::Debug;
+    type ReverseDataType: Clone + Copy + core::fmt::Debug;
     type Alloced<'a>: AllocatedPacket + 'a;
 
     fn alloc_fn(&self) -> AllocFn<Self>;
+    fn transfer_data_fn(&self) -> TransferDataFn<Self>;
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ReadWrite {
-    get_mut: for<'a> unsafe extern "C" fn(BoundPacketObj<'a, Self>) -> ReadWritePacketObj<'a>,
+    get_mut: for<'a> unsafe extern "C" fn(
+        &mut ManuallyDrop<BoundPacketObj<'a, Self>>,
+        usize,
+        &mut MaybeUninit<ReadWritePacketObj<'a>>,
+    ) -> bool,
+    transfer_data: for<'a, 'b> unsafe extern "C" fn(&'a mut BoundPacketObj<'b, Self>, *mut ()),
 }
 
 impl core::fmt::Debug for ReadWrite {
@@ -357,17 +472,27 @@ impl core::fmt::Debug for ReadWrite {
 
 impl PacketPerms for ReadWrite {
     type DataType = *mut ();
+    type ReverseDataType = *mut ();
     type Alloced<'a> = ReadWritePacketObj<'a>;
 
     fn alloc_fn(&self) -> AllocFn<Self> {
         self.get_mut
+    }
+
+    fn transfer_data_fn(&self) -> TransferDataFn<Self> {
+        self.transfer_data
     }
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Write {
-    get_mut: for<'a> unsafe extern "C" fn(BoundPacketObj<'a, Self>) -> WritePacketObj<'a>,
+    get_mut: for<'a> unsafe extern "C" fn(
+        &mut ManuallyDrop<BoundPacketObj<'a, Self>>,
+        usize,
+        &mut MaybeUninit<WritePacketObj<'a>>,
+    ) -> bool,
+    transfer_data: for<'a, 'b> unsafe extern "C" fn(&'a mut BoundPacketObj<'b, Self>, *const ()),
 }
 
 impl core::fmt::Debug for Write {
@@ -378,17 +503,27 @@ impl core::fmt::Debug for Write {
 
 impl PacketPerms for Write {
     type DataType = *mut ();
+    type ReverseDataType = *const ();
     type Alloced<'a> = WritePacketObj<'a>;
 
     fn alloc_fn(&self) -> AllocFn<Self> {
         self.get_mut
+    }
+
+    fn transfer_data_fn(&self) -> TransferDataFn<Self> {
+        self.transfer_data
     }
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Read {
-    get: for<'a> unsafe extern "C" fn(BoundPacketObj<'a, Self>) -> ReadPacketObj<'a>,
+    get: for<'a> unsafe extern "C" fn(
+        &mut ManuallyDrop<BoundPacketObj<'a, Self>>,
+        usize,
+        &mut MaybeUninit<ReadPacketObj<'a>>,
+    ) -> bool,
+    transfer_data: for<'a, 'b> unsafe extern "C" fn(&'a mut BoundPacketObj<'b, Self>, *mut ()),
 }
 
 impl core::fmt::Debug for Read {
@@ -399,10 +534,15 @@ impl core::fmt::Debug for Read {
 
 impl PacketPerms for Read {
     type DataType = *const ();
+    type ReverseDataType = *mut ();
     type Alloced<'a> = ReadPacketObj<'a>;
 
     fn alloc_fn(&self) -> AllocFn<Self> {
         self.get
+    }
+
+    fn transfer_data_fn(&self) -> TransferDataFn<Self> {
+        self.transfer_data
     }
 }
 
@@ -479,11 +619,25 @@ pub struct Packet<'a, Perms: PacketPerms> {
 
 impl<'a> From<&'a mut [u8]> for Packet<'a, ReadWrite> {
     fn from(slc: &'a mut [u8]) -> Self {
-        unsafe extern "C" fn get_mut(obj: BoundPacketObj<ReadWrite>) -> ReadWritePacketObj {
-            ReadWritePacketObj {
+        unsafe extern "C" fn get_mut<'a, 'b>(
+            obj: &'a mut ManuallyDrop<BoundPacketObj<'b, ReadWrite>>,
+            _: usize,
+            out: &'a mut MaybeUninit<ReadWritePacketObj<'b>>,
+        ) -> bool {
+            out.write(ReadWritePacketObj {
                 alloced_packet: (obj.buffer.data as *mut u8).add(obj.buffer.start),
-                buffer: obj,
-            }
+                buffer: ManuallyDrop::take(obj),
+            });
+            true
+        }
+
+        unsafe extern "C" fn transfer_data(obj: &mut BoundPacketObj<ReadWrite>, src: *mut ()) {
+            // TODO: does this operation even make sense?
+            core::ptr::swap_nonoverlapping(
+                src as *mut u8,
+                obj.buffer.data as *mut u8,
+                obj.buffer.len(),
+            );
         }
 
         Self {
@@ -493,7 +647,10 @@ impl<'a> From<&'a mut [u8]> for Packet<'a, ReadWrite> {
                 end: slc.len(),
                 _phantom: PhantomData,
             },
-            vtable: &ReadWrite { get_mut },
+            vtable: &ReadWrite {
+                get_mut,
+                transfer_data,
+            },
         }
     }
 }
@@ -511,11 +668,25 @@ impl AnyBytes for MaybeUninit<u8> {}
 
 impl<'a, D: AnyBytes> From<&'a mut [D]> for Packet<'a, Write> {
     fn from(slc: &'a mut [D]) -> Self {
-        unsafe extern "C" fn get_mut(obj: BoundPacketObj<Write>) -> WritePacketObj {
-            WritePacketObj {
+        unsafe extern "C" fn get_mut<'a, 'b>(
+            obj: &'a mut ManuallyDrop<BoundPacketObj<'b, Write>>,
+            _: usize,
+            out: &'a mut MaybeUninit<WritePacketObj<'b>>,
+        ) -> bool {
+            out.write(WritePacketObj {
                 alloced_packet: (obj.buffer.data as *mut MaybeUninit<u8>).add(obj.buffer.start),
-                buffer: obj,
-            }
+                buffer: ManuallyDrop::take(obj),
+            });
+            true
+        }
+
+        unsafe extern "C" fn transfer_data(obj: &mut BoundPacketObj<Write>, src: *const ()) {
+            // TODO: consider changing this to copy_nonoverlapping
+            core::ptr::copy(
+                src as *const u8,
+                obj.buffer.data as *mut u8,
+                obj.buffer.len(),
+            );
         }
 
         Self {
@@ -525,7 +696,10 @@ impl<'a, D: AnyBytes> From<&'a mut [D]> for Packet<'a, Write> {
                 end: slc.len(),
                 _phantom: PhantomData,
             },
-            vtable: &Write { get_mut },
+            vtable: &Write {
+                get_mut,
+                transfer_data,
+            },
         }
     }
 }
@@ -540,11 +714,25 @@ impl<'a, T: AsRef<[u8]> + ?Sized> From<&'a T> for Packet<'a, Read> {
     fn from(slc: &'a T) -> Self {
         // Just to be sure that the lifetimes are correct
         let slc: &'a [u8] = slc.as_ref();
-        unsafe extern "C" fn get(obj: BoundPacketObj<Read>) -> ReadPacketObj {
-            ReadPacketObj {
+        unsafe extern "C" fn get<'a, 'b>(
+            obj: &'a mut ManuallyDrop<BoundPacketObj<'b, Read>>,
+            _: usize,
+            out: &'a mut MaybeUninit<ReadPacketObj<'b>>,
+        ) -> bool {
+            out.write(ReadPacketObj {
                 alloced_packet: (obj.buffer.data as *const u8).add(obj.buffer.start),
-                buffer: obj,
-            }
+                buffer: ManuallyDrop::take(obj),
+            });
+            true
+        }
+
+        unsafe extern "C" fn transfer_data(obj: &mut BoundPacketObj<Read>, src: *mut ()) {
+            // TODO: consider changing this to copy_nonoverlapping
+            core::ptr::copy(
+                obj.buffer.data as *const u8,
+                src as *mut u8,
+                obj.buffer.len(),
+            );
         }
 
         Self {
@@ -554,23 +742,59 @@ impl<'a, T: AsRef<[u8]> + ?Sized> From<&'a T> for Packet<'a, Read> {
                 end: slc.len(),
                 _phantom: PhantomData,
             },
-            vtable: &Read { get },
+            vtable: &Read { get, transfer_data },
         }
     }
 }
 
-pub trait AllocatedPacket: Sized {
-    type Pointer: Copy;
-
+pub trait Splittable: Sized {
     fn split_at(self, len: usize) -> (Self, Self);
-    fn error(self, err: Error);
-    fn as_ptr(&self) -> Self::Pointer;
     fn len(&self) -> usize;
-    fn id(&self) -> *const ();
-
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+impl<A: Splittable, B: Splittable> Splittable for Result<A, B> {
+    fn split_at(self, len: usize) -> (Self, Self) {
+        match self {
+            Ok(v) => {
+                let (a, b) = v.split_at(len);
+                (Ok(a), Ok(b))
+            }
+            Err(v) => {
+                let (a, b) = v.split_at(len);
+                (Err(a), Err(b))
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Ok(v) => v.len(),
+            Err(v) => v.len(),
+        }
+    }
+}
+
+pub trait Errorable: Sized {
+    fn error(self, err: Error);
+}
+
+impl<A: Errorable, B: Errorable> Errorable for Result<A, B> {
+    fn error(self, err: Error) {
+        match self {
+            Ok(v) => v.error(err),
+            Err(v) => v.error(err),
+        }
+    }
+}
+
+pub trait AllocatedPacket: Splittable + Errorable {
+    type Pointer: Copy;
+
+    fn as_ptr(&self) -> Self::Pointer;
+    fn id(&self) -> *const ();
 }
 
 #[repr(C)]
@@ -579,9 +803,7 @@ pub struct ReadWritePacketObj<'a> {
     buffer: BoundPacketObj<'a, ReadWrite>,
 }
 
-impl<'a> AllocatedPacket for ReadWritePacketObj<'a> {
-    type Pointer = *mut u8;
-
+impl<'a> Splittable for ReadWritePacketObj<'a> {
     fn split_at(self, len: usize) -> (Self, Self) {
         let (b1, b2) = self.buffer.split_at(len);
 
@@ -597,16 +819,22 @@ impl<'a> AllocatedPacket for ReadWritePacketObj<'a> {
         )
     }
 
+    fn len(&self) -> usize {
+        self.buffer.buffer.len()
+    }
+}
+
+impl<'a> Errorable for ReadWritePacketObj<'a> {
     fn error(self, err: Error) {
         self.buffer.error(err)
     }
+}
+
+impl<'a> AllocatedPacket for ReadWritePacketObj<'a> {
+    type Pointer = *mut u8;
 
     fn as_ptr(&self) -> Self::Pointer {
         self.alloced_packet
-    }
-
-    fn len(&self) -> usize {
-        self.buffer.buffer.len()
     }
 
     fn id(&self) -> *const () {
@@ -636,9 +864,7 @@ pub struct WritePacketObj<'a> {
     buffer: BoundPacketObj<'a, Write>,
 }
 
-impl<'a> AllocatedPacket for WritePacketObj<'a> {
-    type Pointer = *mut MaybeUninit<u8>;
-
+impl<'a> Splittable for WritePacketObj<'a> {
     fn split_at(self, len: usize) -> (Self, Self) {
         let (b1, b2) = self.buffer.split_at(len);
 
@@ -654,16 +880,22 @@ impl<'a> AllocatedPacket for WritePacketObj<'a> {
         )
     }
 
+    fn len(&self) -> usize {
+        self.buffer.buffer.len()
+    }
+}
+
+impl<'a> Errorable for WritePacketObj<'a> {
     fn error(self, err: Error) {
         self.buffer.error(err)
     }
+}
+
+impl<'a> AllocatedPacket for WritePacketObj<'a> {
+    type Pointer = *mut MaybeUninit<u8>;
 
     fn as_ptr(&self) -> Self::Pointer {
         self.alloced_packet
-    }
-
-    fn len(&self) -> usize {
-        self.buffer.buffer.len()
     }
 
     fn id(&self) -> *const () {
@@ -693,9 +925,7 @@ pub struct ReadPacketObj<'a> {
     buffer: BoundPacketObj<'a, Read>,
 }
 
-impl<'a> AllocatedPacket for ReadPacketObj<'a> {
-    type Pointer = *const u8;
-
+impl<'a> Splittable for ReadPacketObj<'a> {
     fn split_at(self, len: usize) -> (Self, Self) {
         let (b1, b2) = self.buffer.split_at(len);
 
@@ -711,16 +941,22 @@ impl<'a> AllocatedPacket for ReadPacketObj<'a> {
         )
     }
 
+    fn len(&self) -> usize {
+        self.buffer.buffer.len()
+    }
+}
+
+impl<'a> Errorable for ReadPacketObj<'a> {
     fn error(self, err: Error) {
         self.buffer.error(err)
     }
+}
+
+impl<'a> AllocatedPacket for ReadPacketObj<'a> {
+    type Pointer = *const u8;
 
     fn as_ptr(&self) -> Self::Pointer {
         self.alloced_packet
-    }
-
-    fn len(&self) -> usize {
-        self.buffer.buffer.len()
     }
 
     fn id(&self) -> *const () {
@@ -775,25 +1011,8 @@ impl<'a, T: PacketPerms> Drop for BoundPacketObj<'a, T> {
     }
 }
 
-impl<'a, T: PacketPerms> BoundPacketObj<'a, T> {
-    fn output(&mut self, err: Option<Error>) {
-        let id = &self.id.id;
-        let mut output_stack = self.output.stack.lock();
-        output_stack.push(id, (unsafe { ManuallyDrop::take(&mut self.buffer) }, err));
-        self.id.size.fetch_sub(1, Ordering::Release);
-        {
-            // We need to keep holding the lock to the output stack in this block to prevent
-            // situations where wakee reads from the output queue and drops this waker all while we
-            // are making changes (and vice-versa).
-            if let Some(wake) = unsafe { &mut *self.id.wake.get() }.take() {
-                //lock().take() {
-                wake.wake();
-            }
-        }
-        core::mem::drop(output_stack);
-    }
-
-    pub fn split_at(self, len: usize) -> (Self, Self) {
+impl<'a, T: PacketPerms> Splittable for BoundPacketObj<'a, T> {
+    fn split_at(self, len: usize) -> (Self, Self) {
         let mut this = ManuallyDrop::new(self);
         let buffer = unsafe { ManuallyDrop::take(&mut this.buffer) };
         let (b1, b2) = buffer.split_local(len);
@@ -816,7 +1035,13 @@ impl<'a, T: PacketPerms> BoundPacketObj<'a, T> {
         )
     }
 
-    pub fn error(self, err: Error) {
+    fn len(&self) -> usize {
+        self.buffer.len()
+    }
+}
+
+impl<'a, T: PacketPerms> Errorable for BoundPacketObj<'a, T> {
+    fn error(self, err: Error) {
         let mut this = ManuallyDrop::new(self);
         this.output(Some(err));
         // Manually drop all the fields, without invoking our actual drop implementation.
@@ -829,6 +1054,25 @@ impl<'a, T: PacketPerms> BoundPacketObj<'a, T> {
     }
 }
 
+impl<'a, T: PacketPerms> BoundPacketObj<'a, T> {
+    fn output(&mut self, err: Option<Error>) {
+        let id = &self.id.id;
+        let mut output_stack = self.output.stack.lock();
+        output_stack.push(id, (unsafe { ManuallyDrop::take(&mut self.buffer) }, err));
+        self.id.size.fetch_sub(1, Ordering::Release);
+        {
+            // We need to keep holding the lock to the output stack in this block to prevent
+            // situations where wakee reads from the output queue and drops this waker all while we
+            // are making changes (and vice-versa).
+            if let Some(wake) = unsafe { &mut *self.id.wake.get() }.take() {
+                //lock().take() {
+                wake.wake();
+            }
+        }
+        core::mem::drop(output_stack);
+    }
+}
+
 #[derive(Debug)]
 #[repr(C)]
 pub struct BoundPacket<'a, T: PacketPerms> {
@@ -836,8 +1080,8 @@ pub struct BoundPacket<'a, T: PacketPerms> {
     obj: BoundPacketObj<'a, T>,
 }
 
-impl<'a, T: PacketPerms> BoundPacket<'a, T> {
-    pub fn split_at(self, len: usize) -> (Self, Self) {
+impl<'a, T: PacketPerms> Splittable for BoundPacket<'a, T> {
+    fn split_at(self, len: usize) -> (Self, Self) {
         let (b1, b2) = self.obj.split_at(len);
 
         (
@@ -852,34 +1096,70 @@ impl<'a, T: PacketPerms> BoundPacket<'a, T> {
         )
     }
 
-    pub fn error(self, err: Error) {
+    fn len(&self) -> usize {
+        self.obj.buffer.len()
+    }
+}
+
+impl<'a, T: PacketPerms> Errorable for BoundPacket<'a, T> {
+    fn error(self, err: Error) {
         self.obj.error(err)
     }
+}
 
-    pub fn alloc(self) -> T::Alloced<'a> {
+impl<'a, T: PacketPerms> BoundPacket<'a, T> {
+    pub fn try_alloc(self) -> MaybeAlloced<'a, T> {
         let BoundPacket { obj, vtable } = self;
-        unsafe { (vtable.alloc_fn())(obj) }
+        let mut obj = ManuallyDrop::new(obj);
+        let mut out = MaybeUninit::uninit();
+        let ret = unsafe { (vtable.alloc_fn())(&mut obj, 1, &mut out) };
+        if ret {
+            Ok(unsafe { out.assume_init() })
+        } else {
+            Err(BoundPacket {
+                obj: ManuallyDrop::into_inner(obj),
+                vtable,
+            })
+        }
+    }
+
+    /// Transfers data between the packet and the `input`.
+    ///
+    /// If packet has [`Read`](Read) permissions, `input` will be written to. If packet has
+    /// [`Write`](Write) permissions, `input` will be read.
+    ///
+    /// If packet has [`ReadWrite`](ReadWrite) permissions, behavior is not fully specified, but
+    /// currently buffers perform memory swap operation.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `input` pointer is sufficient for the bounds of the packet. In
+    /// addition, the data pointed by `input` must be properly initialized and byte-addressible.
+    pub unsafe fn transfer_data(self, input: T::ReverseDataType) -> TransferredPacket<'a, T> {
+        let BoundPacket { mut obj, vtable } = self;
+        (vtable.transfer_data_fn())(&mut obj, input);
+        TransferredPacket(obj)
     }
 }
 
-impl<'a> BoundPacket<'a, ReadWrite> {
-    pub fn get_mut(self) -> ReadWritePacketObj<'a> {
-        let BoundPacket { obj, vtable } = self;
-        unsafe { (vtable.get_mut)(obj) }
+#[repr(transparent)]
+pub struct TransferredPacket<'a, T: PacketPerms>(BoundPacketObj<'a, T>);
+
+impl<'a, T: PacketPerms> Splittable for TransferredPacket<'a, T> {
+    fn split_at(self, len: usize) -> (Self, Self) {
+        let (b1, b2) = self.0.split_at(len);
+
+        (Self(b1), Self(b2))
+    }
+
+    fn len(&self) -> usize {
+        self.0.buffer.len()
     }
 }
 
-impl<'a> BoundPacket<'a, Write> {
-    pub fn get_mut(self) -> WritePacketObj<'a> {
-        let BoundPacket { obj, vtable } = self;
-        unsafe { (vtable.get_mut)(obj) }
-    }
-}
-
-impl<'a> BoundPacket<'a, Read> {
-    pub fn get(self) -> ReadPacketObj<'a> {
-        let BoundPacket { obj, vtable } = self;
-        unsafe { (vtable.get)(obj) }
+impl<'a, T: PacketPerms> Errorable for TransferredPacket<'a, T> {
+    fn error(self, err: Error) {
+        self.0.error(err)
     }
 }
 

@@ -52,7 +52,7 @@ struct VolatileMem {
 }
 
 impl VolatileMem {
-    fn read(&self, pos: usize, dest: WritePacketObj) {
+    fn read(&self, pos: usize, dest: BoundPacket<'static, Write>) {
         if pos >= self.len {
             dest.error(Error {
                 code: INTERNAL_ERROR,
@@ -62,7 +62,7 @@ impl VolatileMem {
             });
             return;
         }
-        let mut dest = if pos > self.len - dest.len() {
+        let dest = if pos > self.len - dest.len() {
             println!("{pos} {} {}", self.len, dest.len());
             let (a, b) = dest.split_at(self.len - pos);
             b.error(Error {
@@ -76,18 +76,15 @@ impl VolatileMem {
             dest
         };
         unsafe {
-            (self.buf as *mut MaybeUninit<u8>)
-                .add(pos)
-                .copy_to_nonoverlapping(dest.as_mut_ptr(), dest.len());
+            dest.transfer_data(self.buf.add(pos).cast());
         }
     }
 
-    fn write(&self, pos: usize, src: ReadPacketObj) {
+    fn write(&self, pos: usize, src: BoundPacket<'static, Read>) {
         println!(
-            "{pos} {} {} {:?} {:?}",
+            "{pos} {} {} {:?}",
             src.len(),
             self.len,
-            src.as_ptr(),
             self.buf
         );
         if pos >= self.len {
@@ -112,8 +109,7 @@ impl VolatileMem {
             src
         };
         unsafe {
-            src.as_ptr()
-                .copy_to_nonoverlapping(self.buf.add(pos), src.len())
+            src.transfer_data(self.buf.add(pos).cast());
         }
     }
 }
@@ -159,8 +155,7 @@ impl IoThreadState {
             async move {
                 loop {
                     let proc_inp = |(addr, buf): (usize, BoundPacket<'static, Write>)| {
-                        let pkt = buf.get_mut();
-                        mem.read(addr, pkt);
+                        mem.read(addr, buf);
                     };
 
                     // try_pop here many elems
@@ -184,8 +179,7 @@ impl IoThreadState {
             async move {
                 loop {
                     let proc_inp = |(pos, buf): (usize, BoundPacket<'static, Read>)| {
-                        let pkt = buf.get();
-                        mem.write(pos, pkt);
+                        mem.write(pos, buf);
                     };
 
                     // try_pop here many elems

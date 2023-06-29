@@ -3,7 +3,7 @@ use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
 
 use core::future::pending;
-use core::mem::ManuallyDrop;
+use core::mem::{ManuallyDrop, MaybeUninit};
 use core::task::Waker;
 
 #[cfg(all(unix, not(miri)))]
@@ -116,10 +116,9 @@ impl From<BaseArc<FileInner>> for FileWrapper {
         let read_thread = Some(thread::spawn({
             let file = file.clone();
             move || {
+                let mut tmp_buf = vec![];
                 for (pos, buf) in read_rx {
-                    let mut pkt = buf.get_mut();
-                    let buf = &mut pkt[..];
-                    if !buf.is_empty() {
+                    let copy_buf = |buf: &mut [MaybeUninit<u8>]| {
                         // SAFETY: assume MaybeUninit<u8> is initialized,
                         // as God intended :upside_down:
                         let buf = unsafe {
@@ -128,13 +127,39 @@ impl From<BaseArc<FileInner>> for FileWrapper {
                             core::slice::from_raw_parts_mut(ptr as *mut u8, len)
                         };
 
-                        match read_at(&file, buf, pos) {
-                            Ok(read) if read < buf.len() => {
-                                let (_, right) = pkt.split_at(read);
-                                right.error(io_err(State::Nop));
+                        read_at(&file, buf, pos)
+                    };
+
+                    if !buf.is_empty() {
+                        match buf.try_alloc() {
+                            Ok(mut alloced) => match copy_buf(&mut alloced[..]) {
+                                Ok(read) if read < alloced.len() => {
+                                    let (_, right) = alloced.split_at(read);
+                                    right.error(io_err(State::Nop));
+                                }
+                                Err(e) => alloced.error(io_err(e.kind().into())),
+                                _ => (),
+                            },
+                            Err(buf) => {
+                                // TODO: size limit the temp buffer.
+                                if tmp_buf.len() < buf.len() {
+                                    tmp_buf.reserve(tmp_buf.len() - buf.len());
+                                    // SAFETY: assume MaybeUninit<u8> is initialized,
+                                    // as God intended :upside_down:
+                                    unsafe { tmp_buf.set_len(tmp_buf.capacity()) }
+                                }
+                                match copy_buf(&mut tmp_buf[..buf.len()]) {
+                                    Ok(read) if read < buf.len() => {
+                                        let (left, right) = buf.split_at(read);
+                                        unsafe { left.transfer_data(tmp_buf.as_ptr().cast()) };
+                                        right.error(io_err(State::Nop));
+                                    }
+                                    Err(e) => buf.error(io_err(e.kind().into())),
+                                    _ => {
+                                        unsafe { buf.transfer_data(tmp_buf.as_ptr().cast()) };
+                                    }
+                                }
                             }
-                            Err(e) => pkt.error(io_err(e.kind().into())),
-                            _ => (),
                         }
                     }
                 }
@@ -147,16 +172,41 @@ impl From<BaseArc<FileInner>> for FileWrapper {
         let write_thread = Some(thread::spawn({
             let file = file.clone();
             move || {
+                let mut tmp_buf: Vec<MaybeUninit<u8>> = vec![];
                 for (pos, buf) in write_rx {
-                    let pkt = buf.get();
-                    if pkt.len() > 0 {
-                        match write_at(&file, &pkt, pos) {
-                            Ok(written) if written < pkt.len() => {
-                                let (_, right) = pkt.split_at(written);
-                                right.error(io_err(State::Nop));
+                    match buf.try_alloc() {
+                        Ok(alloced) => {
+                            // For some reason type inference loses itself
+                            let alloced: ReadPacketObj = alloced;
+                            match write_at(&file, &alloced[..], pos) {
+                                Ok(written) if written < alloced.len() => {
+                                    let (_, right) = alloced.split_at(written);
+                                    right.error(io_err(State::Nop));
+                                }
+                                Err(e) => alloced.error(io_err(e.kind().into())),
+                                _ => (),
                             }
-                            Err(e) => pkt.error(io_err(e.kind().into())),
-                            _ => (),
+                        }
+                        Err(buf) => {
+                            // TODO: size limit the temp buffer.
+                            if tmp_buf.len() < buf.len() {
+                                tmp_buf.reserve(tmp_buf.len() - buf.len());
+                                // SAFETY: assume MaybeUninit<u8> is initialized,
+                                // as God intended :upside_down:
+                                unsafe { tmp_buf.set_len(buf.len()) }
+                            }
+                            let buf = unsafe { buf.transfer_data(tmp_buf.as_mut_ptr().cast()) };
+                            let tmp_buf = unsafe {
+                                &*(&tmp_buf[..] as *const [MaybeUninit<u8>] as *const [u8])
+                            };
+                            match write_at(&file, tmp_buf, pos) {
+                                Ok(written) if written < buf.len() => {
+                                    let (_, right) = buf.split_at(written);
+                                    right.error(io_err(State::Nop));
+                                }
+                                Err(e) => buf.error(io_err(e.kind().into())),
+                                _ => (),
+                            }
                         }
                     }
                 }

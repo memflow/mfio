@@ -10,6 +10,7 @@ use slab::Slab;
 use nix::sys::eventfd::{eventfd, EfdFlags};
 
 use core::future::poll_fn;
+use core::mem::MaybeUninit;
 use core::task::{Poll, Waker};
 
 use mfio::backend::fd::FdWaker;
@@ -19,32 +20,85 @@ use mfio::tarc::BaseArc;
 
 use super::{io_err, State};
 
+#[repr(transparent)]
+struct RawBox(*mut [MaybeUninit<u8>]);
+
+impl RawBox {
+    fn null() -> Self {
+        Self(unsafe { core::mem::MaybeUninit::zeroed().assume_init() })
+    }
+}
+
+unsafe impl Send for RawBox {}
+unsafe impl Sync for RawBox {}
+
+impl Drop for RawBox {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            let _ = unsafe { Box::from_raw(self.0) };
+        }
+    }
+}
+
 enum Operation {
-    Read(<WrPerm as PacketPerms>::Alloced<'static>),
-    Write(<RdPerm as PacketPerms>::Alloced<'static>),
+    Read(MaybeAlloced<'static, WrPerm>, RawBox),
+    Write(AllocedOrTransferred<'static, RdPerm>, RawBox),
 }
 
 trait IntoOp: PacketPerms {
-    fn into_op(fd: u32, pos: u64, alloced: Self::Alloced<'static>) -> (Entry, Operation);
+    fn into_op(fd: u32, pos: u64, pkt: BoundPacket<'static, Self>) -> (Entry, Operation);
 }
 
 impl IntoOp for RdPerm {
-    fn into_op(fd: u32, pos: u64, alloced: Self::Alloced<'static>) -> (Entry, Operation) {
-        let entry = opcode::Write::new(Fixed(fd), alloced.as_ptr(), alloced.len() as u32)
+    fn into_op(fd: u32, pos: u64, pkt: BoundPacket<'static, Self>) -> (Entry, Operation) {
+        let len = pkt.len();
+        let pkt = pkt.try_alloc();
+
+        let (buf, raw_box, pkt) = match pkt {
+            Ok(pkt) => (pkt.as_ptr(), RawBox::null(), Ok(pkt)),
+            Err(pkt) => {
+                let mut buf: Vec<MaybeUninit<u8>> = Vec::with_capacity(len);
+                unsafe { buf.set_len(len) };
+                let mut buf = buf.into_boxed_slice();
+                let buf_ptr = buf.as_mut_ptr();
+                let buf = Box::into_raw(buf);
+                let pkt = unsafe { pkt.transfer_data(buf_ptr as *mut ()) };
+                (buf_ptr as *const u8, RawBox(buf), Err(pkt))
+            }
+        };
+
+        let entry = opcode::Write::new(Fixed(fd), buf, len as u32)
             .offset(pos)
             .build();
 
-        (entry, Operation::Write(alloced))
+        (entry, Operation::Write(pkt, raw_box))
     }
 }
 
 impl IntoOp for WrPerm {
-    fn into_op(fd: u32, pos: u64, alloced: Self::Alloced<'static>) -> (Entry, Operation) {
-        let entry = opcode::Read::new(Fixed(fd), alloced.as_ptr() as *mut u8, alloced.len() as u32)
+    fn into_op(fd: u32, pos: u64, pkt: BoundPacket<'static, Self>) -> (Entry, Operation) {
+        let len = pkt.len();
+        let pkt = pkt.try_alloc();
+
+        let (buf, raw_box) = match &pkt {
+            Ok(pkt) => (pkt.as_ptr().cast(), RawBox::null()),
+            Err(_) => {
+                let mut buf = Vec::with_capacity(len);
+                unsafe { buf.set_len(len) };
+                let mut buf = buf.into_boxed_slice();
+                let buf_ptr = buf.as_mut_ptr();
+                let buf = Box::into_raw(buf);
+                (buf_ptr, RawBox(buf))
+            }
+        };
+
+        let buf: *mut MaybeUninit<u8> = buf;
+
+        let entry = opcode::Read::new(Fixed(fd), buf.cast(), len as u32)
             .offset(pos)
             .build();
 
-        (entry, Operation::Read(alloced))
+        (entry, Operation::Read(pkt, raw_box))
     }
 }
 
@@ -76,7 +130,7 @@ impl<Perms: IntoOp> PacketIoHandleable<'static, Perms, u64> for IoOpsHandle<Perm
         let state = &mut *state;
 
         // TODO: handle size limitations???
-        let (ring_entry, ops_entry) = Perms::into_op(self.key as _, pos, packet.alloc());
+        let (ring_entry, ops_entry) = Perms::into_op(self.key as _, pos, packet);
 
         state.all_ssub += 1;
 
@@ -312,18 +366,29 @@ impl Default for NativeFs {
                                 };
 
                                 match op {
-                                    Operation::Read(pkt) => match res {
+                                    Operation::Read(pkt, buf) => match res {
                                         Ok(read) if read < pkt.len() => {
-                                            let (_, right) = pkt.split_at(read);
+                                            let (left, right) = pkt.split_at(read);
+                                            if let Err(pkt) = left {
+                                                assert!(!buf.0.is_null());
+                                                let buf = unsafe { &*buf.0 };
+                                                unsafe { pkt.transfer_data(buf.as_ptr().cast()) };
+                                            }
                                             right.error(io_err(State::Nop));
                                         }
                                         Ok(0) => {
                                             pkt.error(io_err(State::Nop));
                                         }
                                         Err(e) => pkt.error(io_err(e.kind().into())),
-                                        _ => (),
+                                        _ => {
+                                            if let Err(pkt) = pkt {
+                                                assert!(!buf.0.is_null());
+                                                let buf = unsafe { &*buf.0 };
+                                                unsafe { pkt.transfer_data(buf.as_ptr().cast()) };
+                                            }
+                                        }
                                     },
-                                    Operation::Write(pkt) => match res {
+                                    Operation::Write(pkt, _) => match res {
                                         Ok(read) if read < pkt.len() => {
                                             let (_, right) = pkt.split_at(read);
                                             right.error(io_err(State::Nop));

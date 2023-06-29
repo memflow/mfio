@@ -8,11 +8,12 @@ use parking_lot::Mutex;
 use slab::Slab;
 
 use core::future::poll_fn;
+use core::mem::MaybeUninit;
 use core::task::{Poll, Waker};
 
 use mfio::backend::fd::FdWaker;
 use mfio::backend::*;
-use mfio::packet::{FastCWaker, Read as RdPerm, Write as WrPerm, *};
+use mfio::packet::{FastCWaker, Read as RdPerm, Splittable, Write as WrPerm, *};
 use mfio::tarc::BaseArc;
 
 use super::{io_err, State};
@@ -20,14 +21,18 @@ use super::{io_err, State};
 const RW_INTERESTS: Interest = Interest::READABLE.add(Interest::WRITABLE);
 
 enum Operation {
-    Read(<WrPerm as PacketPerms>::Alloced<'static>),
-    Write(<RdPerm as PacketPerms>::Alloced<'static>),
+    Read(MaybeAlloced<'static, WrPerm>),
+    Write(
+        AllocedOrTransferred<'static, RdPerm>,
+        Option<(usize, Vec<u8>)>,
+    ),
 }
 
 struct FileInner {
     file: File,
     pos: u64,
     ops: VecDeque<(u64, Operation)>,
+    tmp_buf: Vec<u8>,
 }
 
 impl From<File> for FileInner {
@@ -36,6 +41,7 @@ impl From<File> for FileInner {
             file,
             pos: 0,
             ops: Default::default(),
+            tmp_buf: vec![],
         }
     }
 }
@@ -60,8 +66,10 @@ impl FileInner {
                         };
 
                         match op {
-                            Operation::Read(pkt) => pkt.error(err),
-                            Operation::Write(pkt) => pkt.error(err),
+                            Operation::Read(Ok(pkt)) => pkt.error(err),
+                            Operation::Read(Err(pkt)) => pkt.error(err),
+                            Operation::Write(Ok(pkt), _) => pkt.error(err),
+                            Operation::Write(Err(pkt), _) => pkt.error(err),
                         }
                         continue;
                     }
@@ -69,56 +77,89 @@ impl FileInner {
             }
 
             match op {
-                Operation::Read(mut pkt) => {
-                    loop {
-                        let len = pkt.len();
-                        let buf = pkt.as_ptr() as *mut u8;
-                        // SAFETY: assume MaybeUninit<u8> is initialized,
-                        // as God intended :upside_down:
-                        let slice = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-                        match self.file.read(slice) {
-                            Ok(l) => {
-                                self.pos += l as u64;
-                                if l == len {
-                                    break;
-                                } else if l > 0 {
-                                    pkt = pkt.split_at(l).1;
-                                    self.pos += l as u64;
-                                } else {
-                                    pkt.error(io_err(State::Nop));
-                                    break;
-                                }
-                            }
-                            Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                                self.ops.push_front((self.pos, Operation::Read(pkt)));
-                                return true;
-                            }
-                            Err(e) => {
-                                pkt.error(io_err(e.kind().into()));
-                                break;
-                            }
-                        }
-                    }
-                }
-                Operation::Write(mut pkt) => loop {
+                Operation::Read(mut pkt) => loop {
                     let len = pkt.len();
-                    let buf = pkt.as_ptr();
-                    let slice = unsafe { core::slice::from_raw_parts(buf, len) };
-                    match self.file.write(slice) {
+
+                    let slice = match &mut pkt {
+                        Ok(pkt) => {
+                            let buf = pkt.as_ptr() as *mut u8;
+                            // SAFETY: assume MaybeUninit<u8> is initialized,
+                            // as God intended :upside_down:
+                            unsafe { core::slice::from_raw_parts_mut(buf, len) }
+                        }
+                        Err(_) => {
+                            if len > self.tmp_buf.len() {
+                                self.tmp_buf.reserve(len - self.tmp_buf.len());
+                            }
+                            // SAFETY: assume MaybeUninit<u8> is initialized,
+                            // as God intended :upside_down:
+                            unsafe { self.tmp_buf.set_len(len) }
+                            &mut self.tmp_buf[..]
+                        }
+                    };
+
+                    match self.file.read(slice) {
                         Ok(l) => {
                             self.pos += l as u64;
                             if l == len {
+                                if let Err(pkt) = pkt {
+                                    unsafe { pkt.transfer_data(self.tmp_buf.as_mut_ptr().cast()) };
+                                }
                                 break;
                             } else if l > 0 {
-                                pkt = pkt.split_at(l).1;
-                                self.pos += l as u64;
+                                let (a, b) = pkt.split_at(l);
+                                if let Err(pkt) = a {
+                                    unsafe { pkt.transfer_data(self.tmp_buf.as_mut_ptr().cast()) };
+                                }
+                                pkt = b;
                             } else {
                                 pkt.error(io_err(State::Nop));
                                 break;
                             }
                         }
                         Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                            self.ops.push_front((self.pos, Operation::Write(pkt)));
+                            self.ops.push_front((self.pos, Operation::Read(pkt)));
+                            return true;
+                        }
+                        Err(e) => {
+                            pkt.error(io_err(e.kind().into()));
+                            break;
+                        }
+                    }
+                },
+
+                Operation::Write(mut pkt, mut transferred) => loop {
+                    let len = pkt.len();
+
+                    let slice = match &mut pkt {
+                        Ok(pkt) => {
+                            let buf = pkt.as_ptr();
+                            unsafe { core::slice::from_raw_parts(buf, len) }
+                        }
+                        Err(_) => {
+                            let (pos, buf) = transferred.as_ref().unwrap();
+                            &buf[*pos..]
+                        }
+                    };
+
+                    match self.file.write(slice) {
+                        Ok(l) => {
+                            self.pos += l as u64;
+                            if let Some((pos, _)) = &mut transferred {
+                                *pos += l;
+                            }
+                            if l == len {
+                                break;
+                            } else if l > 0 {
+                                pkt = pkt.split_at(l).1;
+                            } else {
+                                pkt.error(io_err(State::Nop));
+                                break;
+                            }
+                        }
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                            self.ops
+                                .push_front((self.pos, Operation::Write(pkt, transferred)));
                             return true;
                         }
                         Err(e) => {
@@ -135,17 +176,28 @@ impl FileInner {
 }
 
 trait IntoOp: PacketPerms {
-    fn into_op(alloced: Self::Alloced<'static>) -> Operation;
+    fn into_op(alloced: MaybeAlloced<'static, Self>) -> Operation;
 }
 
 impl IntoOp for RdPerm {
-    fn into_op(alloced: Self::Alloced<'static>) -> Operation {
-        Operation::Write(alloced)
+    fn into_op(alloced: MaybeAlloced<'static, Self>) -> Operation {
+        match alloced {
+            Ok(pkt) => Operation::Write(Ok(pkt), None),
+            Err(pkt) => {
+                let mut new_trans: Vec<MaybeUninit<u8>> = Vec::with_capacity(pkt.len());
+                unsafe { new_trans.set_len(pkt.len()) };
+
+                let transferred = unsafe { pkt.transfer_data(new_trans.as_mut_ptr() as *mut ()) };
+                // SAFETY: buffer has now been initialized, it is safe to transmute it into [u8].
+                let new_trans = unsafe { core::mem::transmute(new_trans) };
+                Operation::Write(Err(transferred), Some((0, new_trans)))
+            }
+        }
     }
 }
 
 impl IntoOp for WrPerm {
-    fn into_op(alloced: Self::Alloced<'static>) -> Operation {
+    fn into_op(alloced: MaybeAlloced<'static, Self>) -> Operation {
         Operation::Read(alloced)
     }
 }
@@ -178,7 +230,8 @@ impl<Perms: IntoOp> PacketIoHandleable<'static, Perms, u64> for IoOpsHandle<Perm
 
         let file = state.files.get_mut(self.key).unwrap();
 
-        file.ops.push_back((pos, Perms::into_op(packet.alloc())));
+        file.ops
+            .push_back((pos, Perms::into_op(packet.try_alloc())));
 
         // If we haven't got any other ops enqueued, then trigger processing!
         if file.ops.len() < 2 {
