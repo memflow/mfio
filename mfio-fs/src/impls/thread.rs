@@ -54,7 +54,7 @@ fn read_at(file: &FileInner, buf: &mut [u8], offset: u64) -> std::io::Result<usi
         use std::io::{Read, Seek, SeekFrom};
         let mut file = file.lock().unwrap();
         file.seek(SeekFrom::Start(offset))?;
-        return file.read(buf);
+        file.read(buf)
     }
     #[cfg(not(miri))]
     {
@@ -71,7 +71,7 @@ fn write_at(file: &FileInner, buf: &[u8], offset: u64) -> std::io::Result<usize>
         use std::io::{Seek, SeekFrom, Write};
         let mut file = file.lock().unwrap();
         file.seek(SeekFrom::Start(offset))?;
-        return file.write(buf);
+        file.write(buf)
     }
     #[cfg(not(miri))]
     {
@@ -277,6 +277,6 @@ impl IoBackend for NativeFs {
 
 impl NativeFs {
     pub fn register_file(&self, file: File) -> FileWrapper {
-        FileWrapper::from(file).into()
+        FileWrapper::from(file)
     }
 }

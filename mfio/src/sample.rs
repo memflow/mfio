@@ -1,5 +1,3 @@
-use core::mem::MaybeUninit;
-
 use mfio::backend::*;
 use mfio::error::{Error, Location, State, Subject, INTERNAL_ERROR};
 use mfio::packet::*;

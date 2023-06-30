@@ -301,13 +301,13 @@ mod tests {
 
     #[test]
     fn wake_test() {
-        NativeFs::default().run(|fs| async move {
+        NativeFs::default().run(|_| async move {
             for i in 0..2 {
                 println!("{i}");
                 let mut signaled = false;
                 poll_fn(|cx| {
                     println!("{signaled}");
-                    if signaled == true {
+                    if signaled {
                         Poll::Ready(())
                     } else {
                         signaled = true;

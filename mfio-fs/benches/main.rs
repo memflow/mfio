@@ -72,7 +72,7 @@ fn file_read(c: &mut Criterion) {
 
                 let mut elapsed = Duration::default();
 
-                let ret = NativeFs::default().run(|fs| async move {
+                NativeFs::default().run(|fs| async move {
                     let file = fs.open(temp_path, OpenOptions::new().read(true));
                     unsafe { FH = &file as *const _ };
 
@@ -87,7 +87,7 @@ fn file_read(c: &mut Criterion) {
                             // reads and have them all finish concurrently.
                             let fut = file.read_all((i * SPARSE) as u64, &mut b[..]);
                             let fut = async move {
-                                fut.await;
+                                fut.await.unwrap();
                             };
                             output.push(fut);
                         }
@@ -100,8 +100,7 @@ fn file_read(c: &mut Criterion) {
                     }
 
                     elapsed
-                });
-                ret
+                })
             });
         });
     }

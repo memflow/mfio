@@ -1,7 +1,7 @@
 use core::task::{RawWaker, RawWakerVTable, Waker};
 use std::fs::File;
 use std::io::Write;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use tarc::BaseArc;
 
 /// An eventfd/pipe backed waker.
