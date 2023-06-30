@@ -257,20 +257,20 @@ impl IoUringState {
     }
 }
 
-impl Default for IoUringState {
-    fn default() -> Self {
+impl IoUringState {
+    fn try_new() -> std::io::Result<Self> {
         // Default to 256 in-flight ops. Appears to be a good default.
         let ring_capacity = 256;
 
-        let ring = IoUring::builder().build(ring_capacity as u32).unwrap();
+        let ring = IoUring::builder().build(ring_capacity as u32)?;
 
-        let event_fd = eventfd(0, EfdFlags::all()).unwrap();
-        ring.submitter().register_eventfd(event_fd).unwrap();
+        let event_fd = eventfd(0, EfdFlags::all())?;
+        ring.submitter().register_eventfd(event_fd)?;
         let event_fd = unsafe { File::from_raw_fd(event_fd) };
 
-        ring.submitter().register_files(&[-1; 1024]).unwrap();
+        ring.submitter().register_files(&[-1; 1024])?;
 
-        Self {
+        Ok(Self {
             ring,
             event_fd,
             ops: Slab::with_capacity(ring_capacity),
@@ -281,7 +281,7 @@ impl Default for IoUringState {
             all_sub: 0,
             all_comp: 0,
             flushed: true,
-        }
+        })
     }
 }
 
@@ -293,12 +293,12 @@ pub struct NativeFs {
     waker: FdWaker<RawFd>,
 }
 
-impl Default for NativeFs {
-    fn default() -> Self {
-        let mut state = IoUringState::default();
+impl NativeFs {
+    pub fn try_new() -> std::io::Result<Self> {
+        let mut state = IoUringState::try_new()?;
 
-        let wake_fd = eventfd(0, EfdFlags::all()).unwrap();
-        set_nonblock(wake_fd).unwrap();
+        let wake_fd = eventfd(0, EfdFlags::all())?;
+        set_nonblock(wake_fd)?;
         let wake_read = unsafe { File::from_raw_fd(wake_fd) };
         let wake_key = state.register_file(wake_read);
         let waker = FdWaker::from(BaseArc::new(wake_fd));
@@ -311,9 +311,13 @@ impl Default for NativeFs {
         .user_data(u64::MAX);
 
         unsafe {
-            state.ring.submission().push(&poll_event).unwrap();
+            state
+                .ring
+                .submission()
+                .push(&poll_event)
+                .map_err(|_| std::io::ErrorKind::Other)?;
         }
-        state.ring.submitter().submit().unwrap();
+        state.ring.submitter().submit()?;
 
         let state = BaseArc::new(Mutex::new(state));
 
@@ -473,11 +477,11 @@ impl Default for NativeFs {
             }
         };
 
-        Self {
+        Ok(Self {
             state,
             backend: BackendContainer::new_dyn(backend),
             waker,
-        }
+        })
     }
 }
 

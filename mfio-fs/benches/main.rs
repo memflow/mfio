@@ -49,8 +49,9 @@ fn file_read(c: &mut Criterion) {
     let order = &order;
 
     let drop_cache = |path: &Path| {
-        std::process::Command::new("/usr/bin/dd")
+        std::process::Command::new("/usr/bin/env")
             .args([
+                "dd",
                 &format!("if={}", path.to_str().unwrap()),
                 "iflag=nocache",
                 "count=0",

@@ -1,13 +1,12 @@
 use core::future::Future;
 use core::task::Waker;
 use mfio::backend::*;
+use mfio::packet::{FastCWaker, PacketId, PacketIo, Read, Write};
 use mfio::stdeq::{AsyncRead, AsyncWrite, Seekable};
 use std::fs;
 use std::path::Path;
 
 pub mod impls;
-
-pub type FileWrapper = impls::FileWrapper;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -62,6 +61,9 @@ pub trait Fs: IoBackend {
 
 pub trait FileHandle: AsyncRead<u64> + AsyncWrite<u64> {}
 impl<T: AsyncRead<u64> + AsyncWrite<u64>> FileHandle for T {}
+
+macro_rules! fs_dispatch {
+    ($($(#[$meta:meta])* $name:ident => $mod:ident),*$(,)?) => {
 
 /// Native OS's filesystem
 ///
@@ -145,8 +147,91 @@ impl<T: AsyncRead<u64> + AsyncWrite<u64>> FileHandle for T {}
 /// # })
 /// # }
 /// ```
-#[derive(Default)]
-pub struct NativeFs(impls::NativeFs);
+        pub enum NativeFs {
+            $($(#[$meta])* $name(impls::$mod::NativeFs)),*
+        }
+
+        impl NativeFs {
+            fn register_file(&self, file: std::fs::File) -> FileWrapper {
+                match self {
+                    $($(#[$meta])* Self::$name(v) => FileWrapper::$name(v.register_file(file))),*
+                }
+            }
+        }
+
+        impl core::fmt::Debug for NativeFs {
+            fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+                match self {
+                    $($(#[$meta])* Self::$name(_) => write!(f, stringify!(NativeFs::$name))),*
+                }
+            }
+        }
+
+        impl Default for NativeFs {
+            fn default() -> Self {
+
+                $($(#[$meta])* if let Ok(v) = impls::$mod::NativeFs::try_new() {
+                    return Self::$name(v);
+                })*
+
+                panic!("Could not initialize any FS backend");
+            }
+        }
+
+        impl IoBackend for NativeFs {
+            type Backend = DynBackend;
+
+            fn polling_handle(&self) -> Option<(DefaultHandle, Waker)> {
+                match self {
+                    $($(#[$meta])* Self::$name(v) => v.polling_handle()),*
+                }
+            }
+
+            fn get_backend(&self) -> BackendHandle<Self::Backend> {
+                match self {
+                    $($(#[$meta])* Self::$name(v) => v.get_backend()),*
+                }
+            }
+        }
+
+        pub enum FileWrapper {
+            $($(#[$meta])* $name(impls::$mod::FileWrapper)),*
+        }
+
+        impl PacketIo<Write, u64> for FileWrapper {
+            fn separate_thread_state(&mut self) {}
+
+            fn try_new_id<'a>(&'a self, context: &mut FastCWaker) -> Option<PacketId<'a, Write, u64>> {
+                match self {
+                    $($(#[$meta])* Self::$name(v) => v.try_new_id(context)),*
+                }
+            }
+        }
+
+        impl PacketIo<Read, u64> for FileWrapper {
+            fn separate_thread_state(&mut self) {}
+
+            fn try_new_id<'a>(&'a self, context: &mut FastCWaker) -> Option<PacketId<'a, Read, u64>> {
+                match self {
+                    $($(#[$meta])* Self::$name(v) => v.try_new_id(context)),*
+                }
+            }
+        }
+    }
+}
+
+fs_dispatch! {
+    #[cfg(all(not(miri), target_os = "linux", feature = "io-uring"))]
+    IoUring => io_uring,
+    #[cfg(all(not(miri), unix, feature = "mio"))]
+    Mio => mio,
+    Default => thread,
+}
+
+pub trait FsDispatch {
+    type FsImpl: IoBackend;
+    type FileHandle: FileHandle;
+}
 
 impl Fs for NativeFs {
     type FileHandle = Seekable<FileWrapper, u64>;
@@ -161,19 +246,7 @@ impl Fs for NativeFs {
             .open(path)
             .unwrap();
 
-        self.0.register_file(file).into()
-    }
-}
-
-impl IoBackend for NativeFs {
-    type Backend = <impls::NativeFs as IoBackend>::Backend;
-
-    fn polling_handle(&self) -> Option<(DefaultHandle, Waker)> {
-        self.0.polling_handle()
-    }
-
-    fn get_backend(&self) -> BackendHandle<Self::Backend> {
-        self.0.get_backend()
+        self.register_file(file).into()
     }
 }
 

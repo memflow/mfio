@@ -308,12 +308,12 @@ struct MioState {
     files: Slab<FileInner>,
 }
 
-impl Default for MioState {
-    fn default() -> Self {
-        Self {
-            poll: mio::Poll::new().unwrap(),
+impl MioState {
+    fn try_new() -> std::io::Result<Self> {
+        Ok(Self {
+            poll: mio::Poll::new()?,
             files: Default::default(),
-        }
+        })
     }
 }
 
@@ -323,28 +323,24 @@ pub struct NativeFs {
     waker: FdWaker<OwnedFd>,
 }
 
-impl Default for NativeFs {
-    fn default() -> Self {
-        let state = MioState::default();
+impl NativeFs {
+    pub fn try_new() -> std::io::Result<Self> {
+        let state = MioState::try_new()?;
 
-        let (wake_read, wake_write) = nix::unistd::pipe().unwrap();
+        let (wake_read, wake_write) = nix::unistd::pipe()?;
 
-        set_nonblock(wake_read).unwrap();
-        set_nonblock(wake_write).unwrap();
+        set_nonblock(wake_read)?;
+        set_nonblock(wake_write)?;
 
         let mut wake_read = unsafe { File::from_raw_fd(wake_read) };
         let wake_write = unsafe { OwnedFd::from_raw_fd(wake_write) };
 
         // Register the waker in a special manner
-        state
-            .poll
-            .registry()
-            .register(
-                &mut SourceFd(&wake_read.as_raw_fd()),
-                Token(usize::MAX),
-                Interest::READABLE,
-            )
-            .unwrap();
+        state.poll.registry().register(
+            &mut SourceFd(&wake_read.as_raw_fd()),
+            Token(usize::MAX),
+            Interest::READABLE,
+        )?;
 
         let state = BaseArc::new(Mutex::new(state));
 
@@ -399,11 +395,11 @@ impl Default for NativeFs {
             }
         };
 
-        Self {
+        Ok(Self {
             state,
             backend: BackendContainer::new_dyn(backend),
             waker: FdWaker::from(BaseArc::new(wake_write)),
-        }
+        })
     }
 }
 

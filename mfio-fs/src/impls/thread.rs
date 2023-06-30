@@ -255,11 +255,11 @@ pub struct NativeFs {
     backend: BackendContainer<DynBackend>,
 }
 
-impl Default for NativeFs {
-    fn default() -> Self {
-        Self {
+impl NativeFs {
+    pub fn try_new() -> Result<Self, std::convert::Infallible> {
+        Ok(Self {
             backend: BackendContainer::new_dyn(pending()),
-        }
+        })
     }
 }
 
