@@ -162,8 +162,6 @@ use cglue::prelude::v1::*;
 
 #[cglue_trait]
 pub trait PacketIo<Perms: PacketPerms, Param>: Sized {
-    fn separate_thread_state(&mut self);
-
     fn try_new_id<'a>(&'a self, context: &mut FastCWaker) -> Option<PacketId<'a, Perms, Param>>;
 
     #[skip_func]

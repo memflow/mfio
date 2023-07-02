@@ -276,8 +276,6 @@ macro_rules! fs_dispatch {
         }
 
         impl PacketIo<Write, u64> for FileWrapper {
-            fn separate_thread_state(&mut self) {}
-
             fn try_new_id<'a>(&'a self, context: &mut FastCWaker) -> Option<PacketId<'a, Write, u64>> {
                 match self {
                     $($(#[cfg($meta)])* Self::$name(v) => v.try_new_id(context)),*
@@ -286,8 +284,6 @@ macro_rules! fs_dispatch {
         }
 
         impl PacketIo<Read, u64> for FileWrapper {
-            fn separate_thread_state(&mut self) {}
-
             fn try_new_id<'a>(&'a self, context: &mut FastCWaker) -> Option<PacketId<'a, Read, u64>> {
                 match self {
                     $($(#[cfg($meta)])* Self::$name(v) => v.try_new_id(context)),*

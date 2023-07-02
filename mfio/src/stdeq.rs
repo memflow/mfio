@@ -277,10 +277,6 @@ impl<T, Param: Default> From<T> for Seekable<T, Param> {
 impl<T: PacketIo<Perms, Param>, Perms: PacketPerms, Param> PacketIo<Perms, Param>
     for Seekable<T, Param>
 {
-    fn separate_thread_state(&mut self) {
-        self.handle.separate_thread_state();
-    }
-
     fn try_new_id<'a>(&'a self, context: &mut FastCWaker) -> Option<PacketId<'a, Perms, Param>> {
         self.handle.try_new_id(context)
     }

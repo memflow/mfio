@@ -84,7 +84,7 @@ fn write_at(file: &FileInner, buf: &[u8], offset: u64) -> std::io::Result<usize>
 }
 
 pub struct FileWrapper {
-    file: BaseArc<FileInner>,
+    _file: BaseArc<FileInner>,
     read_stream: ManuallyDrop<BaseArc<PacketStream<'static, Write, u64>>>,
     write_stream: ManuallyDrop<BaseArc<PacketStream<'static, Read, u64>>>,
     read_thread: Option<JoinHandle<()>>,
@@ -223,7 +223,7 @@ impl From<BaseArc<FileInner>> for FileWrapper {
         }));
 
         Self {
-            file,
+            _file: file,
             read_thread,
             write_thread,
             read_stream,
@@ -233,20 +233,12 @@ impl From<BaseArc<FileInner>> for FileWrapper {
 }
 
 impl PacketIo<Read, u64> for FileWrapper {
-    fn separate_thread_state(&mut self) {
-        *self = Self::from(self.file.clone());
-    }
-
     fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, Read, u64>> {
         Some(self.write_stream.new_packet_id())
     }
 }
 
 impl PacketIo<Write, u64> for FileWrapper {
-    fn separate_thread_state(&mut self) {
-        *self = Self::from(self.file.clone());
-    }
-
     fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, Write, u64>> {
         Some(self.read_stream.new_packet_id())
     }

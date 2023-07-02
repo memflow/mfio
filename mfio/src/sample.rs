@@ -248,20 +248,12 @@ impl SampleIo {
 }
 
 impl PacketIo<Read, Address> for SampleIo {
-    fn separate_thread_state(&mut self) {
-        self.thread_state = IoThreadState::new(&self.mem);
-    }
-
     fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, Read, Address>> {
         Some(self.thread_state.write_stream.new_packet_id())
     }
 }
 
 impl PacketIo<Write, Address> for SampleIo {
-    fn separate_thread_state(&mut self) {
-        self.thread_state = IoThreadState::new(&self.mem);
-    }
-
     fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, Write, Address>> {
         Some(self.thread_state.read_stream.new_packet_id())
     }

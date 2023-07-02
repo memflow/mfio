@@ -285,20 +285,12 @@ impl Drop for FileWrapper {
 }
 
 impl PacketIo<RdPerm, u64> for FileWrapper {
-    fn separate_thread_state(&mut self) {
-        //*self = Self::from(self.file.clone());
-    }
-
     fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, RdPerm, u64>> {
         Some(self.write_stream.new_packet_id())
     }
 }
 
 impl PacketIo<WrPerm, u64> for FileWrapper {
-    fn separate_thread_state(&mut self) {
-        //*self = Self::from(self.file.clone());
-    }
-
     fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, WrPerm, u64>> {
         Some(self.read_stream.new_packet_id())
     }
