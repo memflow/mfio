@@ -29,6 +29,20 @@ const HTTP_SHIFT: usize = 399;
 pub const INTERNAL_ERROR: Code =
     Code(unsafe { NonZeroU8::new_unchecked((500 - HTTP_SHIFT) as u8) });
 
+impl Code {
+    pub fn http_code(&self) -> usize {
+        self.0.get() as usize + HTTP_SHIFT
+    }
+
+    pub fn from_http(code: usize) -> Option<Self> {
+        if (400..600).contains(&code) {
+            NonZeroU8::new((code - 399) as u8).map(Code)
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(feature = "http")]
 mod http {
     use super::*;
@@ -43,13 +57,7 @@ mod http {
     impl core::convert::TryFrom<StatusCode> for Code {
         type Error = ();
         fn try_from(code: StatusCode) -> core::result::Result<Self, Self::Error> {
-            if code.is_client_error() || code.is_server_error() {
-                NonZeroU8::new((code.as_u16() - 399) as u8)
-                    .map(Code)
-                    .ok_or(())
-            } else {
-                Err(())
-            }
+            Self::from_http(code.as_u16() as usize).ok_or(())
         }
     }
 
@@ -220,6 +228,7 @@ ienum! {
         Export,
         Import,
         Section,
+        Backend,
         Other,
     }
 }
@@ -265,6 +274,8 @@ ienum! {
         Backend,
         Memory,
         Client,
+        Core,
+        Filesystem,
         Application,
         ThirdParty,
         Network,
@@ -338,6 +349,12 @@ impl<const N: u8> From<std::io::ErrorKind> for ErrorConstLocation<N> {
 impl From<std::io::ErrorKind> for Error {
     fn from(kind: std::io::ErrorKind) -> Self {
         ErrorConstLocation::<{ Location::Other as u8 }>::from(kind).into()
+    }
+}
+
+impl From<core::convert::Infallible> for Error {
+    fn from(_: core::convert::Infallible) -> Self {
+        unreachable!()
     }
 }
 

@@ -1,7 +1,7 @@
 use core::future::Future;
 use core::task::Waker;
 use mfio::backend::*;
-use mfio::error::Result as MfioResult;
+use mfio::error::{Code, Error, Location, Result as MfioResult, State, Subject};
 use mfio::packet::{FastCWaker, PacketId, PacketIo, Read, Write};
 use mfio::stdeq::{AsyncRead, AsyncWrite, Seekable};
 use std::fs;
@@ -68,7 +68,7 @@ pub trait FileHandle: AsyncRead<u64> + AsyncWrite<u64> {}
 impl<T: AsyncRead<u64> + AsyncWrite<u64>> FileHandle for T {}
 
 macro_rules! fs_dispatch {
-    ($($(#[$meta:meta])* $name:ident => $mod:ident),*$(,)?) => {
+    ($($(#[cfg($meta:meta)])* $name:ident => $mod:ident),*$(,)?) => {
 
 /// Native OS's filesystem
 ///
@@ -155,33 +155,34 @@ macro_rules! fs_dispatch {
 /// # }
 /// ```
         pub enum NativeFs {
-            $($(#[$meta])* $name(impls::$mod::NativeFs)),*
+            $($(#[cfg($meta)])* $name(impls::$mod::NativeFs)),*
         }
 
         impl NativeFs {
             fn register_file(&self, file: std::fs::File) -> FileWrapper {
                 match self {
-                    $($(#[$meta])* Self::$name(v) => FileWrapper::$name(v.register_file(file))),*
+                    $($(#[cfg($meta)])* Self::$name(v) => FileWrapper::$name(v.register_file(file))),*
                 }
+            }
+
+            pub fn builder() -> NativeFsBuilder {
+                NativeFsBuilder::default()
             }
         }
 
         impl core::fmt::Debug for NativeFs {
             fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
                 match self {
-                    $($(#[$meta])* Self::$name(_) => write!(f, stringify!(NativeFs::$name))),*
+                    $($(#[cfg($meta)])* Self::$name(_) => write!(f, stringify!(NativeFs::$name))),*
                 }
             }
         }
 
         impl Default for NativeFs {
             fn default() -> Self {
-
-                $($(#[$meta])* if let Ok(v) = impls::$mod::NativeFs::try_new() {
-                    return Self::$name(v);
-                })*
-
-                panic!("Could not initialize any FS backend");
+                NativeFsBuilder::all_backends()
+                    .build()
+                    .expect("Could not initialize any FS backend")
             }
         }
 
@@ -190,19 +191,88 @@ macro_rules! fs_dispatch {
 
             fn polling_handle(&self) -> Option<(DefaultHandle, Waker)> {
                 match self {
-                    $($(#[$meta])* Self::$name(v) => v.polling_handle()),*
+                    $($(#[cfg($meta)])* Self::$name(v) => v.polling_handle()),*
                 }
             }
 
             fn get_backend(&self) -> BackendHandle<Self::Backend> {
                 match self {
-                    $($(#[$meta])* Self::$name(v) => v.get_backend()),*
+                    $($(#[cfg($meta)])* Self::$name(v) => v.get_backend()),*
                 }
             }
         }
 
+        /// Builder for the [`NativeFs`](NativeFs).
+        ///
+        /// This builder allows configuring the I/O backends to try to construct for the filesystem
+        /// handle. Note that the order of backends is fixed, and is as follows:
+        ///
+        $(#[cfg_attr(all($($meta)*), doc = concat!("- [`", stringify!($mod), "`](impls::", stringify!($mod), ")"))])*
+        ///
+        /// The full order (including unsupported/disabled backends) is as follows:
+        ///
+        $(#[doc = concat!("- `", stringify!($mod), "`")])*
+        ///
+        /// If you wish to customize the construction order, please use multiple builders.
+        #[derive(Default)]
+        pub struct NativeFsBuilder {
+            $($(#[cfg($meta)])* $mod: bool),*
+        }
+
+        impl NativeFsBuilder {
+            pub fn all_backends() -> Self {
+                Self {
+                    $($(#[cfg($meta)])* $mod: true),*
+                }
+            }
+
+            pub fn enable_all(self) -> Self {
+                let _ = self;
+                Self::all_backends()
+            }
+
+            $($(#[cfg($meta)])*
+            #[doc = concat!("Enables the [`", stringify!($mod), "`](impls::", stringify!($mod), ") backend.")]
+            pub fn $mod(self, $mod: bool) -> Self {
+                Self {
+                    $mod,
+                    ..self
+                }
+            })*
+
+            pub fn build(self) -> mfio::error::Result<NativeFs> {
+                $($(#[cfg($meta)])* if self.$mod {
+                    if let Ok(v) = impls::$mod::NativeFs::try_new() {
+                        return Ok(NativeFs::$name(v));
+                    }
+                })*
+
+                Err(Error {
+                    code: Code::from_http(501).unwrap(),
+                    subject: Subject::Backend,
+                    state: State::Unsupported,
+                    location: Location::Filesystem,
+                })
+            }
+
+            pub fn build_each(self) -> Vec<(&'static str, mfio::error::Result<NativeFs>)> {
+                let mut ret = vec![];
+
+                $($(#[cfg($meta)])* if self.$mod {
+                    ret.push((
+                        stringify!($mod),
+                        impls::$mod::NativeFs::try_new()
+                            .map_err(|e| e.into())
+                            .map(|v| NativeFs::$name(v))
+                    ));
+                })*
+
+                ret
+            }
+        }
+
         pub enum FileWrapper {
-            $($(#[$meta])* $name(impls::$mod::FileWrapper)),*
+            $($(#[cfg($meta)])* $name(impls::$mod::FileWrapper)),*
         }
 
         impl PacketIo<Write, u64> for FileWrapper {
@@ -210,7 +280,7 @@ macro_rules! fs_dispatch {
 
             fn try_new_id<'a>(&'a self, context: &mut FastCWaker) -> Option<PacketId<'a, Write, u64>> {
                 match self {
-                    $($(#[$meta])* Self::$name(v) => v.try_new_id(context)),*
+                    $($(#[cfg($meta)])* Self::$name(v) => v.try_new_id(context)),*
                 }
             }
         }
@@ -220,7 +290,7 @@ macro_rules! fs_dispatch {
 
             fn try_new_id<'a>(&'a self, context: &mut FastCWaker) -> Option<PacketId<'a, Read, u64>> {
                 match self {
-                    $($(#[$meta])* Self::$name(v) => v.try_new_id(context)),*
+                    $($(#[cfg($meta)])* Self::$name(v) => v.try_new_id(context)),*
                 }
             }
         }
@@ -288,17 +358,20 @@ mod tests {
 
         write(&filepath, test_string.as_bytes()).unwrap();
 
-        NativeFs::default().run(|fs| async move {
-            let fh = fs
-                .open(&filepath, OpenOptions::new().read(true))
-                .await
-                .unwrap();
+        for (backend, fs) in NativeFsBuilder::all_backends().build_each() {
+            println!("{backend}");
+            fs.unwrap().run(|fs| async {
+                let fh = fs
+                    .open(&filepath, OpenOptions::new().read(true))
+                    .await
+                    .unwrap();
 
-            let mut d = [MaybeUninit::uninit(); 8];
+                let mut d = [MaybeUninit::uninit(); 8];
 
-            let stream = fh.read_raw(0, &mut d[..]);
-            stream.count().await;
-        });
+                let stream = fh.read_raw(0, &mut d[..]);
+                stream.count().await;
+            });
+        }
     }
 
     #[test]
@@ -311,16 +384,19 @@ mod tests {
 
         write(&filepath, test_string.as_bytes()).unwrap();
 
-        NativeFs::default().run(|fs| async move {
-            let fh = fs
-                .open(&filepath, OpenOptions::new().read(true))
-                .await
-                .unwrap();
+        for (backend, fs) in NativeFsBuilder::all_backends().build_each() {
+            println!("{backend}");
+            fs.unwrap().run(|fs| async {
+                let fh = fs
+                    .open(&filepath, OpenOptions::new().read(true))
+                    .await
+                    .unwrap();
 
-            let mut d = [MaybeUninit::uninit(); 8];
+                let mut d = [MaybeUninit::uninit(); 8];
 
-            fh.read_all(0, &mut d[..]).await.unwrap();
-        });
+                fh.read_all(0, &mut d[..]).await.unwrap();
+            });
+        }
     }
 
     #[test]
@@ -334,34 +410,37 @@ mod tests {
         let mut filepath = std::env::temp_dir();
         filepath.push("mfio-fs-test-write");
 
-        NativeFs::default().run(|fs| async move {
-            let mut fh = fs
-                .open(
-                    &filepath,
-                    OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create(true)
-                        .truncate(true),
-                )
-                .await
-                .unwrap();
+        for (backend, fs) in NativeFsBuilder::all_backends().build_each() {
+            println!("{backend}");
+            fs.unwrap().run(|fs| async {
+                let mut fh = fs
+                    .open(
+                        &filepath,
+                        OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create(true)
+                            .truncate(true),
+                    )
+                    .await
+                    .unwrap();
 
-            AsyncWrite::write(&fh, &test_data).await.unwrap();
+                AsyncWrite::write(&fh, &test_data).await.unwrap();
 
-            assert_eq!(test_data.len(), fh.get_pos() as usize);
+                assert_eq!(test_data.len(), fh.get_pos() as usize);
 
-            fh.rewind().unwrap();
+                fh.rewind().unwrap();
 
-            // Read the data back out
-            let mut output = vec![];
-            AsyncRead::read_to_end(&fh, &mut output).await.unwrap();
+                // Read the data back out
+                let mut output = vec![];
+                AsyncRead::read_to_end(&fh, &mut output).await.unwrap();
 
-            assert_eq!(test_data.len(), fh.get_pos() as usize);
-            assert_eq!(test_data, output);
+                assert_eq!(test_data.len(), fh.get_pos() as usize);
+                assert_eq!(test_data, output);
 
-            core::mem::drop(fh);
-        });
+                core::mem::drop(fh);
+            });
+        }
     }
 
     #[test]
@@ -373,43 +452,49 @@ mod tests {
         // Create a test file:
         write(&filepath, test_string.as_bytes()).unwrap();
 
-        NativeFs::default().run(|fs| async move {
-            let fh = fs
-                .open(&filepath, OpenOptions::new().read(true))
-                .await
-                .unwrap();
+        for (backend, fs) in NativeFsBuilder::all_backends().build_each() {
+            println!("{backend}");
+            fs.unwrap().run(|fs| async {
+                let fh = fs
+                    .open(&filepath, OpenOptions::new().read(true))
+                    .await
+                    .unwrap();
 
-            let mut output = vec![];
-            AsyncRead::read_to_end(&fh, &mut output).await.unwrap();
+                let mut output = vec![];
+                AsyncRead::read_to_end(&fh, &mut output).await.unwrap();
 
-            assert_eq!(test_string.len(), fh.get_pos() as usize);
-            assert_eq!(test_string.as_bytes(), output);
-        });
+                assert_eq!(test_string.len(), fh.get_pos() as usize);
+                assert_eq!(test_string.as_bytes(), output);
+            });
+        }
     }
 
     #[test]
     fn wake_test() {
-        NativeFs::default().run(|_| async move {
-            for i in 0..2 {
-                println!("{i}");
-                let mut signaled = false;
-                poll_fn(|cx| {
-                    println!("{signaled}");
-                    if signaled {
-                        Poll::Ready(())
-                    } else {
-                        signaled = true;
-                        let waker = cx.waker().clone();
-                        std::thread::spawn(|| {
-                            std::thread::sleep(std::time::Duration::from_millis(200));
-                            println!("WAKE");
-                            waker.wake();
-                        });
-                        Poll::Pending
-                    }
-                })
-                .await;
-            }
-        });
+        for (backend, fs) in NativeFsBuilder::all_backends().build_each() {
+            println!("{backend}");
+            fs.unwrap().run(|_| async move {
+                for i in 0..2 {
+                    println!("{i}");
+                    let mut signaled = false;
+                    poll_fn(|cx| {
+                        println!("{signaled}");
+                        if signaled {
+                            Poll::Ready(())
+                        } else {
+                            signaled = true;
+                            let waker = cx.waker().clone();
+                            std::thread::spawn(|| {
+                                std::thread::sleep(std::time::Duration::from_millis(200));
+                                println!("WAKE");
+                                waker.wake();
+                            });
+                            Poll::Pending
+                        }
+                    })
+                    .await;
+                }
+            });
+        }
     }
 }
