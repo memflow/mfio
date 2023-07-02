@@ -340,3 +340,58 @@ impl From<std::io::ErrorKind> for Error {
         ErrorConstLocation::<{ Location::Other as u8 }>::from(kind).into()
     }
 }
+
+pub trait ErrorSpecify: Sized {
+    fn code(self, code: Code) -> Self;
+    fn subject(self, subject: Subject) -> Self;
+    fn state(self, state: State) -> Self;
+    fn location(self, location: Location) -> Self;
+}
+
+impl ErrorSpecify for Error {
+    fn code(self, code: Code) -> Self {
+        Self { code, ..self }
+    }
+
+    fn subject(self, subject: Subject) -> Self {
+        Self { subject, ..self }
+    }
+
+    fn state(self, state: State) -> Self {
+        Self { state, ..self }
+    }
+
+    fn location(self, location: Location) -> Self {
+        Self { location, ..self }
+    }
+}
+
+impl<T> ErrorSpecify for Result<T> {
+    fn code(self, code: Code) -> Self {
+        match self {
+            Err(e) => Err(e.code(code)),
+            v => v,
+        }
+    }
+
+    fn subject(self, subject: Subject) -> Self {
+        match self {
+            Err(e) => Err(e.subject(subject)),
+            v => v,
+        }
+    }
+
+    fn state(self, state: State) -> Self {
+        match self {
+            Err(e) => Err(e.state(state)),
+            v => v,
+        }
+    }
+
+    fn location(self, location: Location) -> Self {
+        match self {
+            Err(e) => Err(e.location(location)),
+            v => v,
+        }
+    }
+}
