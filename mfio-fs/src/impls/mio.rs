@@ -16,7 +16,8 @@ use mfio::backend::*;
 use mfio::packet::{FastCWaker, Read as RdPerm, Splittable, Write as WrPerm, *};
 use mfio::tarc::BaseArc;
 
-use super::{io_err, State};
+use crate::util::io_err;
+use mfio::error::State;
 
 const RW_INTERESTS: Interest = Interest::READABLE.add(Interest::WRITABLE);
 

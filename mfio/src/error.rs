@@ -289,6 +289,17 @@ impl<const N: u8> From<ErrorConstLocation<N>> for Error {
     }
 }
 
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Self {
+            code: INTERNAL_ERROR,
+            subject: Subject::Io,
+            state: err.kind().into(),
+            location: Location::Other,
+        }
+    }
+}
+
 impl From<std::io::ErrorKind> for State {
     fn from(kind: std::io::ErrorKind) -> Self {
         use std::io::ErrorKind::*;

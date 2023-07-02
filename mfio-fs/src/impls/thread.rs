@@ -15,7 +15,8 @@ use mfio::backend::*;
 use mfio::packet::*;
 use mfio::tarc::BaseArc;
 
-use super::{io_err, State};
+use crate::util::io_err;
+use mfio::error::State;
 
 #[cfg(miri)]
 type FileInner = std::sync::Mutex<File>;

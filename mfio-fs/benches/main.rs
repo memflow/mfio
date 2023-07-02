@@ -74,7 +74,10 @@ fn file_read(c: &mut Criterion) {
                 let mut elapsed = Duration::default();
 
                 NativeFs::default().run(|fs| async move {
-                    let file = fs.open(temp_path, OpenOptions::new().read(true));
+                    let file = fs
+                        .open(temp_path, OpenOptions::new().read(true))
+                        .await
+                        .unwrap();
                     unsafe { FH = &file as *const _ };
 
                     while iters > 0 {
@@ -123,7 +126,10 @@ fn file_read(c: &mut Criterion) {
                     let mut fs = NativeFs::default();
 
                     Tokio::run_with_mut(&mut fs, |fs| async move {
-                        let file = fs.open(temp_path, OpenOptions::new().read(true));
+                        let file = fs
+                            .open(temp_path, OpenOptions::new().read(true))
+                            .await
+                            .unwrap();
                         unsafe { FH = &file as *const _ };
 
                         while iters > 0 {
@@ -172,7 +178,10 @@ fn file_read(c: &mut Criterion) {
                     let mut fs = NativeFs::default();
 
                     AsyncIo::run_with_mut(&mut fs, |fs| async move {
-                        let file = fs.open(temp_path, OpenOptions::new().read(true));
+                        let file = fs
+                            .open(temp_path, OpenOptions::new().read(true))
+                            .await
+                            .unwrap();
                         unsafe { FH = &file as *const _ };
 
                         while iters > 0 {

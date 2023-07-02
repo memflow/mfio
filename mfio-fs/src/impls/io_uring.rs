@@ -18,7 +18,8 @@ use mfio::backend::*;
 use mfio::packet::{FastCWaker, Read as RdPerm, Write as WrPerm, *};
 use mfio::tarc::BaseArc;
 
-use super::{io_err, State};
+use crate::util::io_err;
+use mfio::error::State;
 
 #[repr(transparent)]
 struct RawBox(*mut [MaybeUninit<u8>]);

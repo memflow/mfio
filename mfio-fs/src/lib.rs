@@ -1,12 +1,14 @@
 use core::future::Future;
 use core::task::Waker;
 use mfio::backend::*;
+use mfio::error::Result as MfioResult;
 use mfio::packet::{FastCWaker, PacketId, PacketIo, Read, Write};
 use mfio::stdeq::{AsyncRead, AsyncWrite, Seekable};
 use std::fs;
 use std::path::Path;
 
 pub mod impls;
+pub(crate) mod util;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -55,8 +57,11 @@ impl OpenOptions {
 
 pub trait Fs: IoBackend {
     type FileHandle: FileHandle;
+    type OpenFuture<'a>: Future<Output = MfioResult<Self::FileHandle>> + 'a
+    where
+        Self: 'a;
 
-    fn open(&self, path: &Path, options: OpenOptions) -> Self::FileHandle;
+    fn open(&self, path: &Path, options: OpenOptions) -> Self::OpenFuture<'_>;
 }
 
 pub trait FileHandle: AsyncRead<u64> + AsyncWrite<u64> {}
@@ -87,14 +92,15 @@ macro_rules! fs_dispatch {
 ///
 /// // Create mfio's filesystem
 /// NativeFs::default().run(|fs| async move {
-///     let fh = fs.open(&filepath, OpenOptions::new().read(true));
+///     let fh = fs.open(&filepath, OpenOptions::new().read(true)).await?;
 ///
 ///     let mut output = vec![];
-///     fh.read_to_end(&mut output).await.unwrap();
+///     fh.read_to_end(&mut output).await?;
 ///
 ///     assert_eq!(test_string.len(), fh.get_pos() as usize);
 ///     assert_eq!(test_string.as_bytes(), output);
-/// });
+///     mfio::error::Result::Ok(())
+/// }).unwrap();
 ///
 /// # Ok(())
 /// # }
@@ -128,9 +134,9 @@ macro_rules! fs_dispatch {
 ///             .write(true)
 ///             .create(true)
 ///             .truncate(true)
-///         );
+///         ).await?;
 ///
-///     fh.write(&test_data).await;
+///     fh.write(&test_data).await?;
 ///
 ///     assert_eq!(test_data.len(), fh.get_pos() as usize);
 ///
@@ -138,11 +144,12 @@ macro_rules! fs_dispatch {
 ///
 ///     // Read the data back out
 ///     let mut output = vec![];
-///     fh.read_to_end(&mut output).await.unwrap();
+///     fh.read_to_end(&mut output).await?;
 ///
 ///     assert_eq!(test_data.len(), fh.get_pos() as usize);
 ///     assert_eq!(test_data, output);
-/// });
+///     mfio::error::Result::Ok(())
+/// }).unwrap();
 /// # Ok(())
 /// # })
 /// # }
@@ -228,15 +235,11 @@ fs_dispatch! {
     Default => thread,
 }
 
-pub trait FsDispatch {
-    type FsImpl: IoBackend;
-    type FileHandle: FileHandle;
-}
-
 impl Fs for NativeFs {
     type FileHandle = Seekable<FileWrapper, u64>;
+    type OpenFuture<'a> = core::future::Ready<MfioResult<Self::FileHandle>>;
 
-    fn open(&self, path: &Path, options: OpenOptions) -> Self::FileHandle {
+    fn open(&self, path: &Path, options: OpenOptions) -> Self::OpenFuture<'_> {
         let file = fs::OpenOptions::new()
             .read(options.read)
             .write(options.write)
@@ -244,9 +247,9 @@ impl Fs for NativeFs {
             .create_new(options.create_new)
             .truncate(options.truncate)
             .open(path)
-            .unwrap();
+            .map_err(util::from_io_error);
 
-        self.register_file(file).into()
+        core::future::ready(file.map(|file| self.register_file(file).into()))
     }
 }
 
@@ -286,7 +289,10 @@ mod tests {
         write(&filepath, test_string.as_bytes()).unwrap();
 
         NativeFs::default().run(|fs| async move {
-            let fh = fs.open(&filepath, OpenOptions::new().read(true));
+            let fh = fs
+                .open(&filepath, OpenOptions::new().read(true))
+                .await
+                .unwrap();
 
             let mut d = [MaybeUninit::uninit(); 8];
 
@@ -306,7 +312,10 @@ mod tests {
         write(&filepath, test_string.as_bytes()).unwrap();
 
         NativeFs::default().run(|fs| async move {
-            let fh = fs.open(&filepath, OpenOptions::new().read(true));
+            let fh = fs
+                .open(&filepath, OpenOptions::new().read(true))
+                .await
+                .unwrap();
 
             let mut d = [MaybeUninit::uninit(); 8];
 
@@ -326,14 +335,17 @@ mod tests {
         filepath.push("mfio-fs-test-write");
 
         NativeFs::default().run(|fs| async move {
-            let mut fh = fs.open(
-                &filepath,
-                OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(true),
-            );
+            let mut fh = fs
+                .open(
+                    &filepath,
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(true),
+                )
+                .await
+                .unwrap();
 
             AsyncWrite::write(&fh, &test_data).await.unwrap();
 
@@ -362,7 +374,10 @@ mod tests {
         write(&filepath, test_string.as_bytes()).unwrap();
 
         NativeFs::default().run(|fs| async move {
-            let fh = fs.open(&filepath, OpenOptions::new().read(true));
+            let fh = fs
+                .open(&filepath, OpenOptions::new().read(true))
+                .await
+                .unwrap();
 
             let mut output = vec![];
             AsyncRead::read_to_end(&fh, &mut output).await.unwrap();

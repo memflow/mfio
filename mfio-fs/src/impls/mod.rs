@@ -1,14 +1,3 @@
-use mfio::error::{Error, Location, State, Subject, INTERNAL_ERROR};
-
-fn io_err(state: State) -> Error {
-    Error {
-        code: INTERNAL_ERROR,
-        location: Location::Backend,
-        subject: Subject::Io,
-        state,
-    }
-}
-
 pub mod thread;
 
 #[cfg(all(not(miri), target_os = "linux", feature = "io-uring"))]
