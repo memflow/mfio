@@ -294,7 +294,7 @@ impl NativeFs {
         set_nonblock(wake_fd)?;
         let wake_read = unsafe { File::from_raw_fd(wake_fd) };
         let wake_key = state.register_file(wake_read);
-        let waker = FdWaker::from(BaseArc::new(wake_fd));
+        let waker = FdWaker::from(wake_fd);
 
         let poll_event = opcode::PollAdd::new(
             Fixed(wake_key as _),
@@ -489,7 +489,7 @@ impl IoBackend for NativeFs {
     }
 
     fn get_backend(&self) -> BackendHandle<Self::Backend> {
-        self.backend.acquire()
+        self.backend.acquire(Some(self.waker.flags()))
     }
 }
 

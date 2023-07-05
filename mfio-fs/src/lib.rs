@@ -493,4 +493,96 @@ mod tests {
             });
         }
     }
+
+    #[test]
+    fn wake_test_lot() {
+        for (backend, fs) in NativeFsBuilder::all_backends().build_each() {
+            println!("{backend}");
+            fs.unwrap().run(|_| async move {
+                for i in 0..2000 {
+                    println!("{i}");
+                    let mut signaled = false;
+                    poll_fn(|cx| {
+                        println!("{signaled}");
+                        if signaled {
+                            Poll::Ready(())
+                        } else {
+                            signaled = true;
+                            let waker = cx.waker().clone();
+                            std::thread::spawn(|| {
+                                println!("WAKE");
+                                waker.wake();
+                                println!("Woke");
+                            });
+                            Poll::Pending
+                        }
+                    })
+                    .await;
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn self_wake() {
+        // Verifies that all backends support self waking correctly
+        for (backend, fs) in NativeFsBuilder::all_backends().build_each() {
+            println!("{backend}");
+            fs.unwrap().run(|_| async move {
+                for i in 0..2000 {
+                    println!("{i}");
+                    let mut signaled = false;
+                    poll_fn(|cx| {
+                        println!("{signaled}");
+                        if signaled {
+                            Poll::Ready(())
+                        } else {
+                            signaled = true;
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                    })
+                    .await;
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn self_no_doublewake() {
+        // Verifies that no backend incorrectly wakes itself up when not needed
+        for (backend, fs) in NativeFsBuilder::all_backends().build_each() {
+            println!("{backend}");
+
+            let (tx, rx) = std::sync::mpsc::channel();
+
+            fs.unwrap().run(|_| async move {
+                let mut signaled = 0;
+                poll_fn(|cx| {
+                    println!("{signaled}");
+                    if signaled > 1 {
+                        Poll::Ready(())
+                    } else {
+                        signaled += 1;
+                        if signaled == 1 {
+                            cx.waker().wake_by_ref();
+                        } else {
+                            let waker = cx.waker().clone();
+                            let tx = tx.clone();
+                            std::thread::spawn(move || {
+                                std::thread::sleep(std::time::Duration::from_millis(200));
+                                println!("WAKE");
+                                tx.send(()).unwrap();
+                                waker.wake();
+                            });
+                        }
+                        Poll::Pending
+                    }
+                })
+                .await;
+            });
+
+            assert_eq!(Ok(()), rx.try_recv());
+        }
+    }
 }

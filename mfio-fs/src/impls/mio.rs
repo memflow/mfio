@@ -327,6 +327,7 @@ impl NativeFs {
 
         let mut wake_read = unsafe { File::from_raw_fd(wake_read) };
         let wake_write = unsafe { OwnedFd::from_raw_fd(wake_write) };
+        let waker = FdWaker::from(wake_write);
 
         // Register the waker in a special manner
         state.poll.registry().register(
@@ -339,6 +340,7 @@ impl NativeFs {
 
         let backend = {
             let state = state.clone();
+            let waker = waker.clone();
             async move {
                 let mut events = Events::with_capacity(1024);
 
@@ -357,7 +359,9 @@ impl NativeFs {
 
                             // This will fail with usize::MAX key
                             if let Some(file) = state.files.get_mut(key) {
-                                observed_blocking = file.do_ops() || observed_blocking;
+                                file.do_ops();
+                            } else {
+                                observed_blocking = true;
                             }
                         }
 
@@ -370,6 +374,8 @@ impl NativeFs {
                                     _ => break,
                                 }
                             }
+                            // Set the self wake flag here
+                            waker.wake_by_ref();
                         }
                     }
 
@@ -391,7 +397,7 @@ impl NativeFs {
         Ok(Self {
             state,
             backend: BackendContainer::new_dyn(backend),
-            waker: FdWaker::from(BaseArc::new(wake_write)),
+            waker,
         })
     }
 }
@@ -407,7 +413,7 @@ impl IoBackend for NativeFs {
     }
 
     fn get_backend(&self) -> BackendHandle<Self::Backend> {
-        self.backend.acquire()
+        self.backend.acquire(Some(self.waker.flags()))
     }
 }
 

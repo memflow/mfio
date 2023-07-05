@@ -267,6 +267,6 @@ impl IoBackend for SampleIo {
     }
 
     fn get_backend(&self) -> BackendHandle<Self::Backend> {
-        self.thread_state.backend.acquire()
+        self.thread_state.backend.acquire(None)
     }
 }

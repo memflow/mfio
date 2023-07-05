@@ -1,8 +1,9 @@
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use core::task::{Context, Poll, Waker};
+use tarc::Arc;
 
 pub mod integrations;
 
@@ -36,7 +37,7 @@ unsafe impl<B: ?Sized + Send> Send for BackendContainer<B> {}
 unsafe impl<B: ?Sized + Send> Sync for BackendContainer<B> {}
 
 impl<B: ?Sized> BackendContainer<B> {
-    pub fn acquire(&self) -> BackendHandle<B> {
+    pub fn acquire(&self, wake_flags: Option<Arc<AtomicU8>>) -> BackendHandle<B> {
         if self.lock.swap(true, Ordering::Acquire) {
             panic!("Tried to acquire backend twice!");
         }
@@ -46,6 +47,7 @@ impl<B: ?Sized> BackendContainer<B> {
         BackendHandle {
             owner: self,
             backend,
+            wake_flags,
         }
     }
 }
@@ -62,6 +64,7 @@ impl BackendContainer<DynBackend> {
 pub struct BackendHandle<'a, B: ?Sized> {
     owner: &'a BackendContainer<B>,
     backend: Pin<&'a mut B>,
+    wake_flags: Option<Arc<AtomicU8>>,
 }
 
 impl<'a, B: ?Sized> Drop for BackendHandle<'a, B> {
@@ -94,15 +97,38 @@ impl<'a, Backend: Future + ?Sized, Fut: Future + ?Sized> Future for WithBackend<
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        let fut = unsafe { Pin::new_unchecked(&mut this.future) };
-        let backend = this.backend.as_mut();
 
-        match fut.poll(cx) {
-            Poll::Ready(v) => Poll::Ready(v),
-            Poll::Pending => match backend.poll(cx) {
-                Poll::Ready(_) => panic!("Backend future completed"),
-                Poll::Pending => Poll::Pending,
-            },
+        loop {
+            this.backend
+                .wake_flags
+                .as_ref()
+                .map(|v| v.fetch_or(0b10, Ordering::AcqRel));
+            let fut = unsafe { Pin::new_unchecked(&mut this.future) };
+            let backend = this.backend.as_mut();
+
+            match fut.poll(cx) {
+                Poll::Ready(v) => {
+                    if let Some(v) = this.backend.wake_flags.as_ref() {
+                        v.store(0, Ordering::Release);
+                    }
+                    break Poll::Ready(v);
+                }
+                Poll::Pending => match backend.poll(cx) {
+                    Poll::Ready(_) => panic!("Backend future completed"),
+                    Poll::Pending => (),
+                },
+            }
+
+            if this
+                .backend
+                .wake_flags
+                .as_ref()
+                .map(|v| v.fetch_and(0b0, Ordering::AcqRel) & 0b1)
+                .unwrap_or(0)
+                == 0
+            {
+                break Poll::Pending;
+            }
         }
     }
 }

@@ -264,7 +264,7 @@ impl IoBackend for NativeFs {
     }
 
     fn get_backend(&self) -> BackendHandle<Self::Backend> {
-        self.backend.acquire()
+        self.backend.acquire(None)
     }
 }
 
