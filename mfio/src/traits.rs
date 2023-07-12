@@ -2,7 +2,7 @@ use crate::packet::*;
 
 use crate::backend::IoBackend;
 use crate::error::Error;
-use crate::util::UsizeMath;
+use crate::util::PosShift;
 use bytemuck::Pod;
 use cglue::prelude::v1::*;
 use core::future::Future;
@@ -170,9 +170,7 @@ pub enum ReadToEndFutState<'a, Io: PacketIo<Write, Param>, Param: 'a> {
     Finished,
 }
 
-impl<'a, Io: PacketIo<Write, Param>, Param: Copy + UsizeMath> Future
-    for ReadToEndFut<'a, Io, Param>
-{
+impl<'a, Io: PacketIo<Write, Param>, Param: PosShift<Io>> Future for ReadToEndFut<'a, Io, Param> {
     type Output = Option<usize>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
@@ -213,7 +211,8 @@ impl<'a, Io: PacketIo<Write, Param>, Param: Copy + UsizeMath> Future
 
                         match &mut this.state {
                             ReadToEndFutState::Read(_, _, _, _, _, stream) => {
-                                unsafe { Pin::new_unchecked(&**stream) }.send_io(this.pos, data);
+                                unsafe { Pin::new_unchecked(&**stream) }
+                                    .send_io(this.pos.copy_pos(), data);
                             }
                             _ => unreachable!(),
                         }
@@ -286,7 +285,7 @@ impl<'a, Io: PacketIo<Write, Param>, Param: Copy + UsizeMath> Future
                                     };
 
                                     unsafe { Pin::new_unchecked(&**stream) }
-                                        .send_io(this.pos.add(this.buf.len()), data);
+                                        .send_io(this.pos.copy_pos().add(this.buf.len()), data);
                                 }
                             }
                         }

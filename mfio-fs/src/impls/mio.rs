@@ -1,9 +1,9 @@
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
-use mio::{unix::SourceFd, Events, Interest, Token};
+use mio::{event::Source, unix::SourceFd, Events, Interest, Registry, Token};
 use parking_lot::Mutex;
 use slab::Slab;
 
@@ -16,69 +16,225 @@ use mfio::backend::*;
 use mfio::packet::{FastCWaker, Read as RdPerm, Splittable, Write as WrPerm, *};
 use mfio::tarc::BaseArc;
 
+use super::{OwnedStreamHandle, RawHandleConv, StreamBorrow, StreamHandleConv};
 use crate::util::io_err;
 use mfio::error::State;
 
 const RW_INTERESTS: Interest = Interest::READABLE.add(Interest::WRITABLE);
 
-enum Operation {
-    Read(MaybeAlloced<'static, WrPerm>),
-    Write(
-        AllocedOrTransferred<'static, RdPerm>,
-        Option<(usize, Vec<u8>)>,
-    ),
+struct ReadOp {
+    pkt: MaybeAlloced<'static, WrPerm>,
 }
 
-struct FileInner {
-    file: File,
-    pos: u64,
-    ops: VecDeque<(u64, Operation)>,
+struct WriteOp {
+    pkt: AllocedOrTransferred<'static, RdPerm>,
+    transferred: Option<(usize, Vec<u8>)>,
+}
+
+type SeekFn<Param> = fn(&<Param as IoAt>::Handle, &mut Param, &Param) -> io::Result<()>;
+
+struct FileInner<Param: IoAt> {
+    handle: Param::Handle,
+    pos: Param,
+    read_ops: VecDeque<(Param, ReadOp)>,
+    write_ops: VecDeque<(Param, WriteOp)>,
     tmp_buf: Vec<u8>,
+    read: fn(&Param::Handle, &mut [u8]) -> io::Result<usize>,
+    write: fn(&Param::Handle, &[u8]) -> io::Result<usize>,
+    seek: Option<SeekFn<Param>>,
 }
 
-impl From<File> for FileInner {
-    fn from(file: File) -> Self {
+impl<Param: IoAt> Source for FileInner<Param> {
+    // Required methods
+    fn register(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
+        registry.register(&mut SourceFd(&self.handle.as_raw()), token, interests)
+    }
+    fn reregister(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
+        registry.reregister(&mut SourceFd(&self.handle.as_raw()), token, interests)
+    }
+    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
+        registry.deregister(&mut SourceFd(&self.handle.as_raw()))
+    }
+}
+
+impl From<File> for FileInner<u64> {
+    fn from(handle: File) -> Self {
+        fn read(mut file: &File, buf: &mut [u8]) -> io::Result<usize> {
+            file.read(buf)
+        }
+
+        fn write(mut file: &File, buf: &[u8]) -> io::Result<usize> {
+            file.write(buf)
+        }
+
+        fn seek(file: &File, cur_pos: &mut u64, new_pos: &u64) -> io::Result<()> {
+            if cur_pos == new_pos {
+                Ok(())
+            } else {
+                match (&mut &*file).seek(SeekFrom::Start(*new_pos)) {
+                    Ok(p) if p == *new_pos => {
+                        *cur_pos = *new_pos;
+                        Ok(())
+                    }
+                    Ok(_) => Err(std::io::ErrorKind::Other.into()),
+                    Err(e) => Err(e),
+                }
+            }
+        }
+
         Self {
-            file,
+            handle,
             pos: 0,
-            ops: Default::default(),
+            read_ops: Default::default(),
+            write_ops: Default::default(),
             tmp_buf: vec![],
+            read,
+            write,
+            seek: Some(seek),
         }
     }
 }
 
-impl FileInner {
-    fn do_ops(&mut self) -> bool {
-        while let Some((pos, op)) = self.ops.pop_front() {
-            if self.pos != pos {
-                match self.file.seek(SeekFrom::Start(pos)) {
-                    Ok(p) if p == pos => {
-                        self.pos = p;
-                    }
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                        self.ops.push_front((pos, op));
-                        return true;
-                    }
-                    v => {
-                        let err = if let Err(e) = v {
-                            io_err(e.kind().into())
-                        } else {
-                            io_err(State::Other)
-                        };
+impl<T: StreamHandleConv> From<T> for FileInner<NoPos> {
+    fn from(stream: T) -> Self {
+        fn read<T: StreamHandleConv>(
+            stream: &OwnedStreamHandle,
+            buf: &mut [u8],
+        ) -> io::Result<usize> {
+            let mut stream = unsafe { StreamBorrow::<T>::get(stream) };
+            stream.read(buf)
+        }
 
-                        match op {
-                            Operation::Read(Ok(pkt)) => pkt.error(err),
-                            Operation::Read(Err(pkt)) => pkt.error(err),
-                            Operation::Write(Ok(pkt), _) => pkt.error(err),
-                            Operation::Write(Err(pkt), _) => pkt.error(err),
+        fn write<T: StreamHandleConv>(stream: &OwnedStreamHandle, buf: &[u8]) -> io::Result<usize> {
+            let mut stream = unsafe { StreamBorrow::<T>::get(stream) };
+            stream.write(buf)
+        }
+
+        let handle = stream.into_owned();
+
+        Self {
+            handle,
+            pos: NoPos::new(),
+            read_ops: Default::default(),
+            write_ops: Default::default(),
+            tmp_buf: vec![],
+            read: read::<T>,
+            write: write::<T>,
+            seek: None,
+        }
+    }
+}
+
+const KEYS: usize = 2;
+
+trait IoAt: Sized + Clone {
+    type Handle: RawHandleConv<RawHandle = RawFd>;
+    const KEY_IDX: usize;
+
+    fn our_key(key: usize) -> bool {
+        key % KEYS == Self::KEY_IDX
+    }
+
+    fn add_len(&mut self, len: usize);
+    fn get_slab_registry(mio: &mut MioState) -> (&mut Slab<FileInner<Self>>, &Registry);
+    fn map_key(raw_key: usize) -> usize {
+        raw_key * KEYS + Self::KEY_IDX
+    }
+    fn slab_get(mio: &mut MioState, key: usize) -> Option<&mut FileInner<Self>> {
+        if !Self::our_key(key) {
+            None
+        } else {
+            Self::slab_get_unchecked(mio, key)
+        }
+    }
+    fn slab_get_unchecked(mio: &mut MioState, key: usize) -> Option<&mut FileInner<Self>>;
+    fn slab_remove(mio: &mut MioState, key: usize) -> FileInner<Self>;
+}
+
+impl IoAt for u64 {
+    type Handle = File;
+
+    const KEY_IDX: usize = 0;
+
+    fn add_len(&mut self, len: usize) {
+        *self += len as u64;
+    }
+
+    fn get_slab_registry(mio: &mut MioState) -> (&mut Slab<FileInner<Self>>, &Registry) {
+        (&mut mio.files, mio.poll.registry())
+    }
+
+    fn slab_get_unchecked(mio: &mut MioState, key: usize) -> Option<&mut FileInner<Self>> {
+        mio.files.get_mut((key - Self::KEY_IDX) / KEYS)
+    }
+
+    fn slab_remove(mio: &mut MioState, key: usize) -> FileInner<Self> {
+        mio.files.remove((key - Self::KEY_IDX) / KEYS)
+    }
+}
+
+impl IoAt for NoPos {
+    type Handle = OwnedStreamHandle;
+
+    const KEY_IDX: usize = 1;
+
+    fn add_len(&mut self, _: usize) {}
+
+    fn get_slab_registry(mio: &mut MioState) -> (&mut Slab<FileInner<Self>>, &Registry) {
+        (&mut mio.streams, mio.poll.registry())
+    }
+
+    fn slab_get_unchecked(mio: &mut MioState, key: usize) -> Option<&mut FileInner<Self>> {
+        mio.streams.get_mut((key - Self::KEY_IDX) / KEYS)
+    }
+
+    fn slab_remove(mio: &mut MioState, key: usize) -> FileInner<Self> {
+        mio.streams.remove((key - Self::KEY_IDX) / KEYS)
+    }
+}
+
+impl<Param: IoAt> FileInner<Param> {
+    fn do_ops(&mut self, read: bool, write: bool) {
+        log::trace!(
+            "Do ops handle={:?} read={read} write={write} (to read={} to write={})",
+            self.handle.as_raw(),
+            self.read_ops.len(),
+            self.write_ops.len()
+        );
+        if read {
+            'outer: while let Some((pos, op)) = self.read_ops.pop_front() {
+                if let Some(seek) = self.seek {
+                    match seek(&self.handle, &mut self.pos, &pos) {
+                        Ok(()) => (),
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                            self.read_ops.push_front((pos, op));
+                            break 'outer;
                         }
-                        continue;
+                        Err(e) => {
+                            let err = io_err(e.kind().into());
+
+                            match op.pkt {
+                                Ok(pkt) => pkt.error(err),
+                                Err(pkt) => pkt.error(err),
+                            }
+                            continue;
+                        }
                     }
                 }
-            }
 
-            match op {
-                Operation::Read(mut pkt) => loop {
+                let ReadOp { mut pkt } = op;
+
+                loop {
                     let len = pkt.len();
 
                     let slice = match &mut pkt {
@@ -99,9 +255,10 @@ impl FileInner {
                         }
                     };
 
-                    match self.file.read(slice) {
+                    match (self.read)(&self.handle, slice) {
                         Ok(l) => {
-                            self.pos += l as u64;
+                            log::trace!("Read {l}/{}", slice.len());
+                            self.pos.add_len(l);
                             if l == len {
                                 if let Err(pkt) = pkt {
                                     unsafe { pkt.transfer_data(self.tmp_buf.as_mut_ptr().cast()) };
@@ -119,17 +276,47 @@ impl FileInner {
                             }
                         }
                         Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                            self.ops.push_front((self.pos, Operation::Read(pkt)));
-                            return true;
+                            log::trace!("Would Block");
+                            self.read_ops.push_front((self.pos.clone(), ReadOp { pkt }));
+                            break 'outer;
                         }
                         Err(e) => {
+                            log::trace!("Error {e}");
                             pkt.error(io_err(e.kind().into()));
                             break;
                         }
                     }
-                },
+                }
+            }
+        }
 
-                Operation::Write(mut pkt, mut transferred) => loop {
+        if write {
+            'outer: while let Some((pos, op)) = self.write_ops.pop_front() {
+                if let Some(seek) = self.seek {
+                    match seek(&self.handle, &mut self.pos, &pos) {
+                        Ok(()) => (),
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                            self.write_ops.push_front((pos, op));
+                            break 'outer;
+                        }
+                        Err(e) => {
+                            let err = io_err(e.kind().into());
+
+                            match op.pkt {
+                                Ok(pkt) => pkt.error(err),
+                                Err(pkt) => pkt.error(err),
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                let WriteOp {
+                    mut pkt,
+                    mut transferred,
+                } = op;
+
+                loop {
                     let len = pkt.len();
 
                     let slice = match &mut pkt {
@@ -143,9 +330,10 @@ impl FileInner {
                         }
                     };
 
-                    match self.file.write(slice) {
+                    match (self.write)(&self.handle, slice) {
                         Ok(l) => {
-                            self.pos += l as u64;
+                            log::trace!("Written {l}/{}", slice.len());
+                            self.pos.add_len(l);
                             if let Some((pos, _)) = &mut transferred {
                                 *pos += l;
                             }
@@ -159,31 +347,34 @@ impl FileInner {
                             }
                         }
                         Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                            self.ops
-                                .push_front((self.pos, Operation::Write(pkt, transferred)));
-                            return true;
+                            log::trace!("WouldBlock");
+                            self.write_ops
+                                .push_front((self.pos.clone(), WriteOp { pkt, transferred }));
+                            break 'outer;
                         }
                         Err(e) => {
+                            log::trace!("Error {e}");
                             pkt.error(io_err(e.kind().into()));
                             break;
                         }
                     }
-                },
+                }
             }
         }
-
-        false
     }
 }
 
-trait IntoOp: PacketPerms {
-    fn into_op(alloced: MaybeAlloced<'static, Self>) -> Operation;
+trait IntoOp<Param: IoAt>: PacketPerms {
+    fn push_op(file: &mut FileInner<Param>, pos: Param, alloced: MaybeAlloced<'static, Self>);
 }
 
-impl IntoOp for RdPerm {
-    fn into_op(alloced: MaybeAlloced<'static, Self>) -> Operation {
-        match alloced {
-            Ok(pkt) => Operation::Write(Ok(pkt), None),
+impl<Param: IoAt> IntoOp<Param> for RdPerm {
+    fn push_op(file: &mut FileInner<Param>, pos: Param, alloced: MaybeAlloced<'static, Self>) {
+        let op = match alloced {
+            Ok(pkt) => WriteOp {
+                pkt: Ok(pkt),
+                transferred: None,
+            },
             Err(pkt) => {
                 let mut new_trans: Vec<MaybeUninit<u8>> = Vec::with_capacity(pkt.len());
                 unsafe { new_trans.set_len(pkt.len()) };
@@ -191,25 +382,39 @@ impl IntoOp for RdPerm {
                 let transferred = unsafe { pkt.transfer_data(new_trans.as_mut_ptr() as *mut ()) };
                 // SAFETY: buffer has now been initialized, it is safe to transmute it into [u8].
                 let new_trans = unsafe { core::mem::transmute(new_trans) };
-                Operation::Write(Err(transferred), Some((0, new_trans)))
+                WriteOp {
+                    pkt: Err(transferred),
+                    transferred: Some((0, new_trans)),
+                }
             }
+        };
+
+        file.write_ops.push_back((pos, op));
+
+        // If we haven't got any other ops enqueued, then trigger processing!
+        if file.write_ops.len() < 2 {
+            file.do_ops(false, true);
         }
     }
 }
 
-impl IntoOp for WrPerm {
-    fn into_op(alloced: MaybeAlloced<'static, Self>) -> Operation {
-        Operation::Read(alloced)
+impl<Param: IoAt> IntoOp<Param> for WrPerm {
+    fn push_op(file: &mut FileInner<Param>, pos: Param, pkt: MaybeAlloced<'static, Self>) {
+        file.read_ops.push_back((pos, ReadOp { pkt }));
+        // If we haven't got any other ops enqueued, then trigger processing!
+        if file.read_ops.len() < 2 {
+            file.do_ops(true, false);
+        }
     }
 }
 
-struct IoOpsHandle<Perms: IntoOp> {
-    handle: PacketIoHandle<'static, Perms, u64>,
+struct IoOpsHandle<Perms: IntoOp<Param>, Param: IoAt> {
+    handle: PacketIoHandle<'static, Perms, Param>,
     key: usize,
     state: BaseArc<Mutex<MioState>>,
 }
 
-impl<Perms: IntoOp> IoOpsHandle<Perms> {
+impl<Perms: IntoOp<Param>, Param: IoAt> IoOpsHandle<Perms, Param> {
     fn new(key: usize, state: BaseArc<Mutex<MioState>>) -> Self {
         Self {
             handle: PacketIoHandle::new::<Self>(),
@@ -219,36 +424,34 @@ impl<Perms: IntoOp> IoOpsHandle<Perms> {
     }
 }
 
-impl<Perms: IntoOp> AsRef<PacketIoHandle<'static, Perms, u64>> for IoOpsHandle<Perms> {
-    fn as_ref(&self) -> &PacketIoHandle<'static, Perms, u64> {
+impl<Perms: IntoOp<Param>, Param: IoAt> AsRef<PacketIoHandle<'static, Perms, Param>>
+    for IoOpsHandle<Perms, Param>
+{
+    fn as_ref(&self) -> &PacketIoHandle<'static, Perms, Param> {
         &self.handle
     }
 }
 
-impl<Perms: IntoOp> PacketIoHandleable<'static, Perms, u64> for IoOpsHandle<Perms> {
-    extern "C" fn send_input(&self, pos: u64, packet: BoundPacket<'static, Perms>) {
+impl<Perms: IntoOp<Param>, Param: IoAt> PacketIoHandleable<'static, Perms, Param>
+    for IoOpsHandle<Perms, Param>
+{
+    extern "C" fn send_input(&self, pos: Param, packet: BoundPacket<'static, Perms>) {
         let mut state = self.state.lock();
 
-        let file = state.files.get_mut(self.key).unwrap();
+        let file = Param::slab_get(&mut state, self.key).unwrap();
 
-        file.ops
-            .push_back((pos, Perms::into_op(packet.try_alloc())));
-
-        // If we haven't got any other ops enqueued, then trigger processing!
-        if file.ops.len() < 2 {
-            file.do_ops();
-        }
+        Perms::push_op(file, pos, packet.try_alloc());
     }
 }
 
-pub struct FileWrapper {
+struct IoWrapper<Param: IoAt> {
     key: usize,
     state: BaseArc<Mutex<MioState>>,
-    read_stream: BaseArc<PacketStream<'static, WrPerm, u64>>,
-    write_stream: BaseArc<PacketStream<'static, RdPerm, u64>>,
+    read_stream: BaseArc<PacketStream<'static, WrPerm, Param>>,
+    write_stream: BaseArc<PacketStream<'static, RdPerm, Param>>,
 }
 
-impl FileWrapper {
+impl<Param: IoAt> IoWrapper<Param> {
     fn new(key: usize, state: BaseArc<Mutex<MioState>>) -> Self {
         let write_io = BaseArc::new(IoOpsHandle::new(key, state.clone()));
 
@@ -271,34 +474,55 @@ impl FileWrapper {
     }
 }
 
-impl Drop for FileWrapper {
+impl<Param: IoAt> Drop for IoWrapper<Param> {
     fn drop(&mut self) {
         let mut state = self.state.lock();
-        let file = state.files.remove(self.key);
-
-        let fd = file.file.as_raw_fd();
-        let mut fd = SourceFd(&fd);
-
+        let mut file = Param::slab_remove(&mut state, self.key);
         // TODO: what to do on error?
-        let _ = state.poll.registry().deregister(&mut fd);
+        let _ = state.poll.registry().deregister(&mut file);
     }
 }
 
-impl PacketIo<RdPerm, u64> for FileWrapper {
-    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, RdPerm, u64>> {
+impl<Param: IoAt> PacketIo<RdPerm, Param> for IoWrapper<Param> {
+    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, RdPerm, Param>> {
         Some(self.write_stream.new_packet_id())
     }
 }
 
-impl PacketIo<WrPerm, u64> for FileWrapper {
-    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, WrPerm, u64>> {
+impl<Param: IoAt> PacketIo<WrPerm, Param> for IoWrapper<Param> {
+    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, WrPerm, Param>> {
         Some(self.read_stream.new_packet_id())
+    }
+}
+
+impl PacketIo<RdPerm, u64> for FileWrapper {
+    fn try_new_id<'a>(&'a self, w: &mut FastCWaker) -> Option<PacketId<'a, RdPerm, u64>> {
+        self.0.try_new_id(w)
+    }
+}
+
+impl PacketIo<WrPerm, u64> for FileWrapper {
+    fn try_new_id<'a>(&'a self, cx: &mut FastCWaker) -> Option<PacketId<'a, WrPerm, u64>> {
+        self.0.try_new_id(cx)
+    }
+}
+
+impl PacketIo<RdPerm, NoPos> for StreamWrapper {
+    fn try_new_id<'a>(&'a self, w: &mut FastCWaker) -> Option<PacketId<'a, RdPerm, NoPos>> {
+        self.0.try_new_id(w)
+    }
+}
+
+impl PacketIo<WrPerm, NoPos> for StreamWrapper {
+    fn try_new_id<'a>(&'a self, cx: &mut FastCWaker) -> Option<PacketId<'a, WrPerm, NoPos>> {
+        self.0.try_new_id(cx)
     }
 }
 
 struct MioState {
     poll: mio::Poll,
-    files: Slab<FileInner>,
+    files: Slab<FileInner<u64>>,
+    streams: Slab<FileInner<NoPos>>,
 }
 
 impl MioState {
@@ -306,6 +530,7 @@ impl MioState {
         Ok(Self {
             poll: mio::Poll::new()?,
             files: Default::default(),
+            streams: Default::default(),
         })
     }
 }
@@ -357,15 +582,30 @@ impl NativeFs {
                         for event in events.iter() {
                             let key = event.token().0;
 
-                            // This will fail with usize::MAX key
-                            if let Some(file) = state.files.get_mut(key) {
-                                file.do_ops();
-                            } else {
+                            log::trace!("Key: {key:x}");
+
+                            // These will fail with usize::MAX key
+                            if key == usize::MAX {
                                 observed_blocking = true;
+                            } else if let Some(file) = u64::slab_get(&mut state, key) {
+                                log::trace!(
+                                    "readable={} writeable={}",
+                                    event.is_readable(),
+                                    event.is_writable()
+                                );
+                                file.do_ops(event.is_readable(), event.is_writable());
+                            } else if let Some(stream) = NoPos::slab_get(&mut state, key) {
+                                log::trace!(
+                                    "readable={} writeable={}",
+                                    event.is_readable(),
+                                    event.is_writable()
+                                );
+                                stream.do_ops(event.is_readable(), event.is_writable());
                             }
                         }
 
                         if observed_blocking {
+                            log::trace!("Observe block");
                             // Drain the waker
                             loop {
                                 let mut buf = [0u8; 64];
@@ -417,23 +657,26 @@ impl IoBackend for NativeFs {
     }
 }
 
+pub struct FileWrapper(IoWrapper<u64>);
+pub struct StreamWrapper(IoWrapper<NoPos>);
+
 impl NativeFs {
-    pub fn register_file(&self, file: File) -> FileWrapper {
-        let fd = file.as_raw_fd();
-
-        set_nonblock(fd).unwrap();
-
-        let mut fd = SourceFd(&fd);
-
+    fn register_io<Param: IoAt, T: Into<FileInner<Param>>>(&self, file: T) -> IoWrapper<Param> {
         let mut state = self.state.lock();
-        let key = state.files.insert(file.into());
+        let (slab, registry) = Param::get_slab_registry(&mut state);
+        let entry = slab.vacant_entry();
+        let key = Param::map_key(entry.key());
+        let mut file = <T as Into<FileInner<_>>>::into(file);
+
+        log::trace!(
+            "Register handle={:?} self={:?} state={:?}: key={key}",
+            file.handle.as_raw(),
+            self as *const _,
+            self.state.as_ptr()
+        );
 
         // TODO: handle errors
-        match state
-            .poll
-            .registry()
-            .register(&mut fd, Token(key), RW_INTERESTS)
-        {
+        match registry.register(&mut file, Token(key), RW_INTERESTS) {
             // EPERM using epoll means file descriptor is always ready.
             // However, this also comes with a caveat that even though the file always shows up as
             // ready, it does not necessarily work in non-blocking mode.
@@ -443,7 +686,24 @@ impl NativeFs {
             Ok(_) => (),
         }
 
-        FileWrapper::new(key, self.state.clone())
+        entry.insert(file);
+
+        IoWrapper::new(key, self.state.clone())
+    }
+
+    pub fn register_file(&self, file: File) -> FileWrapper {
+        let fd = file.as_raw_fd();
+        set_nonblock(fd).unwrap();
+
+        FileWrapper(self.register_io(file))
+    }
+
+    pub fn register_stream(&self, stream: impl StreamHandleConv) -> StreamWrapper {
+        // TODO: make this portable
+        let fd = stream.as_raw();
+        set_nonblock(fd).unwrap();
+
+        StreamWrapper(self.register_io(stream))
     }
 }
 

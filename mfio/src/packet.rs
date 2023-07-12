@@ -182,6 +182,25 @@ pub trait PacketIo<Perms: PacketPerms, Param>: Sized {
     }
 }
 
+pub trait StreamIo<Perms: PacketPerms>: PacketIo<Perms, NoPos> {
+    fn stream_io<'a>(
+        &'a self,
+        packet: impl Into<Packet<'a, Perms>>,
+    ) -> IoFut<'a, Self, Perms, NoPos> {
+        self.io(NoPos::new(), packet)
+    }
+}
+
+#[repr(transparent)]
+#[derive(Clone)]
+pub struct NoPos(core::marker::PhantomData<()>);
+
+impl NoPos {
+    pub const fn new() -> Self {
+        Self(core::marker::PhantomData)
+    }
+}
+
 pub enum IoFut<'a, T, Perms: PacketPerms, Param> {
     NewId(&'a T, Param, Packet<'a, Perms>),
     InProgress(PacketId<'a, Perms, Param>),

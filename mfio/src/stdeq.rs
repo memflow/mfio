@@ -3,7 +3,7 @@
 use crate as mfio;
 use crate::packet::*;
 use crate::traits::*;
-use crate::util::UsizeMath;
+use crate::util::PosShift;
 use cglue::task::FastCWaker;
 use core::future::Future;
 use core::marker::PhantomData;
@@ -26,7 +26,12 @@ pub trait StreamPos<Param> {
     }
 }
 
-pub trait AsyncRead<Param: 'static>: IoRead<Param> + StreamPos<Param> {
+pub trait AsyncRead<Param: 'static>: IoRead<Param> {
+    fn read<'a>(&'a self, buf: &'a mut [u8]) -> AsyncIoFut<'a, Self, Write, Param>;
+    fn read_to_end<'a>(&'a self, buf: &'a mut Vec<u8>) -> StdReadToEndFut<'a, Self, Param>;
+}
+
+impl<T: IoRead<Param> + StreamPos<Param>, Param: 'static + Copy> AsyncRead<Param> for T {
     fn read<'a>(&'a self, buf: &'a mut [u8]) -> AsyncIoFut<'a, Self, Write, Param> {
         AsyncIoFut {
             io: self,
@@ -45,9 +50,30 @@ pub trait AsyncRead<Param: 'static>: IoRead<Param> + StreamPos<Param> {
     }
 }
 
-impl<T: IoRead<Param> + StreamPos<Param>, Param: 'static> AsyncRead<Param> for T {}
+impl<T: IoRead<NoPos>> AsyncRead<NoPos> for T {
+    fn read<'a>(&'a self, buf: &'a mut [u8]) -> AsyncIoFut<'a, Self, Write, NoPos> {
+        AsyncIoFut {
+            io: self,
+            pos: NoPos::new(),
+            len: buf.len(),
+            state: AsyncIoFutState::NewId(buf.into(), self.new_id()),
+            _phantom: PhantomData,
+        }
+    }
 
-pub trait AsyncWrite<Param>: IoWrite<Param> + StreamPos<Param> {
+    fn read_to_end<'a>(&'a self, buf: &'a mut Vec<u8>) -> StdReadToEndFut<'a, Self, NoPos> {
+        StdReadToEndFut {
+            io: self,
+            fut: <Self as IoRead<NoPos>>::read_to_end(self, NoPos::new(), buf),
+        }
+    }
+}
+
+pub trait AsyncWrite<Param>: IoWrite<Param> {
+    fn write<'a>(&'a self, buf: &'a [u8]) -> AsyncIoFut<'a, Self, Read, Param>;
+}
+
+impl<T: IoWrite<Param> + StreamPos<Param>, Param: Copy> AsyncWrite<Param> for T {
     fn write<'a>(&'a self, buf: &'a [u8]) -> AsyncIoFut<'a, Self, Read, Param> {
         AsyncIoFut {
             io: self,
@@ -59,7 +85,17 @@ pub trait AsyncWrite<Param>: IoWrite<Param> + StreamPos<Param> {
     }
 }
 
-impl<T: IoWrite<Param> + StreamPos<Param>, Param> AsyncWrite<Param> for T {}
+impl<T: IoWrite<NoPos>> AsyncWrite<NoPos> for T {
+    fn write<'a>(&'a self, buf: &'a [u8]) -> AsyncIoFut<'a, Self, Read, NoPos> {
+        AsyncIoFut {
+            io: self,
+            pos: NoPos::new(),
+            len: buf.len(),
+            state: AsyncIoFutState::NewId(buf.into(), self.new_id()),
+            _phantom: PhantomData,
+        }
+    }
+}
 
 pub struct AsyncIoFut<'a, Io: PacketIo<Perms, Param>, Perms: PacketPerms, Param> {
     io: *const Io,
@@ -79,12 +115,8 @@ pub enum AsyncIoFutState<'a, Io: PacketIo<Perms, Param>, Perms: PacketPerms, Par
     Finished,
 }
 
-impl<
-        'a,
-        Io: PacketIo<Perms, Param> + StreamPos<Param>,
-        Perms: PacketPerms,
-        Param: Copy + UsizeMath,
-    > Future for AsyncIoFut<'a, Io, Perms, Param>
+impl<'a, Io: PacketIo<Perms, Param>, Perms: PacketPerms, Param: PosShift<Io>> Future
+    for AsyncIoFut<'a, Io, Perms, Param>
 {
     type Output = io::Result<usize>;
 
@@ -106,7 +138,8 @@ impl<
                                 AsyncIoFutState::NewId(packet, _),
                                 AsyncIoFutState::Read(_, _, id),
                             ) => {
-                                unsafe { Pin::new_unchecked(id) }.send_io(this.pos, packet);
+                                unsafe { Pin::new_unchecked(id) }
+                                    .send_io(this.pos.copy_pos(), packet);
                             }
                             _ => unreachable!(),
                         }
@@ -134,16 +167,14 @@ impl<
                                 }
                             }
 
-                            this.pos.add_assign(out);
-
                             // SAFETY: there are no more shared references to io.
-                            unsafe {
-                                (*this.io).set_pos(this.pos);
-                            }
+                            this.pos.add_pos(out, unsafe { &*this.io });
 
                             break Poll::Ready(Ok(out));
                         }
-                        _ => break Poll::Pending,
+                        _ => {
+                            break Poll::Pending;
+                        }
                     }
                 }
                 AsyncIoFutState::Finished => unreachable!(),
@@ -157,7 +188,7 @@ pub struct StdReadToEndFut<'a, Io: PacketIo<Write, Param>, Param> {
     fut: ReadToEndFut<'a, Io, Param>,
 }
 
-impl<'a, Io: PacketIo<Write, Param> + StreamPos<Param>, Param: Copy + UsizeMath> Future
+impl<'a, Io: PacketIo<Write, Param>, Param: PosShift<Io>> Future
     for StdReadToEndFut<'a, Io, Param>
 {
     type Output = io::Result<()>;
@@ -167,7 +198,7 @@ impl<'a, Io: PacketIo<Write, Param> + StreamPos<Param>, Param: Copy + UsizeMath>
 
         match unsafe { Pin::new_unchecked(&mut this.fut) }.poll(cx) {
             Poll::Ready(Some(r)) => {
-                this.io.update_pos(|pos| pos.add(r));
+                Param::add_io_pos(this.io, r);
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(None) => Poll::Ready(Err(io::ErrorKind::Other.into())),
@@ -192,7 +223,7 @@ macro_rules! stdio_impl {
                         Ok(val)
                     }
                     std::io::SeekFrom::End(val) => {
-                        if let Some(end) = self.end() {
+                        if let Some(end) = $crate::stdeq::StreamPos::<u64>::end(self) {
                             let pos = if val < 0 {
                                 end.checked_sub((-val) as u64)
                                     .ok_or_else(|| std::io::ErrorKind::InvalidInput)?
@@ -206,7 +237,7 @@ macro_rules! stdio_impl {
                         }
                     }
                     std::io::SeekFrom::Current(val) => {
-                        let pos = self.get_pos();
+                        let pos = $crate::stdeq::StreamPos::<u64>::get_pos(self);
                         let pos = if val < 0 {
                             pos.checked_sub((-val) as u64)
                                 .ok_or_else(|| std::io::ErrorKind::InvalidInput)?
@@ -298,3 +329,32 @@ impl<T, Param: Copy> StreamPos<Param> for Seekable<T, Param> {
 }
 
 stdio_impl!(<T> Seekable<T, u64> @);
+
+#[derive(SyncIoWrite, SyncIoRead)]
+pub struct FakeSeek<T> {
+    handle: T,
+}
+
+impl<T> From<T> for FakeSeek<T> {
+    fn from(handle: T) -> Self {
+        Self { handle }
+    }
+}
+
+impl<T: PacketIo<Perms, Param>, Perms: PacketPerms, Param> PacketIo<Perms, Param> for FakeSeek<T> {
+    fn try_new_id<'a>(&'a self, context: &mut FastCWaker) -> Option<PacketId<'a, Perms, Param>> {
+        self.handle.try_new_id(context)
+    }
+}
+
+impl<T, Param: Default + core::ops::Not<Output = Param>> StreamPos<Param> for FakeSeek<T> {
+    fn get_pos(&self) -> Param {
+        !Param::default()
+    }
+
+    fn set_pos(&self, _: Param) {}
+
+    fn update_pos<F: FnOnce(Param) -> Param>(&self, _: F) {}
+}
+
+stdio_impl!(<T> FakeSeek<T> @);

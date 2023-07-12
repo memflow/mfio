@@ -1,3 +1,4 @@
+use crate::packet::NoPos;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Waker;
@@ -83,4 +84,43 @@ impl UsizeMath for u64 {
     fn add(self, val: usize) -> Self {
         self + val as u64
     }
+}
+
+impl UsizeMath for NoPos {
+    fn add_assign(&mut self, _: usize) {}
+
+    fn add(self, _: usize) -> Self {
+        self
+    }
+}
+
+// This trait unifies implementations on NoPos (streams) with seekable I/O
+pub(crate) trait PosShift<Io>: Sized + UsizeMath {
+    fn copy_pos(&self) -> Self;
+    fn add_pos(&mut self, out: usize, io: &Io);
+    fn add_io_pos(io: &Io, out: usize);
+}
+
+impl<Param: Copy + UsizeMath, Io: crate::stdeq::StreamPos<Param>> PosShift<Io> for Param {
+    fn copy_pos(&self) -> Self {
+        *self
+    }
+
+    fn add_pos(&mut self, out: usize, io: &Io) {
+        self.add_assign(out);
+        io.set_pos(*self);
+    }
+
+    fn add_io_pos(io: &Io, out: usize) {
+        io.update_pos(|pos| pos.add(out))
+    }
+}
+
+impl<Io> PosShift<Io> for NoPos {
+    fn copy_pos(&self) -> Self {
+        Self::new()
+    }
+
+    fn add_pos(&mut self, _: usize, _: &Io) {}
+    fn add_io_pos(_: &Io, _: usize) {}
 }

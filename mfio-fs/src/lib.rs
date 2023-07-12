@@ -1,8 +1,9 @@
 use core::future::Future;
 use core::task::Waker;
+use impls::StreamHandleConv;
 use mfio::backend::*;
 use mfio::error::{Code, Error, Location, Result as MfioResult, State, Subject};
-use mfio::packet::{FastCWaker, PacketId, PacketIo, Read, Write};
+use mfio::packet::{FastCWaker, NoPos, PacketId, PacketIo, Read, Write};
 use mfio::stdeq::{AsyncRead, AsyncWrite, Seekable};
 use std::fs;
 use std::path::Path;
@@ -57,6 +58,7 @@ impl OpenOptions {
 
 pub trait Fs: IoBackend {
     type FileHandle: FileHandle;
+    type StreamHandle: StreamHandle;
     type OpenFuture<'a>: Future<Output = MfioResult<Self::FileHandle>> + 'a
     where
         Self: 'a;
@@ -66,6 +68,9 @@ pub trait Fs: IoBackend {
 
 pub trait FileHandle: AsyncRead<u64> + AsyncWrite<u64> {}
 impl<T: AsyncRead<u64> + AsyncWrite<u64>> FileHandle for T {}
+
+pub trait StreamHandle: AsyncRead<NoPos> + AsyncWrite<NoPos> {}
+impl<T: AsyncRead<NoPos> + AsyncWrite<NoPos>> StreamHandle for T {}
 
 macro_rules! fs_dispatch {
     ($($(#[cfg($meta:meta)])* $name:ident => $mod:ident),*$(,)?) => {
@@ -159,9 +164,16 @@ macro_rules! fs_dispatch {
         }
 
         impl NativeFs {
-            fn register_file(&self, file: std::fs::File) -> FileWrapper {
+            pub fn register_file(&self, file: std::fs::File) -> FileWrapper {
                 match self {
                     $($(#[cfg($meta)])* Self::$name(v) => FileWrapper::$name(v.register_file(file))),*
+                }
+            }
+
+            /// Registers a non-seekable I/O stream
+            pub fn register_stream(&self, stream: impl StreamHandleConv) -> StreamWrapper {
+                match self {
+                    $($(#[cfg($meta)])* Self::$name(v) => StreamWrapper::$name(v.register_stream(stream))),*
                 }
             }
 
@@ -290,6 +302,26 @@ macro_rules! fs_dispatch {
                 }
             }
         }
+
+        pub enum StreamWrapper {
+            $($(#[cfg($meta)])* $name(impls::$mod::StreamWrapper)),*
+        }
+
+        impl PacketIo<Write, NoPos> for StreamWrapper {
+            fn try_new_id<'a>(&'a self, context: &mut FastCWaker) -> Option<PacketId<'a, Write, NoPos>> {
+                match self {
+                    $($(#[cfg($meta)])* Self::$name(v) => v.try_new_id(context)),*
+                }
+            }
+        }
+
+        impl PacketIo<Read, NoPos> for StreamWrapper {
+            fn try_new_id<'a>(&'a self, context: &mut FastCWaker) -> Option<PacketId<'a, Read, NoPos>> {
+                match self {
+                    $($(#[cfg($meta)])* Self::$name(v) => v.try_new_id(context)),*
+                }
+            }
+        }
     }
 }
 
@@ -303,6 +335,7 @@ fs_dispatch! {
 
 impl Fs for NativeFs {
     type FileHandle = Seekable<FileWrapper, u64>;
+    type StreamHandle = StreamWrapper;
     type OpenFuture<'a> = core::future::Ready<MfioResult<Self::FileHandle>>;
 
     fn open(&self, path: &Path, options: OpenOptions) -> Self::OpenFuture<'_> {

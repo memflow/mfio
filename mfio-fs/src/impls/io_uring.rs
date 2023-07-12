@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::Read;
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use io_uring::{opcode, squeue::Entry, types::Fixed, IoUring, SubmissionQueue};
 use parking_lot::Mutex;
@@ -18,6 +18,7 @@ use mfio::backend::*;
 use mfio::packet::{FastCWaker, Read as RdPerm, Write as WrPerm, *};
 use mfio::tarc::BaseArc;
 
+use super::{RawHandleConv, StreamBorrow, StreamHandleConv};
 use crate::util::io_err;
 use mfio::error::State;
 
@@ -44,6 +45,22 @@ impl Drop for RawBox {
 enum Operation {
     Read(MaybeAlloced<'static, WrPerm>, RawBox),
     Write(AllocedOrTransferred<'static, RdPerm>, RawBox),
+}
+
+trait PosMap {
+    fn map_pos(self) -> u64;
+}
+
+impl PosMap for u64 {
+    fn map_pos(self) -> u64 {
+        self
+    }
+}
+
+impl PosMap for NoPos {
+    fn map_pos(self) -> u64 {
+        !0u64
+    }
 }
 
 trait IntoOp: PacketPerms {
@@ -103,13 +120,13 @@ impl IntoOp for WrPerm {
     }
 }
 
-struct IoOpsHandle<Perms: IntoOp> {
-    handle: PacketIoHandle<'static, Perms, u64>,
+struct IoOpsHandle<Perms: IntoOp, Param: PosMap> {
+    handle: PacketIoHandle<'static, Perms, Param>,
     key: usize,
     state: BaseArc<Mutex<IoUringState>>,
 }
 
-impl<Perms: IntoOp> IoOpsHandle<Perms> {
+impl<Perms: IntoOp, Param: PosMap> IoOpsHandle<Perms, Param> {
     fn new(key: usize, state: BaseArc<Mutex<IoUringState>>) -> Self {
         Self {
             handle: PacketIoHandle::new::<Self>(),
@@ -119,19 +136,23 @@ impl<Perms: IntoOp> IoOpsHandle<Perms> {
     }
 }
 
-impl<Perms: IntoOp> AsRef<PacketIoHandle<'static, Perms, u64>> for IoOpsHandle<Perms> {
-    fn as_ref(&self) -> &PacketIoHandle<'static, Perms, u64> {
+impl<Perms: IntoOp, Param: PosMap> AsRef<PacketIoHandle<'static, Perms, Param>>
+    for IoOpsHandle<Perms, Param>
+{
+    fn as_ref(&self) -> &PacketIoHandle<'static, Perms, Param> {
         &self.handle
     }
 }
 
-impl<Perms: IntoOp> PacketIoHandleable<'static, Perms, u64> for IoOpsHandle<Perms> {
-    extern "C" fn send_input(&self, pos: u64, packet: BoundPacket<'static, Perms>) {
+impl<Perms: IntoOp, Param: PosMap> PacketIoHandleable<'static, Perms, Param>
+    for IoOpsHandle<Perms, Param>
+{
+    extern "C" fn send_input(&self, pos: Param, packet: BoundPacket<'static, Perms>) {
         let mut state = self.state.lock();
         let state = &mut *state;
 
         // TODO: handle size limitations???
-        let (ring_entry, ops_entry) = Perms::into_op(self.key as _, pos, packet);
+        let (ring_entry, ops_entry) = Perms::into_op(self.key as _, pos.map_pos(), packet);
 
         state.all_ssub += 1;
 
@@ -150,15 +171,18 @@ impl<Perms: IntoOp> PacketIoHandleable<'static, Perms, u64> for IoOpsHandle<Perm
     }
 }
 
-pub struct FileWrapper {
+pub struct IoWrapper<Param> {
     key: usize,
     state: BaseArc<Mutex<IoUringState>>,
-    read_stream: BaseArc<PacketStream<'static, WrPerm, u64>>,
-    write_stream: BaseArc<PacketStream<'static, RdPerm, u64>>,
+    read_stream: BaseArc<PacketStream<'static, WrPerm, Param>>,
+    write_stream: BaseArc<PacketStream<'static, RdPerm, Param>>,
 }
 
-impl FileWrapper {
-    fn new(key: usize, state: BaseArc<Mutex<IoUringState>>) -> Self {
+impl<Param> IoWrapper<Param> {
+    fn new(key: usize, state: BaseArc<Mutex<IoUringState>>) -> Self
+    where
+        Param: PosMap,
+    {
         let write_io = BaseArc::new(IoOpsHandle::new(key, state.clone()));
 
         let write_stream = BaseArc::from(PacketStream {
@@ -180,7 +204,7 @@ impl FileWrapper {
     }
 }
 
-impl Drop for FileWrapper {
+impl<Param> Drop for IoWrapper<Param> {
     fn drop(&mut self) {
         let mut state = self.state.lock();
         let _ = state.files.remove(self.key);
@@ -193,14 +217,14 @@ impl Drop for FileWrapper {
     }
 }
 
-impl PacketIo<RdPerm, u64> for FileWrapper {
-    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, RdPerm, u64>> {
+impl<Param> PacketIo<RdPerm, Param> for IoWrapper<Param> {
+    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, RdPerm, Param>> {
         Some(self.write_stream.new_packet_id())
     }
 }
 
-impl PacketIo<WrPerm, u64> for FileWrapper {
-    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, WrPerm, u64>> {
+impl<Param> PacketIo<WrPerm, Param> for IoWrapper<Param> {
+    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, WrPerm, Param>> {
         Some(self.read_stream.new_packet_id())
     }
 }
@@ -208,7 +232,7 @@ impl PacketIo<WrPerm, u64> for FileWrapper {
 struct IoUringState {
     ring: IoUring,
     event_fd: File,
-    files: Slab<File>,
+    files: Slab<OwnedFd>,
     ops: Slab<Operation>,
     ring_capacity: usize,
     pending_ops: VecDeque<(Entry, Operation)>,
@@ -219,7 +243,8 @@ struct IoUringState {
 }
 
 impl IoUringState {
-    fn register_file(&mut self, file: File) -> usize {
+    fn register_fd(&mut self, file: impl RawHandleConv<OwnedHandle = OwnedFd>) -> usize {
+        let file = file.into_owned();
         let file_fd = file.as_raw_fd();
         let key = self.files.insert(file);
 
@@ -293,7 +318,7 @@ impl NativeFs {
         let wake_fd = eventfd(0, EfdFlags::all())?;
         set_nonblock(wake_fd)?;
         let wake_read = unsafe { File::from_raw_fd(wake_fd) };
-        let wake_key = state.register_file(wake_read);
+        let wake_key = state.register_fd(wake_read);
         let waker = FdWaker::from(wake_fd);
 
         let poll_event = opcode::PollAdd::new(
@@ -427,6 +452,7 @@ impl NativeFs {
 
                                 // Drain the waker
                                 let wake_read = state.files.get_mut(wake_key).unwrap();
+                                let mut wake_read = unsafe { StreamBorrow::<File>::get(wake_read) };
                                 loop {
                                     let mut buf = [0u8; 64];
                                     match wake_read.read(&mut buf) {
@@ -493,11 +519,20 @@ impl IoBackend for NativeFs {
     }
 }
 
+pub type FileWrapper = IoWrapper<u64>;
+pub type StreamWrapper = IoWrapper<NoPos>;
+
 impl NativeFs {
     pub fn register_file(&self, file: File) -> FileWrapper {
         let mut state = self.state.lock();
-        let key = state.register_file(file);
-        FileWrapper::new(key, self.state.clone())
+        let key = state.register_fd(file);
+        IoWrapper::new(key, self.state.clone())
+    }
+
+    pub fn register_stream(&self, stream: impl StreamHandleConv) -> StreamWrapper {
+        let mut state = self.state.lock();
+        let key = state.register_fd(stream);
+        IoWrapper::new(key, self.state.clone())
     }
 }
 

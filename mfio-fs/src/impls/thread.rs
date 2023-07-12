@@ -6,10 +6,18 @@ use core::future::pending;
 use core::mem::{ManuallyDrop, MaybeUninit};
 use core::task::Waker;
 
+use super::{OwnedStreamHandle, StreamBorrow, StreamHandleConv};
+
+use std::io;
 #[cfg(all(unix, not(miri)))]
 use std::os::unix::fs::FileExt;
 #[cfg(all(windows, not(miri)))]
 use std::os::windows::fs::FileExt;
+
+#[cfg(windows)]
+use std::os::windows::io::{
+    AsRawHandle, FromRawHandle, IntoRawHandle as IntoRaw, IntoRawSocket, OwnedHandle, OwnedSocked,
+};
 
 use mfio::backend::*;
 use mfio::packet::*;
@@ -18,18 +26,104 @@ use mfio::tarc::BaseArc;
 use crate::util::io_err;
 use mfio::error::State;
 
-#[cfg(miri)]
-type FileInner = std::sync::Mutex<File>;
-#[cfg(not(miri))]
-type FileInner = File;
-
-struct IoThreadHandle<Perms: PacketPerms> {
-    handle: PacketIoHandle<'static, Perms, u64>,
-    tx: Sender<(u64, BoundPacket<'static, Perms>)>,
+struct IoInner<Handle, Param> {
+    handle: Handle,
+    read_at: fn(&Handle, &mut [u8], Param) -> io::Result<usize>,
+    write_at: fn(&Handle, &[u8], Param) -> io::Result<usize>,
 }
 
-impl<Perms: PacketPerms> IoThreadHandle<Perms> {
-    fn new(tx: Sender<(u64, BoundPacket<'static, Perms>)>) -> Self {
+impl<Handle, Param> IoInner<Handle, Param> {
+    fn read_at(&self, buf: &mut [u8], pos: Param) -> io::Result<usize> {
+        (self.read_at)(&self.handle, buf, pos)
+    }
+
+    fn write_at(&self, buf: &[u8], pos: Param) -> io::Result<usize> {
+        (self.write_at)(&self.handle, buf, pos)
+    }
+}
+
+impl From<File> for IoInner<File, u64> {
+    fn from(handle: File) -> Self {
+        fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            #[cfg(miri)]
+            {
+                use io::{Read, Seek, SeekFrom};
+                (&*file).seek(SeekFrom::Start(offset))?;
+                return (&*file).read(buf);
+            }
+            #[cfg(not(miri))]
+            {
+                #[cfg(unix)]
+                return file.read_at(buf, offset);
+                #[cfg(windows)]
+                return file.seek_read(buf, offset);
+            }
+        }
+
+        fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
+            #[cfg(miri)]
+            {
+                use io::{Seek, SeekFrom, Write};
+                (&*file).seek(SeekFrom::Start(offset))?;
+                (&*file).write(buf)
+            }
+            #[cfg(not(miri))]
+            {
+                #[cfg(unix)]
+                return file.write_at(buf, offset);
+                #[cfg(windows)]
+                return file.seek_write(buf, offset);
+            }
+        }
+
+        Self {
+            handle,
+            read_at,
+            write_at,
+        }
+    }
+}
+
+impl<T: StreamHandleConv> From<T> for IoInner<OwnedStreamHandle, NoPos> {
+    fn from(stream: T) -> Self {
+        fn read_at<T: StreamHandleConv>(
+            stream: &OwnedStreamHandle,
+            buf: &mut [u8],
+            _: NoPos,
+        ) -> io::Result<usize> {
+            let mut stream = unsafe { StreamBorrow::<T>::get(stream) };
+            stream.read(buf)
+        }
+
+        fn write_at<T: StreamHandleConv>(
+            stream: &OwnedStreamHandle,
+            buf: &[u8],
+            _: NoPos,
+        ) -> io::Result<usize> {
+            log::debug!("Write {}", buf.len());
+            let mut stream = unsafe { StreamBorrow::<T>::get(stream) };
+            let ret = stream.write(buf);
+            log::debug!("Written");
+            ret
+        }
+
+        let handle = stream.into_owned();
+
+        Self {
+            handle,
+            read_at: read_at::<T>,
+            write_at: write_at::<T>,
+        }
+    }
+}
+
+struct IoThreadHandle<Perms: PacketPerms, Param> {
+    handle: PacketIoHandle<'static, Perms, Param>,
+    tx: Sender<(Param, BoundPacket<'static, Perms>)>,
+}
+
+impl<Perms: PacketPerms, Param> IoThreadHandle<Perms, Param> {
+    fn new(tx: Sender<(Param, BoundPacket<'static, Perms>)>) -> Self {
         Self {
             handle: PacketIoHandle::new::<Self>(),
             tx,
@@ -37,61 +131,31 @@ impl<Perms: PacketPerms> IoThreadHandle<Perms> {
     }
 }
 
-impl<Perms: PacketPerms> AsRef<PacketIoHandle<'static, Perms, u64>> for IoThreadHandle<Perms> {
-    fn as_ref(&self) -> &PacketIoHandle<'static, Perms, u64> {
+impl<Perms: PacketPerms, Param> AsRef<PacketIoHandle<'static, Perms, Param>>
+    for IoThreadHandle<Perms, Param>
+{
+    fn as_ref(&self) -> &PacketIoHandle<'static, Perms, Param> {
         &self.handle
     }
 }
 
-impl<Perms: PacketPerms> PacketIoHandleable<'static, Perms, u64> for IoThreadHandle<Perms> {
-    extern "C" fn send_input(&self, pos: u64, packet: BoundPacket<'static, Perms>) {
+impl<Perms: PacketPerms, Param> PacketIoHandleable<'static, Perms, Param>
+    for IoThreadHandle<Perms, Param>
+{
+    extern "C" fn send_input(&self, pos: Param, packet: BoundPacket<'static, Perms>) {
         self.tx.send((pos, packet)).unwrap();
     }
 }
 
-fn read_at(file: &FileInner, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
-    #[cfg(miri)]
-    {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut file = file.lock().unwrap();
-        file.seek(SeekFrom::Start(offset))?;
-        file.read(buf)
-    }
-    #[cfg(not(miri))]
-    {
-        #[cfg(unix)]
-        return file.read_at(buf, offset);
-        #[cfg(windows)]
-        return file.seek_read(buf, offset);
-    }
-}
-
-fn write_at(file: &FileInner, buf: &[u8], offset: u64) -> std::io::Result<usize> {
-    #[cfg(miri)]
-    {
-        use std::io::{Seek, SeekFrom, Write};
-        let mut file = file.lock().unwrap();
-        file.seek(SeekFrom::Start(offset))?;
-        file.write(buf)
-    }
-    #[cfg(not(miri))]
-    {
-        #[cfg(unix)]
-        return file.write_at(buf, offset);
-        #[cfg(windows)]
-        return file.seek_write(buf, offset);
-    }
-}
-
-pub struct FileWrapper {
-    _file: BaseArc<FileInner>,
-    read_stream: ManuallyDrop<BaseArc<PacketStream<'static, Write, u64>>>,
-    write_stream: ManuallyDrop<BaseArc<PacketStream<'static, Read, u64>>>,
+struct IoWrapper<Handle, Param> {
+    _file: BaseArc<IoInner<Handle, Param>>,
+    read_stream: ManuallyDrop<BaseArc<PacketStream<'static, Write, Param>>>,
+    write_stream: ManuallyDrop<BaseArc<PacketStream<'static, Read, Param>>>,
     read_thread: Option<JoinHandle<()>>,
     write_thread: Option<JoinHandle<()>>,
 }
 
-impl Drop for FileWrapper {
+impl<Handle, Param> Drop for IoWrapper<Handle, Param> {
     fn drop(&mut self) {
         unsafe {
             ManuallyDrop::drop(&mut self.read_stream);
@@ -102,17 +166,12 @@ impl Drop for FileWrapper {
     }
 }
 
-impl From<File> for FileWrapper {
-    fn from(file: File) -> Self {
-        #[allow(clippy::useless_conversion)]
-        Self::from(BaseArc::from(FileInner::from(file)))
-    }
-}
-
-impl From<BaseArc<FileInner>> for FileWrapper {
-    fn from(file: BaseArc<FileInner>) -> Self {
+impl<Handle: Send + Sync + 'static, Param: Send + 'static> From<BaseArc<IoInner<Handle, Param>>>
+    for IoWrapper<Handle, Param>
+{
+    fn from(file: BaseArc<IoInner<Handle, Param>>) -> Self {
         let (read_tx, read_rx) = mpsc::channel();
-        let read_io = BaseArc::new(IoThreadHandle::<Write>::new(read_tx));
+        let read_io = BaseArc::new(IoThreadHandle::<Write, Param>::new(read_tx));
 
         let read_thread = Some(thread::spawn({
             let file = file.clone();
@@ -128,7 +187,7 @@ impl From<BaseArc<FileInner>> for FileWrapper {
                             core::slice::from_raw_parts_mut(ptr as *mut u8, len)
                         };
 
-                        read_at(&file, buf, pos)
+                        file.read_at(buf, pos)
                     };
 
                     if !buf.is_empty() {
@@ -144,7 +203,7 @@ impl From<BaseArc<FileInner>> for FileWrapper {
                             Err(buf) => {
                                 // TODO: size limit the temp buffer.
                                 if tmp_buf.len() < buf.len() {
-                                    tmp_buf.reserve(tmp_buf.len() - buf.len());
+                                    tmp_buf.reserve(buf.len() - tmp_buf.len());
                                     // SAFETY: assume MaybeUninit<u8> is initialized,
                                     // as God intended :upside_down:
                                     unsafe { tmp_buf.set_len(tmp_buf.capacity()) }
@@ -179,7 +238,7 @@ impl From<BaseArc<FileInner>> for FileWrapper {
                         Ok(alloced) => {
                             // For some reason type inference loses itself
                             let alloced: ReadPacketObj = alloced;
-                            match write_at(&file, &alloced[..], pos) {
+                            match file.write_at(&alloced[..], pos) {
                                 Ok(written) if written < alloced.len() => {
                                     let (_, right) = alloced.split_at(written);
                                     right.error(io_err(State::Nop));
@@ -200,7 +259,7 @@ impl From<BaseArc<FileInner>> for FileWrapper {
                             let tmp_buf = unsafe {
                                 &*(&tmp_buf[..] as *const [MaybeUninit<u8>] as *const [u8])
                             };
-                            match write_at(&file, tmp_buf, pos) {
+                            match file.write_at(tmp_buf, pos) {
                                 Ok(written) if written < buf.len() => {
                                     let (_, right) = buf.split_at(written);
                                     right.error(io_err(State::Nop));
@@ -232,15 +291,39 @@ impl From<BaseArc<FileInner>> for FileWrapper {
     }
 }
 
-impl PacketIo<Read, u64> for FileWrapper {
-    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, Read, u64>> {
+impl<Handle, Param> PacketIo<Read, Param> for IoWrapper<Handle, Param> {
+    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, Read, Param>> {
         Some(self.write_stream.new_packet_id())
     }
 }
 
-impl PacketIo<Write, u64> for FileWrapper {
-    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, Write, u64>> {
+impl<Handle, Param> PacketIo<Write, Param> for IoWrapper<Handle, Param> {
+    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, Write, Param>> {
         Some(self.read_stream.new_packet_id())
+    }
+}
+
+impl PacketIo<Read, u64> for FileWrapper {
+    fn try_new_id<'a>(&'a self, w: &mut FastCWaker) -> Option<PacketId<'a, Read, u64>> {
+        self.0.try_new_id(w)
+    }
+}
+
+impl PacketIo<Write, u64> for FileWrapper {
+    fn try_new_id<'a>(&'a self, cx: &mut FastCWaker) -> Option<PacketId<'a, Write, u64>> {
+        self.0.try_new_id(cx)
+    }
+}
+
+impl PacketIo<Read, NoPos> for StreamWrapper {
+    fn try_new_id<'a>(&'a self, w: &mut FastCWaker) -> Option<PacketId<'a, Read, NoPos>> {
+        self.0.try_new_id(w)
+    }
+}
+
+impl PacketIo<Write, NoPos> for StreamWrapper {
+    fn try_new_id<'a>(&'a self, cx: &mut FastCWaker) -> Option<PacketId<'a, Write, NoPos>> {
+        self.0.try_new_id(cx)
     }
 }
 
@@ -268,8 +351,17 @@ impl IoBackend for NativeFs {
     }
 }
 
+pub struct FileWrapper(IoWrapper<File, u64>);
+pub struct StreamWrapper(IoWrapper<OwnedStreamHandle, NoPos>);
+
 impl NativeFs {
     pub fn register_file(&self, file: File) -> FileWrapper {
-        FileWrapper::from(file)
+        FileWrapper(IoWrapper::from(BaseArc::from(IoInner::from(file))))
+    }
+
+    pub fn register_stream<T: StreamHandleConv>(&self, stream: T) -> StreamWrapper {
+        StreamWrapper(IoWrapper::from(BaseArc::from(
+            <T as Into<IoInner<_, _>>>::into(stream),
+        )))
     }
 }
