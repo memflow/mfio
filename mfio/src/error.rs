@@ -30,13 +30,21 @@ pub const INTERNAL_ERROR: Code =
     Code(unsafe { NonZeroU8::new_unchecked((500 - HTTP_SHIFT) as u8) });
 
 impl Code {
-    pub fn http_code(&self) -> usize {
+    pub const fn http_code(&self) -> usize {
         self.0.get() as usize + HTTP_SHIFT
+    }
+
+    pub const fn from_http_const(code: usize) -> Self {
+        if code >= 400 && code < 600 {
+            Code(unsafe { NonZeroU8::new_unchecked((code - HTTP_SHIFT) as u8) })
+        } else {
+            panic!("Invalid code provided")
+        }
     }
 
     pub fn from_http(code: usize) -> Option<Self> {
         if (400..600).contains(&code) {
-            NonZeroU8::new((code - 399) as u8).map(Code)
+            NonZeroU8::new((code - HTTP_SHIFT) as u8).map(Code)
         } else {
             None
         }
