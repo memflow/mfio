@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use slab::Slab;
 
 use core::future::poll_fn;
-use core::task::{Poll, Waker};
+use core::task::Poll;
 
 use mfio::backend::fd::FdWaker;
 use mfio::backend::*;
@@ -272,9 +272,11 @@ impl NativeFs {
 impl IoBackend for NativeFs {
     type Backend = DynBackend;
 
-    fn polling_handle(&self) -> Option<(DefaultHandle, Waker)> {
+    fn polling_handle(&self) -> Option<PollingHandle> {
+        static READ: PollingFlags = PollingFlags::new().read(true);
         Some((
             self.state.lock().poll.as_raw_fd(),
+            &READ,
             self.waker.clone().into_waker(),
         ))
     }

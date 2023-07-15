@@ -5,8 +5,6 @@ use mfio::util::*;
 
 use mfio_derive::*;
 
-use core::task::Waker;
-
 use tarc::{Arc, BaseArc};
 
 use parking_lot::Mutex;
@@ -79,12 +77,7 @@ impl VolatileMem {
     }
 
     fn write(&self, pos: usize, src: BoundPacket<'static, Read>) {
-        println!(
-            "{pos} {} {} {:?}",
-            src.len(),
-            self.len,
-            self.buf
-        );
+        println!("{pos} {} {} {:?}", src.len(), self.len, self.buf);
         if pos >= self.len {
             src.error(Error {
                 code: INTERNAL_ERROR,
@@ -262,7 +255,7 @@ impl PacketIo<Write, Address> for SampleIo {
 impl IoBackend for SampleIo {
     type Backend = DynBackend;
 
-    fn polling_handle(&self) -> Option<(DefaultHandle, Waker)> {
+    fn polling_handle(&self) -> Option<PollingHandle> {
         None
     }
 

@@ -11,6 +11,8 @@ pub use integrations::null::{Null, NullImpl};
 pub use integrations::Integration;
 
 #[cfg(unix)]
+use nix::poll::*;
+#[cfg(unix)]
 use std::os::fd::RawFd;
 #[cfg(windows)]
 use std::os::windows::io::RawHandle;
@@ -133,7 +135,94 @@ impl<'a, Backend: Future + ?Sized, Fut: Future + ?Sized> Future for WithBackend<
     }
 }
 
-pub type PollingHandle = (DefaultHandle, Waker);
+pub type PollingHandle<'a> = (DefaultHandle, &'a PollingFlags, Waker);
+
+#[repr(transparent)]
+pub struct PollingFlags {
+    flags: AtomicU8,
+}
+
+const READ_POLL: u8 = 0b1;
+const WRITE_POLL: u8 = 0b10;
+
+impl PollingFlags {
+    const fn from_flags(flags: u8) -> Self {
+        Self {
+            flags: AtomicU8::new(flags),
+        }
+    }
+
+    pub const fn new() -> Self {
+        Self {
+            flags: AtomicU8::new(0),
+        }
+    }
+
+    pub const fn all() -> Self {
+        Self {
+            flags: AtomicU8::new(!0),
+        }
+    }
+
+    pub const fn read(self, val: bool) -> Self {
+        // SAFETY: data layout matches perfectly
+        // We need this since AtomicU8::into_inner is not const stable yet.
+        let mut flags = unsafe { core::mem::transmute(self) };
+        if val {
+            flags |= READ_POLL;
+        } else {
+            flags &= !READ_POLL;
+        }
+        Self::from_flags(flags)
+    }
+
+    pub const fn write(self, val: bool) -> Self {
+        // SAFETY: data layout matches perfectly
+        let mut flags = unsafe { core::mem::transmute(self) };
+        if val {
+            flags |= WRITE_POLL;
+        } else {
+            flags &= !WRITE_POLL;
+        }
+        Self::from_flags(flags)
+    }
+
+    pub fn set_read(&self, val: bool) {
+        if val {
+            self.flags.fetch_or(READ_POLL, Ordering::Relaxed);
+        } else {
+            self.flags.fetch_and(!READ_POLL, Ordering::Relaxed);
+        }
+    }
+
+    pub fn set_write(&self, val: bool) {
+        if val {
+            self.flags.fetch_or(WRITE_POLL, Ordering::Relaxed);
+        } else {
+            self.flags.fetch_and(!WRITE_POLL, Ordering::Relaxed);
+        }
+    }
+
+    pub fn get(&self) -> (bool, bool) {
+        let bits = self.flags.load(Ordering::Relaxed);
+        (bits & READ_POLL != 0, bits & WRITE_POLL != 0)
+    }
+
+    #[cfg(unix)]
+    pub fn into_posix(&self) -> PollFlags {
+        let mut flags = PollFlags::empty();
+        // Relaxed is okay, because flags are meant to be set only by the owner of these flags, who
+        // we are going to poll on behalf of.
+        let bits = self.flags.load(Ordering::Relaxed);
+        if bits & READ_POLL != 0 {
+            flags.set(PollFlags::POLLIN, true);
+        }
+        if bits & WRITE_POLL != 0 {
+            flags.set(PollFlags::POLLIN, true);
+        }
+        flags
+    }
+}
 
 pub trait IoBackend {
     type Backend: Future<Output = ()> + Send + ?Sized;
@@ -220,8 +309,8 @@ pub fn block_on<F: Future, B: IoBackend + ?Sized>(
 ) -> F::Output {
     let fut = WithBackend { backend, future };
 
-    if let Some((handle, waker)) = polling {
-        block_on_handle(fut, handle, waker)
+    if let Some((handle, flags, waker)) = polling {
+        block_on_handle(fut, handle, flags, waker)
     } else {
         crate::poller::block_on(fut)
     }
@@ -233,10 +322,13 @@ fn block_on_handle<F: Future>(_: F, _: DefaultHandle, _: Waker) -> F::Output {
 }
 
 #[cfg(all(unix, not(miri)))]
-fn block_on_handle<F: Future>(mut fut: F, handle: RawFd, waker: Waker) -> F::Output {
-    use nix::poll::*;
-
-    let fd = PollFd::new(handle, PollFlags::POLLIN);
+fn block_on_handle<F: Future>(
+    mut fut: F,
+    handle: RawFd,
+    flags: &PollingFlags,
+    waker: Waker,
+) -> F::Output {
+    let mut fd = PollFd::new(handle, PollFlags::empty());
 
     let mut cx = Context::from_waker(&waker);
 
@@ -246,6 +338,7 @@ fn block_on_handle<F: Future>(mut fut: F, handle: RawFd, waker: Waker) -> F::Out
         match fut.poll(&mut cx) {
             Poll::Ready(v) => break v,
             Poll::Pending => {
+                fd.set_events(flags.into_posix());
                 let _ = poll(&mut [fd], -1);
             }
         }
@@ -253,7 +346,12 @@ fn block_on_handle<F: Future>(mut fut: F, handle: RawFd, waker: Waker) -> F::Out
 }
 
 #[cfg(all(windows, not(miri)))]
-fn block_on_handle<F: Future>(mut fut: F, handle: RawHandle, waker: Waker) -> F::Output {
+fn block_on_handle<F: Future>(
+    mut fut: F,
+    handle: RawHandle,
+    _: &PollingFlags,
+    waker: Waker,
+) -> F::Output {
     use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
 
     let mut cx = Context::from_waker(&waker);

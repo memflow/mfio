@@ -26,7 +26,7 @@ enum AsyncIoState<'a, B: IoBackend + ?Sized + 'a, Func, F> {
     Initial(Func),
     Loaded(
         WithBackend<'a, B::Backend, F>,
-        Option<(Async<RawFd>, Waker)>,
+        Option<(Async<RawFd>, &'a PollingFlags, Waker)>,
     ),
     Finished,
 }
@@ -69,13 +69,14 @@ impl<'a, B: LinksIoBackend + 'a, Func: BorrowingFn<B::Link>> Future
                     let (fut, h) = backend.with_backend(fut);
                     this.state = AsyncIoState::Loaded(
                         fut,
-                        h.map(|(h, w)| {
+                        h.map(|(h, p, w)| {
                             (
                                 // FIXME: we need to make `Async` not set nonblocking mode, as it
                                 // is unsupported on kqueues. We should talk with upstream to
                                 // enable our usage.
                                 // Async::with_nonblocking_mode(h, false)
                                 Async::new(h).expect("Could not register the IO resource"),
+                                p,
                                 w,
                             )
                         }),
@@ -87,12 +88,21 @@ impl<'a, B: LinksIoBackend + 'a, Func: BorrowingFn<B::Link>> Future
                             break Poll::Ready(v);
                         }
 
-                        if let Some((fd, _)) = fd {
-                            if fd.poll_readable(cx).is_pending() {
-                                break Poll::Pending;
+                        if let Some((fd, p, _)) = fd {
+                            let (read, write) = p.get();
+                            // TODO: what to do when read = write = false?
+                            let mut ret = Some(Poll::Pending);
+                            if read && fd.poll_readable(cx).is_ready() {
+                                ret = None
+                            }
+                            if write && fd.poll_writable(cx).is_ready() {
+                                ret = None
+                            }
+                            if let Some(ret) = ret {
+                                break ret;
                             }
                         }
-                    }
+                    };
                 }
                 AsyncIoState::Finished => unreachable!(),
             }

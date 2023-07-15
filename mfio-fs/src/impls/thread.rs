@@ -4,7 +4,6 @@ use std::thread::{self, JoinHandle};
 
 use core::future::pending;
 use core::mem::{ManuallyDrop, MaybeUninit};
-use core::task::Waker;
 
 use super::{OwnedStreamHandle, StreamBorrow, StreamHandleConv};
 
@@ -342,7 +341,7 @@ impl NativeFs {
 impl IoBackend for NativeFs {
     type Backend = DynBackend;
 
-    fn polling_handle(&self) -> Option<(DefaultHandle, Waker)> {
+    fn polling_handle(&self) -> Option<PollingHandle> {
         None
     }
 

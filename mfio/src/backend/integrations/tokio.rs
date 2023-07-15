@@ -1,6 +1,5 @@
 use std::os::fd::RawFd;
 use tokio::io::unix::AsyncFd;
-use tokio::io::Interest;
 
 use super::super::*;
 use super::{BorrowingFn, Integration};
@@ -27,7 +26,7 @@ enum TokioState<'a, B: IoBackend + ?Sized + 'a, Func, F> {
     Initial(Func),
     Loaded(
         WithBackend<'a, B::Backend, F>,
-        Option<(AsyncFd<RawFd>, Waker)>,
+        Option<(AsyncFd<RawFd>, &'a PollingFlags, Waker)>,
     ),
     Finished,
 }
@@ -68,10 +67,10 @@ impl<'a, B: LinksIoBackend + 'a, Func: BorrowingFn<B::Link>> Future
                     let (fut, h) = backend.with_backend(fut);
                     this.state = TokioState::Loaded(
                         fut,
-                        h.map(|(h, w)| {
+                        h.map(|(h, p, w)| {
                             (
-                                AsyncFd::with_interest(h, Interest::READABLE)
-                                    .expect("Could not register the IO resource"),
+                                AsyncFd::new(h).expect("Could not register the IO resource"),
+                                p,
                                 w,
                             )
                         }),
@@ -82,13 +81,28 @@ impl<'a, B: LinksIoBackend + 'a, Func: BorrowingFn<B::Link>> Future
                         if let Poll::Ready(v) = unsafe { Pin::new_unchecked(&mut *wb) }.poll(cx) {
                             break Poll::Ready(v);
                         }
-                        if let Some((fd, _)) = fd {
-                            if let Poll::Ready(Ok(mut guard)) = fd.poll_read_ready(cx) {
-                                // We clear the ready flag, because the backend is expected to consume
-                                // all I/O until it blocks without waking anything.
-                                guard.clear_ready();
-                            } else {
-                                break Poll::Pending;
+                        if let Some((fd, p, _)) = fd {
+                            let (read, write) = p.get();
+                            // TODO: what to do when read = write = false?
+                            let mut ret = Some(Poll::Pending);
+                            if read {
+                                if let Poll::Ready(Ok(mut guard)) = fd.poll_read_ready(cx) {
+                                    // We clear the ready flag, because the backend is expected to consume
+                                    // all I/O until it blocks without waking anything.
+                                    guard.clear_ready();
+                                    ret = None;
+                                }
+                            }
+                            if write {
+                                if let Poll::Ready(Ok(mut guard)) = fd.poll_write_ready(cx) {
+                                    // We clear the ready flag, because the backend is expected to consume
+                                    // all I/O until it blocks without waking anything.
+                                    guard.clear_ready();
+                                    ret = None;
+                                }
+                            }
+                            if let Some(ret) = ret {
+                                break ret;
                             }
                         }
                     };

@@ -1,5 +1,4 @@
 use core::future::Future;
-use core::task::Waker;
 use impls::StreamHandleConv;
 use mfio::backend::*;
 use mfio::error::{Code, Error, Location, Result as MfioResult, State, Subject};
@@ -201,7 +200,7 @@ macro_rules! fs_dispatch {
         impl IoBackend for NativeFs {
             type Backend = DynBackend;
 
-            fn polling_handle(&self) -> Option<(DefaultHandle, Waker)> {
+            fn polling_handle(&self) -> Option<PollingHandle> {
                 match self {
                     $($(#[cfg($meta)])* Self::$name(v) => v.polling_handle()),*
                 }
