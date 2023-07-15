@@ -517,7 +517,7 @@ impl StreamBuf {
         }
 
         // then, queue up cache reads
-        // TODO: make this configurable
+        // TODO: make use of this configurable
         let (a, b) = self.read_buf.spare_bufs();
         if !a.is_empty() {
             queue.push(IoSliceMut::new(a));

@@ -26,11 +26,35 @@ mod stream;
 
 const RW_INTERESTS: Interest = Interest::READABLE.add(Interest::WRITABLE);
 
+#[derive(Default)]
+struct BlockTrack {
+    cur_interests: Option<Interest>,
+    read_blocked: bool,
+    write_blocked: bool,
+    update_queued: bool,
+}
+
+impl BlockTrack {
+    pub fn expected_interests(&self) -> Option<Interest> {
+        let mut expected_interests = Some(RW_INTERESTS);
+
+        if !self.read_blocked {
+            expected_interests = expected_interests.and_then(|v| v.remove(Interest::READABLE));
+        }
+
+        if !self.write_blocked {
+            expected_interests = expected_interests.and_then(|v| v.remove(Interest::WRITABLE));
+        }
+
+        expected_interests
+    }
+}
+
 struct MioState {
     poll: mio::Poll,
     files: Slab<FileInner>,
     streams: Slab<StreamInner>,
-    opqueue: Vec<usize>,
+    opqueue: Vec<Key>,
 }
 
 impl MioState {
@@ -108,6 +132,10 @@ impl NativeFs {
             let state = state.clone();
             let waker = waker.clone();
             async move {
+                // We could use a set here, but arguably, computing interests multiple times
+                // should be quicker than walking down the set. TODO: verify this
+                let mut interest_update_queue = vec![];
+
                 let mut events = Events::with_capacity(1024);
 
                 loop {
@@ -124,6 +152,7 @@ impl NativeFs {
                             let key = event.token().0;
 
                             log::trace!("Key: {key:x}");
+                            interest_update_queue.push(Key::from(key));
 
                             // These will fail with usize::MAX key
                             if key == usize::MAX {
@@ -156,15 +185,49 @@ impl NativeFs {
 
                         // process the operation queue
                         for key in state.opqueue.drain(..) {
-                            match Key::from(key) {
-                                Key::File(_) => {
-                                    unreachable!();
+                            interest_update_queue.push(key);
+                            match key {
+                                Key::File(v) => {
+                                    if let Some(file) = state.files.get_mut(v) {
+                                        file.on_queue();
+                                    }
                                 }
                                 Key::Stream(v) => {
                                     if let Some(stream) = state.streams.get_mut(v) {
                                         stream.on_queue();
                                     }
                                 }
+                            }
+                        }
+
+                        // Update polling interests for any FDs that did any work.
+                        for key in interest_update_queue.drain(..) {
+                            let res = match key {
+                                Key::File(v) => {
+                                    if let Some(file) = state.files.get_mut(v) {
+                                        file.update_interests(key.key(), state.poll.registry())
+                                    } else {
+                                        Ok(())
+                                    }
+                                }
+                                Key::Stream(v) => {
+                                    if let Some(stream) = state.streams.get_mut(v) {
+                                        stream.update_interests(key.key(), state.poll.registry())
+                                    } else {
+                                        Ok(())
+                                    }
+                                }
+                            };
+
+                            // TODO: handle errors
+                            match res {
+                                // EPERM using epoll means file descriptor is always ready.
+                                // However, this also comes with a caveat that even though the file always shows up as
+                                // ready, it does not necessarily work in non-blocking mode.
+                                #[cfg(target_os = "linux")]
+                                Err(e) if e.kind() == ErrorKind::PermissionDenied => (),
+                                Err(e) => panic!("{e}"),
+                                Ok(_) => (),
                             }
                         }
 
@@ -230,7 +293,7 @@ impl NativeFs {
         let entry = state.files.vacant_entry();
         // 2N mapping, to accomodate for streams
         let key = Key::File(entry.key());
-        let mut file = FileInner::from(file);
+        let file = FileInner::from(file);
 
         log::trace!(
             "Register file={:?} self={:?} state={:?}: key={key:?}",
@@ -238,21 +301,6 @@ impl NativeFs {
             self as *const _,
             self.state.as_ptr()
         );
-
-        // TODO: handle errors
-        match state
-            .poll
-            .registry()
-            .register(&mut file, Token(key.key()), RW_INTERESTS)
-        {
-            // EPERM using epoll means file descriptor is always ready.
-            // However, this also comes with a caveat that even though the file always shows up as
-            // ready, it does not necessarily work in non-blocking mode.
-            #[cfg(target_os = "linux")]
-            Err(e) if e.kind() == ErrorKind::PermissionDenied => (),
-            Err(e) => panic!("{e}"),
-            Ok(_) => (),
-        }
 
         entry.insert(file);
 
@@ -268,7 +316,7 @@ impl NativeFs {
         let entry = state.streams.vacant_entry();
         // 2N mapping, to accomodate for streams
         let key = Key::Stream(entry.key());
-        let mut stream = StreamInner::from(stream);
+        let stream = StreamInner::from(stream);
 
         log::trace!(
             "Register stream={:?} self={:?} state={:?}: key={key:?}",
@@ -276,21 +324,6 @@ impl NativeFs {
             self as *const _,
             self.state.as_ptr()
         );
-
-        // TODO: handle errors
-        match state
-            .poll
-            .registry()
-            .register(&mut stream, Token(key.key()), RW_INTERESTS)
-        {
-            // EPERM using epoll means file descriptor is always ready.
-            // However, this also comes with a caveat that even though the file always shows up as
-            // ready, it does not necessarily work in non-blocking mode.
-            #[cfg(target_os = "linux")]
-            Err(e) if e.kind() == ErrorKind::PermissionDenied => (),
-            Err(e) => panic!("{e}"),
-            Ok(_) => (),
-        }
 
         entry.insert(stream);
 

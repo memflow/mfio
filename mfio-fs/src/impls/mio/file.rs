@@ -12,7 +12,7 @@ use mfio::packet::{FastCWaker, Read as RdPerm, Splittable, Write as WrPerm, *};
 use mfio::tarc::BaseArc;
 
 use super::super::RawHandleConv;
-use super::MioState;
+use super::{BlockTrack, Key, MioState};
 use crate::util::io_err;
 use mfio::error::State;
 
@@ -27,6 +27,7 @@ struct WriteOp {
 
 pub struct FileInner {
     file: File,
+    track: BlockTrack,
     pos: u64,
     read_ops: VecDeque<(u64, ReadOp)>,
     write_ops: VecDeque<(u64, WriteOp)>,
@@ -47,6 +48,7 @@ impl Source for FileInner {
         token: Token,
         interests: Interest,
     ) -> io::Result<()> {
+        self.track.cur_interests = Some(interests);
         registry.register(&mut SourceFd(&self.file.as_raw()), token, interests)
     }
     fn reregister(
@@ -55,9 +57,11 @@ impl Source for FileInner {
         token: Token,
         interests: Interest,
     ) -> io::Result<()> {
+        self.track.cur_interests = Some(interests);
         registry.reregister(&mut SourceFd(&self.file.as_raw()), token, interests)
     }
     fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
+        self.track.cur_interests = None;
         registry.deregister(&mut SourceFd(&self.file.as_raw()))
     }
 }
@@ -66,6 +70,7 @@ impl From<File> for FileInner {
     fn from(file: File) -> Self {
         Self {
             file,
+            track: Default::default(),
             pos: 0,
             read_ops: Default::default(),
             write_ops: Default::default(),
@@ -98,6 +103,20 @@ impl FileInner {
         }
     }
 
+    pub fn update_interests(&mut self, key: usize, registry: &Registry) -> std::io::Result<()> {
+        let expected_interests = self.track.expected_interests();
+
+        if self.track.cur_interests != expected_interests {
+            if let Some(i) = expected_interests {
+                self.reregister(registry, Token(key), i)?;
+            } else {
+                self.deregister(registry)?;
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn do_ops(&mut self, read: bool, write: bool) {
         log::trace!(
             "Do ops file={:?} read={read} write={write} (to read={} to write={})",
@@ -105,11 +124,13 @@ impl FileInner {
             self.read_ops.len(),
             self.write_ops.len()
         );
-        if read {
+        if read || !self.track.read_blocked {
             'outer: while let Some((pos, op)) = self.read_ops.pop_front() {
+                self.track.read_blocked = false;
                 match self.seek(pos) {
                     Ok(()) => (),
                     Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        self.track.read_blocked = true;
                         self.read_ops.push_front((pos, op));
                         break 'outer;
                     }
@@ -169,6 +190,7 @@ impl FileInner {
                         }
                         Err(e) if e.kind() == ErrorKind::WouldBlock => {
                             log::trace!("Would Block");
+                            self.track.read_blocked = true;
                             self.read_ops.push_front((self.pos, ReadOp { pkt }));
                             break 'outer;
                         }
@@ -182,11 +204,13 @@ impl FileInner {
             }
         }
 
-        if write {
+        if write || !self.track.write_blocked {
             'outer: while let Some((pos, op)) = self.write_ops.pop_front() {
+                self.track.write_blocked = false;
                 match self.seek(pos) {
                     Ok(()) => (),
                     Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        self.track.write_blocked = true;
                         self.write_ops.push_front((pos, op));
                         break 'outer;
                     }
@@ -238,6 +262,7 @@ impl FileInner {
                         }
                         Err(e) if e.kind() == ErrorKind::WouldBlock => {
                             log::trace!("WouldBlock");
+                            self.track.write_blocked = true;
                             self.write_ops
                                 .push_front((self.pos, WriteOp { pkt, transferred }));
                             break 'outer;
@@ -251,6 +276,11 @@ impl FileInner {
                 }
             }
         }
+    }
+
+    pub fn on_queue(&mut self) {
+        self.track.update_queued = false;
+        self.do_ops(true, true);
     }
 }
 
@@ -283,7 +313,7 @@ impl IntoOp for RdPerm {
 
         // If we haven't got any other ops enqueued, then trigger processing!
         if file.write_ops.len() < 2 {
-            file.do_ops(false, true);
+            file.do_ops(false, false);
         }
     }
 }
@@ -293,7 +323,7 @@ impl IntoOp for WrPerm {
         file.read_ops.push_back((pos, ReadOp { pkt }));
         // If we haven't got any other ops enqueued, then trigger processing!
         if file.read_ops.len() < 2 {
-            file.do_ops(true, false);
+            file.do_ops(false, false);
         }
     }
 }
@@ -327,6 +357,13 @@ impl<Perms: IntoOp> PacketIoHandleable<'static, Perms, u64> for FileOpsHandle<Pe
         let file = state.files.get_mut(self.idx).unwrap();
 
         Perms::push_op(file, pos, packet.try_alloc());
+
+        // This will trigger change in interests in the mio loop
+        if !file.track.update_queued && file.track.expected_interests() != file.track.cur_interests
+        {
+            file.track.update_queued = true;
+            state.opqueue.push(Key::File(self.idx));
+        }
     }
 }
 
