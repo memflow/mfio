@@ -3,11 +3,12 @@ use core::mem::MaybeUninit;
 use core::pin::Pin;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tarc::Arc;
 
 #[allow(clippy::type_complexity)]
 pub struct PinHeap<T: Release> {
+    used: [UnsafeCell<Option<Box<[AtomicBool]>>>; 32],
     data: [UnsafeCell<Option<Box<[MaybeUninit<T>]>>>; 32],
     shards: Mutex<usize>,
     cached_elems_len: AtomicUsize,
@@ -54,6 +55,7 @@ impl<T: Release> PinHeap<T> {
     #[allow(clippy::uninit_assumed_init)]
     pub fn new(cache_size: usize) -> Self {
         Self {
+            used: [(); 32].map(|_| UnsafeCell::new(None)),
             data: [(); 32].map(|_| UnsafeCell::new(None)),
             shards: Mutex::new(0),
             cached_elems_len: Default::default(),
@@ -61,6 +63,20 @@ impl<T: Release> PinHeap<T> {
             free_elems: Default::default(),
             cache_size,
         }
+    }
+
+    unsafe fn mark_used(&self, used: bool, shard_id: usize, idx: usize) {
+        let shard = self.used[shard_id].get();
+        // Here we would have an intermediary step of taking &mut Option and unwrapping it,
+        // but that would cause data race in miri. Since we are certain that the value is
+        // Some(_), and *mut Option<Box<T>> is equivalent to *mut *mut T (because
+        // Option<Box<T>> is equivalent to *mut T), we can ignore the unwrap and instead cast
+        // `*mut Option<Box<T>>` directly into `*mut *mut T`.
+        let shard = shard as *mut Box<AtomicBool> as *mut *mut AtomicBool;
+        // In addition, do manual pointer addition to drop slice metadata, in order to avoid
+        // pointer retagging happening in MIR.
+        let elem = (*shard).add(idx);
+        (*elem).store(used, Ordering::Release);
     }
 
     pub fn alloc_pin(this: Arc<Self>, value: T) -> Pin<AllocHandle<T>> {
@@ -93,6 +109,8 @@ impl<T: Release> PinHeap<T> {
 
             let data = data as *mut _;
 
+            unsafe { this.mark_used(true, shard_id, idx) };
+
             AllocHandle {
                 data,
                 location: (shard_id, idx),
@@ -104,6 +122,13 @@ impl<T: Release> PinHeap<T> {
     }
 
     pub fn alloc(this: Arc<Self>, value: T) -> AllocHandle<T> {
+        Self::alloc_init(this, |_| value)
+    }
+
+    pub fn alloc_init(
+        this: Arc<Self>,
+        initializer: impl FnOnce((usize, usize)) -> T,
+    ) -> AllocHandle<T> {
         let elem = this.free_elems.lock().pop_front();
         let (shard_id, idx) = match elem {
             Some(elem) => elem,
@@ -131,6 +156,15 @@ impl<T: Release> PinHeap<T> {
                     this.data[shard].get().write(Some(alloc));
                 }
 
+                let alloc = (0..alloc_size)
+                    .map(|_| AtomicBool::new(false))
+                    .collect::<Vec<_>>();
+
+                // SAFETY: we are holding the alloc lock and are the only ones writing to the shard
+                unsafe {
+                    this.used[shard].get().write(Some(alloc.into_boxed_slice()));
+                }
+
                 *shards += 1;
                 core::mem::drop(shards);
 
@@ -156,8 +190,10 @@ impl<T: Release> PinHeap<T> {
             // In addition, do manual pointer addition to drop slice metadata, in order to avoid
             // pointer retagging happening in MIR.
             let elem = (*shard).add(idx);
-            (*elem).write(value) as *mut _
+            (*elem).write(initializer((shard_id, idx))) as *mut _
         };
+
+        unsafe { this.mark_used(true, shard_id, idx) };
 
         AllocHandle {
             data,
@@ -167,6 +203,8 @@ impl<T: Release> PinHeap<T> {
     }
 
     fn release(this: Arc<Self>, location: (usize, usize), data: *mut T) {
+        unsafe { this.mark_used(false, location.0, location.1) };
+
         if this.cached_elems_len.load(Ordering::Relaxed) >= this.cache_size {
             unsafe { core::ptr::drop_in_place(data) };
             this.free_elems.lock().push_back(location);

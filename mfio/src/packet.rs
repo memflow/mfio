@@ -85,10 +85,11 @@ use core::marker::{PhantomData, PhantomPinned};
 use core::mem::ManuallyDrop;
 use core::mem::MaybeUninit;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicIsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use core::task::{Context, Poll};
 use futures::stream::Stream;
 use parking_lot::Mutex;
+use rangemap::RangeSet;
 use tarc::{Arc, BaseArc};
 
 pub type Output<'a, DataType> = (PacketObj<'a, DataType>, Option<Error>);
@@ -123,6 +124,13 @@ impl<'a, Perms: PacketPerms, Param> PacketId<'a, Perms, Param> {
         self.stream
             .send_io(self.project_inner(), param, packet.into())
     }
+
+    pub fn bind_packet(
+        self: Pin<&Self>,
+        packet: impl Into<Packet<'a, Perms>>,
+    ) -> BoundPacket<Perms> {
+        self.stream.bind_packet(self.project_inner(), packet.into())
+    }
 }
 
 impl<'a, Perms: PacketPerms, Param> Stream for PacketId<'a, Perms, Param> {
@@ -131,6 +139,15 @@ impl<'a, Perms: PacketPerms, Param> Stream for PacketId<'a, Perms, Param> {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         let this = self.into_ref();
         this.stream.poll_id(this, cx)
+    }
+}
+
+impl<'a, 'b, Perms: PacketPerms, Param> Stream for &'b PacketId<'a, Perms, Param> {
+    type Item = Output<'a, Perms::DataType>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        self.stream
+            .poll_id(unsafe { Pin::new_unchecked(&**self) }, cx)
     }
 }
 
@@ -318,6 +335,20 @@ impl<'a, Perms: PacketPerms, Param> PacketStream<'a, Perms, Param> {
             }),
             stream,
         }
+    }
+
+    pub fn bind_packet<'b>(
+        &self,
+        id: Pin<&'b PacketIdInner>,
+        packet: Packet<'b, Perms>,
+    ) -> BoundPacket<'b, Perms> {
+        // Shorten lifetime of self.
+        // According to safety guarantees of the crate, this is valid.
+        // PacketId is pinned, thus it will be polled to completion, meaning no data of lifetime 'b
+        // will be left in the system by the time 'b is dropped.
+        let stream: &PacketStream<'b, Perms, Param> =
+            unsafe { core::mem::transmute::<&Self, _>(self) };
+        packet.bind(stream, id)
     }
 
     pub fn send_io<'b>(&self, id: Pin<&'b PacketIdInner>, param: Param, packet: Packet<'b, Perms>)
@@ -566,10 +597,13 @@ impl PacketPerms for Read {
 #[derive(Debug)]
 #[repr(C)]
 pub struct PacketObj<'a, DataType> {
-    data: DataType,
-    start: usize,
-    end: usize,
-    _phantom: PhantomData<&'a u8>,
+    // TODO: should these be public (probably not)
+    pub data: DataType,
+    pub start: usize,
+    pub end: usize,
+    // Unbound packet should always be able to replace this tag
+    pub tag: usize,
+    pub _phantom: PhantomData<&'a u8>,
 }
 
 impl<'a, DataType: Copy> PacketObj<'a, DataType> {
@@ -599,6 +633,7 @@ impl<'a, DataType: Copy> PacketObj<'a, DataType> {
             data,
             start,
             end,
+            tag,
             _phantom,
         } = self;
         (
@@ -606,15 +641,37 @@ impl<'a, DataType: Copy> PacketObj<'a, DataType> {
                 data,
                 start,
                 end: start + pos,
+                tag,
                 _phantom,
             },
             Self {
                 data,
                 start: start + pos,
                 end,
+                tag,
                 _phantom,
             },
         )
+    }
+
+    /// Extract a sub-packet from this packet.
+    ///
+    /// # Safety
+    ///
+    /// Please see [`BoundPacketObj::extract_packet`] documentation for details.
+    pub unsafe fn extract_packet(&self, offset: usize, len: usize) -> Self {
+        let Self {
+            data, start, tag, ..
+        } = self;
+        assert!(offset <= self.len());
+        assert!(offset + len <= self.len());
+        Self {
+            data: *data,
+            start: start + offset,
+            end: start + offset + len,
+            tag: *tag,
+            _phantom: PhantomData,
+        }
     }
 }
 
@@ -662,6 +719,7 @@ impl<'a> From<&'a mut [u8]> for Packet<'a, ReadWrite> {
                 data: slc.as_mut_ptr() as *mut _,
                 start: 0,
                 end: slc.len(),
+                tag: 0,
                 _phantom: PhantomData,
             },
             vtable: &ReadWrite {
@@ -711,6 +769,7 @@ impl<'a, D: AnyBytes> From<&'a mut [D]> for Packet<'a, Write> {
                 data: slc.as_mut_ptr() as *mut _,
                 start: 0,
                 end: slc.len(),
+                tag: 0,
                 _phantom: PhantomData,
             },
             vtable: &Write {
@@ -757,6 +816,7 @@ impl<'a, T: AsRef<[u8]> + ?Sized> From<&'a T> for Packet<'a, Read> {
                 data: slc.as_ptr() as *const _,
                 start: 0,
                 end: slc.len(),
+                tag: 0,
                 _phantom: PhantomData,
             },
             vtable: &Read { get, transfer_data },
@@ -1011,6 +1071,11 @@ impl<'a, Perms: PacketPerms> Packet<'a, Perms> {
             vtable,
         }
     }
+
+    pub fn tag(mut self, tag: usize) -> Self {
+        self.obj.tag = tag;
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -1088,6 +1153,43 @@ impl<'a, T: PacketPerms> BoundPacketObj<'a, T> {
         }
         core::mem::drop(output_stack);
     }
+
+    /// Forget the packet
+    ///
+    /// # Safety
+    ///
+    /// This packet must have originally been the receiver of [`BoundPacketObj::extract_packet`]
+    /// call. There must be one extracted packet split left.
+    pub unsafe fn forget(self) {
+        debug_assert_ne!(self.id.size.fetch_sub(1, Ordering::Release), 1);
+        let arc = self.output.as_original_ptr::<()>();
+        core::mem::forget(self);
+        Arc::decrement_strong_count(arc, 0);
+    }
+
+    /// Extract a sub-packet from this packet
+    ///
+    /// # Safety
+    ///
+    /// To avoid undefined behavior, the caller must ensure the following conditions are met:
+    ///
+    /// 1. Extracted packets do not overlap each other.
+    ///
+    /// 2. Entire range of `self` must be extracted.
+    ///
+    /// 3. Before the last extracted packet is dropped, `self` must be released with
+    ///    [`BoundPacketObj::forget`].
+    pub unsafe fn extract_packet(&self, pos: usize, len: usize) -> Self {
+        let b = self.buffer.extract_packet(pos, len);
+
+        self.id.size.fetch_add(1, Ordering::Release);
+
+        Self {
+            buffer: ManuallyDrop::new(b),
+            output: self.output.clone(),
+            id: self.id,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1137,6 +1239,48 @@ impl<'a, T: PacketPerms> BoundPacket<'a, T> {
                 obj: ManuallyDrop::into_inner(obj),
                 vtable,
             })
+        }
+    }
+
+    /// Forget the packet
+    ///
+    /// # Safety
+    ///
+    /// Please see [`BoundPacketObj::forget`] documentation for details.
+    pub unsafe fn forget(self) {
+        self.obj.forget();
+    }
+
+    /// Extract a sub-packet from this packet.
+    ///
+    /// # Safety
+    ///
+    /// Please see [`BoundPacketObj::extract_packet`] documentation for details.
+    pub unsafe fn extract_packet(&self, start: usize, len: usize) -> Self {
+        let Self { vtable, obj } = self;
+        Self {
+            obj: obj.extract_packet(start, len),
+            vtable,
+        }
+    }
+
+    /// Get an unbound `Packet`.
+    ///
+    /// This function allows the packet to be rebound to a different I/O backend and have their
+    /// results intercepted.
+    ///
+    /// # Safety
+    ///
+    /// Please see [`BoundPacketObj::extract_packet`] documentation for details.
+    pub unsafe fn unbound<'b>(&self) -> Packet<'b, T>
+    where
+        'a: 'b,
+    {
+        let Self { vtable, obj } = self;
+
+        Packet {
+            vtable,
+            obj: obj.buffer.extract_packet(0, obj.len()),
         }
     }
 
@@ -1223,3 +1367,143 @@ downgrade_packet!(perms::READ_WRITE, perms::WRITE);
 /*impl<'a> Packet<'a, {perms::READ}> {
 
 }*/
+
+/// Allows to intercept a packet between its origin packet ID.
+///
+/// `ReboundPacket` allows a packet to be read or written, before returning its result to the
+/// origin. The packet segments which have finished their core I/O operation can be re-split into
+/// smaller parts and returned to the origin with partial successes or failures.
+///
+/// ## Background
+///
+/// All parts of a bound packet must end up in their original starting position - the first place
+/// they were bound. Failure to uphold this invariant may lead to deadlocks, or other unexpected
+/// behavior. In addition, packet usually reaches an I/O backend, where it gets processed, before
+/// being returned back to the caller. However, it is often desired to be able to do some
+/// intermediary processing, or apply custom routing/splitting rules on the packet.
+///
+/// ### Client-server example
+///
+/// Let's take networked I/O backend as an example. To perform a read request, the following flow
+/// happens:
+///
+/// 1. Caller sends an I/O packet to the client, acting as a I/O backend. The packet gets accepted,
+///    read request is sent to the server.
+///
+/// 2. The server performs the read request, and for every segment of the packet writes the
+///    response header with the packet bytes itself.
+///
+/// 3. The client receives individual packet segments as `(header, bytes)` pairs. For each pair the
+///    client outputs the segment back to the original caller.
+///
+/// This is a very simple flow - client sends a request, server sends a response, client processes
+/// the response, but how do you make this efficient?
+///
+/// For starters, the client needs to hold on to the original packet until all responses arrive.
+/// Upon each response, the client needs to split a segment out, read data into it, and then return
+/// it to the sender. This can actually be relatively easily solved with a simple sharded wrapper
+/// around packet. Something equivalent to `BTreeMap<usize, BoundPacketObj>`. However, the
+/// difficulty appears when working on the send side.
+///
+/// A naive way to transfer the packet over the wire is to use regular
+/// [`IoWrite`](crate::traits::IoWrite) interface and await for each write to complete. However,
+/// the process of awaiting for each request to finish makes the client extremely bottlenecked by
+/// the time it takes to write each individual request. As far as client is concerned, completion
+/// of each write operation is not important, what matters is order of operations.
+///
+/// [`NoPos`] I/O is by convention processed in the packet send order. Therefore, all a client
+/// needs to do is send packets to the same packet ID, while awaiting for confirmations in a
+/// separate async task, polled concurrently.
+///
+/// For a client write request, the one missing piece is awaiting for actual response from the
+/// other end - which segment of the packet was successful, which was not. The problem is that
+/// the regular [`IoWrite`](crate::traits::IoWrite) interface consumes the packet and does not let
+/// you fail parts of it after the fact. A client needs to intercept the packet, and fail parts of
+/// it after the fact. This is where [`ReboundPacket`] comes into play.
+///
+/// Upon arrival at a client, the write request would be rebound to the client's session packet ID,
+/// and sent for processing through the I/O stream. At some point, the server returns back the
+/// result of individual segments, which the client would then translate to actual response.
+///
+/// `ReboundPacket` helps in this situation, because it facilitates this rebind process safely.
+pub struct ReboundPacket<'a, T: PacketPerms> {
+    ranges: RangeSet<usize>,
+    orig: ManuallyDrop<BoundPacket<'a, T>>,
+    unbound: AtomicBool,
+}
+
+impl<'a, T: PacketPerms> ReboundPacket<'a, T> {
+    pub fn unbound<'b>(&'b self) -> Packet<'b, T>
+    where
+        'a: 'b,
+    {
+        assert!(!self.unbound.swap(true, Ordering::Acquire));
+        // SAFETY: we are ensuring only a single unbound packet instance is created. In addition,
+        // the rest of this struct ensures that all required invariants of the packet system are
+        // upheld.
+        unsafe { self.orig.unbound() }
+    }
+
+    pub fn on_processed(&mut self, pkt: PacketObj<'a, T::DataType>, err: Option<Error>) {
+        match err {
+            Some(err) => {
+                let pkt = unsafe {
+                    self.orig
+                        .extract_packet(pkt.start - self.orig.obj.buffer.start, pkt.len())
+                };
+                pkt.error(err);
+            }
+            None => {
+                let start = pkt.start - self.orig.obj.buffer.start;
+                let end = pkt.end - self.orig.obj.buffer.start;
+                self.ranges.insert(start..end);
+            }
+        }
+    }
+
+    pub fn range_result(&mut self, start: usize, len: usize, err: Option<Error>) {
+        let range = start..(start + len);
+        let mut o = self.ranges.overlapping(&range);
+        let o = o.next().unwrap();
+        assert!(o.contains(&start));
+        assert!(o.contains(&(start + len)));
+        self.ranges.remove(range);
+        // SAFETY: we verified uniqueness of the range.
+        let pkt = unsafe { self.orig.extract_packet(start, len) };
+        if let Some(err) = err {
+            pkt.error(err)
+        }
+    }
+
+    pub fn ranges(&self) -> &RangeSet<usize> {
+        &self.ranges
+    }
+}
+
+impl<'a, T: PacketPerms> From<BoundPacket<'a, T>> for ReboundPacket<'a, T> {
+    fn from(orig: BoundPacket<'a, T>) -> Self {
+        Self {
+            ranges: Default::default(),
+            orig: ManuallyDrop::new(orig),
+            unbound: false.into(),
+        }
+    }
+}
+
+impl<'a, T: PacketPerms> Drop for ReboundPacket<'a, T> {
+    fn drop(&mut self) {
+        let orig = unsafe { ManuallyDrop::take(&mut self.orig) };
+
+        if *self.unbound.get_mut() {
+            let mut prev = None;
+
+            for range in self.ranges.iter() {
+                prev = Some(unsafe { self.orig.extract_packet(range.start, range.len()) });
+            }
+
+            unsafe { orig.forget() };
+
+            core::mem::drop(prev);
+        }
+    }
+}

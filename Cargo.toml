@@ -15,3 +15,6 @@ default-members = [
 	"mfio-derive",
 ]
 
+[patch.crates-io]
+tracy-client = { git = "https://github.com/h33p/rust_tracy_client", branch = "fibers" }
+tracing-tracy = { git = "https://github.com/h33p/rust_tracy_client", branch = "fibers" }

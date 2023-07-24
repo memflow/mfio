@@ -69,17 +69,24 @@ impl<'a, B: LinksIoBackend + 'a, Func: BorrowingFn<B::Link>> Future
                     let (fut, h) = backend.with_backend(fut);
                     this.state = AsyncIoState::Loaded(
                         fut,
-                        h.map(|(h, p, w)| {
-                            (
-                                // FIXME: we need to make `Async` not set nonblocking mode, as it
-                                // is unsupported on kqueues. We should talk with upstream to
-                                // enable our usage.
-                                // Async::with_nonblocking_mode(h, false)
-                                Async::new(h).expect("Could not register the IO resource"),
-                                p,
-                                w,
-                            )
-                        }),
+                        h.map(
+                            |PollingHandle {
+                                 handle,
+                                 cur_flags,
+                                 waker,
+                                 ..
+                             }| {
+                                (
+                                    // FIXME: we need to make `Async` not set nonblocking mode, as it
+                                    // is unsupported on kqueues. We should talk with upstream to
+                                    // enable our usage.
+                                    // Async::with_nonblocking_mode(h, false)
+                                    Async::new(handle).expect("Could not register the IO resource"),
+                                    cur_flags,
+                                    waker,
+                                )
+                            },
+                        ),
                     );
                 }
                 AsyncIoState::Loaded(wb, fd) => {

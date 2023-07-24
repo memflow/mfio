@@ -1,11 +1,20 @@
 use std::os::fd::RawFd;
-use tokio::io::unix::AsyncFd;
+use tokio::io::{unix::AsyncFd, Interest};
 
 use super::super::*;
 use super::{BorrowingFn, Integration};
 
 #[derive(Clone, Copy, Default)]
 pub struct Tokio;
+
+fn into_tokio(flags: &PollingFlags) -> Interest {
+    match flags.get() {
+        (true, true) => Interest::READABLE.add(Interest::WRITABLE),
+        (false, true) => Interest::WRITABLE,
+        (true, false) => Interest::READABLE,
+        (false, false) => panic!("Polling flags incompatible!"),
+    }
+}
 
 impl Integration for Tokio {
     type Impl<'a, B: LinksIoBackend + 'a, Func: for<'b> BorrowingFn<B::Link>> =
@@ -67,13 +76,21 @@ impl<'a, B: LinksIoBackend + 'a, Func: BorrowingFn<B::Link>> Future
                     let (fut, h) = backend.with_backend(fut);
                     this.state = TokioState::Loaded(
                         fut,
-                        h.map(|(h, p, w)| {
-                            (
-                                AsyncFd::new(h).expect("Could not register the IO resource"),
-                                p,
-                                w,
-                            )
-                        }),
+                        h.map(
+                            |PollingHandle {
+                                 handle,
+                                 cur_flags,
+                                 waker,
+                                 max_flags,
+                             }| {
+                                (
+                                    AsyncFd::with_interest(handle, into_tokio(&max_flags))
+                                        .expect("Could not register the IO resource"),
+                                    cur_flags,
+                                    waker,
+                                )
+                            },
+                        ),
                     );
                 }
                 TokioState::Loaded(wb, fd) => {

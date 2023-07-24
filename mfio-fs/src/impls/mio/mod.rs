@@ -14,6 +14,7 @@ use mfio::backend::*;
 use mfio::tarc::BaseArc;
 
 use super::StreamHandleConv;
+use tracing::instrument::Instrument;
 
 use file::FileInner;
 pub use file::FileWrapper;
@@ -115,6 +116,8 @@ impl NativeFs {
         set_nonblock(wake_read)?;
         set_nonblock(wake_write)?;
 
+        log::trace!("{wake_read} {wake_write}");
+
         let mut wake_read = unsafe { File::from_raw_fd(wake_read) };
         let wake_write = unsafe { OwnedFd::from_raw_fd(wake_write) };
         let waker = FdWaker::from(wake_write);
@@ -139,11 +142,11 @@ impl NativeFs {
                 let mut events = Events::with_capacity(1024);
 
                 loop {
-                    {
+                    let ret = async {
                         let state = &mut *state.lock();
 
                         if let Err(_e) = state.poll.poll(&mut events, Some(Default::default())) {
-                            break;
+                            return false;
                         }
 
                         let mut observed_blocking = false;
@@ -244,6 +247,14 @@ impl NativeFs {
                             // Set the self wake flag here
                             waker.wake_by_ref();
                         }
+
+                        true
+                    }
+                    .instrument(tracing::span!(tracing::Level::TRACE, "mio poll"))
+                    .await;
+
+                    if !ret {
+                        break;
                     }
 
                     let mut signaled = false;
@@ -274,11 +285,12 @@ impl IoBackend for NativeFs {
 
     fn polling_handle(&self) -> Option<PollingHandle> {
         static READ: PollingFlags = PollingFlags::new().read(true);
-        Some((
-            self.state.lock().poll.as_raw_fd(),
-            &READ,
-            self.waker.clone().into_waker(),
-        ))
+        Some(PollingHandle {
+            handle: self.state.lock().poll.as_raw_fd(),
+            cur_flags: &READ,
+            max_flags: PollingFlags::new().read(true),
+            waker: self.waker.clone().into_waker(),
+        })
     }
 
     fn get_backend(&self) -> BackendHandle<Self::Backend> {

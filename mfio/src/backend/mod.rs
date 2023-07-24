@@ -135,7 +135,12 @@ impl<'a, Backend: Future + ?Sized, Fut: Future + ?Sized> Future for WithBackend<
     }
 }
 
-pub type PollingHandle<'a> = (DefaultHandle, &'a PollingFlags, Waker);
+pub struct PollingHandle<'a> {
+    pub handle: DefaultHandle,
+    pub cur_flags: &'a PollingFlags,
+    pub max_flags: PollingFlags,
+    pub waker: Waker,
+}
 
 #[repr(transparent)]
 pub struct PollingFlags {
@@ -309,8 +314,8 @@ pub fn block_on<F: Future, B: IoBackend + ?Sized>(
 ) -> F::Output {
     let fut = WithBackend { backend, future };
 
-    if let Some((handle, flags, waker)) = polling {
-        block_on_handle(fut, handle, flags, waker)
+    if let Some(handle) = polling {
+        block_on_handle(fut, handle)
     } else {
         crate::poller::block_on(fut)
     }
@@ -322,12 +327,14 @@ fn block_on_handle<F: Future>(_: F, _: DefaultHandle, _: Waker) -> F::Output {
 }
 
 #[cfg(all(unix, not(miri)))]
-fn block_on_handle<F: Future>(
-    mut fut: F,
-    handle: RawFd,
-    flags: &PollingFlags,
-    waker: Waker,
-) -> F::Output {
+fn block_on_handle<F: Future>(mut fut: F, handle: PollingHandle) -> F::Output {
+    let PollingHandle {
+        handle,
+        cur_flags,
+        waker,
+        ..
+    } = handle;
+
     let mut fd = PollFd::new(handle, PollFlags::empty());
 
     let mut cx = Context::from_waker(&waker);
@@ -338,7 +345,7 @@ fn block_on_handle<F: Future>(
         match fut.poll(&mut cx) {
             Poll::Ready(v) => break v,
             Poll::Pending => {
-                fd.set_events(flags.into_posix());
+                fd.set_events(cur_flags.into_posix());
                 let _ = poll(&mut [fd], -1);
             }
         }
@@ -346,12 +353,9 @@ fn block_on_handle<F: Future>(
 }
 
 #[cfg(all(windows, not(miri)))]
-fn block_on_handle<F: Future>(
-    mut fut: F,
-    handle: RawHandle,
-    _: &PollingFlags,
-    waker: Waker,
-) -> F::Output {
+fn block_on_handle<F: Future>(mut fut: F, handle: PollingHandle) -> F::Output {
+    let PollingHandle { handle, waker, .. } = handle;
+
     use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
 
     let mut cx = Context::from_waker(&waker);

@@ -117,6 +117,7 @@ impl FileInner {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     pub fn do_ops(&mut self, read: bool, write: bool) {
         log::trace!(
             "Do ops file={:?} read={read} write={write} (to read={} to write={})",
@@ -124,7 +125,10 @@ impl FileInner {
             self.read_ops.len(),
             self.write_ops.len()
         );
+        let rd_span = tracing::span!(tracing::Level::TRACE, "read", ops = self.read_ops.len());
+        let wr_span = tracing::span!(tracing::Level::TRACE, "write", ops = self.write_ops.len());
         if read || !self.track.read_blocked {
+            let _guard = rd_span.enter();
             'outer: while let Some((pos, op)) = self.read_ops.pop_front() {
                 self.track.read_blocked = false;
                 match self.seek(pos) {
@@ -205,6 +209,7 @@ impl FileInner {
         }
 
         if write || !self.track.write_blocked {
+            let _guard = wr_span.enter();
             'outer: while let Some((pos, op)) = self.write_ops.pop_front() {
                 self.track.write_blocked = false;
                 match self.seek(pos) {

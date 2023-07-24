@@ -509,11 +509,12 @@ impl IoBackend for NativeFs {
 
     fn polling_handle(&self) -> Option<PollingHandle> {
         static READ: PollingFlags = PollingFlags::new().read(true);
-        Some((
-            self.state.lock().event_fd.as_raw_fd(),
-            &READ,
-            self.waker.clone().into_waker(),
-        ))
+        Some(PollingHandle {
+            handle: self.state.lock().event_fd.as_raw_fd(),
+            cur_flags: &READ,
+            max_flags: PollingFlags::new().read(true),
+            waker: self.waker.clone().into_waker(),
+        })
     }
 
     fn get_backend(&self) -> BackendHandle<Self::Backend> {

@@ -96,6 +96,7 @@ impl StreamInner {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     pub fn do_ops(&mut self, read: bool, write: bool) {
         log::trace!(
             "Do ops file={:?} read={read} write={write} (to read={} to write={})",
@@ -104,8 +105,11 @@ impl StreamInner {
             self.stream.write_ops()
         );
         if read || !self.track.read_blocked {
-            self.track.read_blocked = false;
             while self.stream.read_ops() > 0 {
+                let rd_span =
+                    tracing::span!(tracing::Level::TRACE, "read", ops = self.stream.read_ops());
+                let _span = rd_span.enter();
+                self.track.read_blocked = false;
                 let queue = self.stream.read_queue();
                 if !queue.is_empty() {
                     let res = (self.read)(&self.fd, queue);
@@ -118,6 +122,7 @@ impl StreamInner {
                     {
                         self.stream.on_read(res);
                     } else {
+                        tracing::event!(tracing::Level::INFO, "read blocked");
                         self.track.read_blocked = true;
                         break;
                     }
@@ -127,6 +132,12 @@ impl StreamInner {
 
         if write || !self.track.write_blocked {
             while self.stream.write_ops() > 0 {
+                let wr_span = tracing::span!(
+                    tracing::Level::TRACE,
+                    "write",
+                    ops = self.stream.write_ops()
+                );
+                let _span = wr_span.enter();
                 self.track.write_blocked = false;
                 let queue = self.stream.write_queue();
                 if !queue.is_empty() {
@@ -140,6 +151,7 @@ impl StreamInner {
                     {
                         self.stream.on_write(res);
                     } else {
+                        tracing::event!(tracing::Level::INFO, "write blocked");
                         self.track.write_blocked = true;
                         break;
                     }
@@ -161,14 +173,18 @@ trait IntoOp: PacketPerms {
 impl IntoOp for RdPerm {
     fn push_op(stream: &mut StreamInner, pkt: BoundPacket<'static, Self>) {
         stream.stream.queue_write(pkt);
-        stream.do_ops(false, false);
+        // we would normally attempt the operation right here, but that leads to overly high
+        // syscall count.
+        //stream.do_ops(false, false);
     }
 }
 
 impl IntoOp for WrPerm {
     fn push_op(stream: &mut StreamInner, pkt: BoundPacket<'static, Self>) {
         stream.stream.queue_read(pkt);
-        stream.do_ops(true, false);
+        // we would normally attempt the operation right here, but that leads to overly high
+        // syscall count.
+        //stream.do_ops(true, false);
     }
 }
 
@@ -203,9 +219,7 @@ impl<Perms: IntoOp> PacketIoHandleable<'static, Perms, NoPos> for StreamOpsHandl
         Perms::push_op(stream, packet);
 
         // This will trigger change in interests in the mio loop
-        if !stream.track.update_queued
-            && stream.track.expected_interests() != stream.track.cur_interests
-        {
+        if !stream.track.update_queued {
             stream.track.update_queued = true;
             state.opqueue.push(Key::Stream(self.idx));
         }
