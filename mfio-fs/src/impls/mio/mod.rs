@@ -229,7 +229,7 @@ impl NativeFs {
                                 // ready, it does not necessarily work in non-blocking mode.
                                 #[cfg(target_os = "linux")]
                                 Err(e) if e.kind() == ErrorKind::PermissionDenied => (),
-                                Err(e) => panic!("{e}"),
+                                Err(e) => panic!("Unable to update interests: {e}"),
                                 Ok(_) => (),
                             }
                         }

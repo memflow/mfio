@@ -108,7 +108,11 @@ impl FileInner {
 
         if self.track.cur_interests != expected_interests {
             if let Some(i) = expected_interests {
-                self.reregister(registry, Token(key), i)?;
+                if self.track.cur_interests.is_some() {
+                    self.reregister(registry, Token(key), i)?;
+                } else {
+                    self.register(registry, Token(key), i)?;
+                }
             } else {
                 self.deregister(registry)?;
             }

@@ -322,7 +322,7 @@ pub fn block_on<F: Future, B: IoBackend + ?Sized>(
 }
 
 #[cfg(miri)]
-fn block_on_handle<F: Future>(_: F, _: DefaultHandle, _: Waker) -> F::Output {
+fn block_on_handle<F: Future>(_: F, _: PollingHandle) -> F::Output {
     unimplemented!("Polling on miri is unsupported")
 }
 

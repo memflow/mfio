@@ -531,7 +531,11 @@ mod tests {
         for (backend, fs) in NativeFsBuilder::all_backends().build_each() {
             println!("{backend}");
             fs.unwrap().run(|_| async move {
-                for i in 0..2000 {
+                #[cfg(miri)]
+                let wakes = 20;
+                #[cfg(not(miri))]
+                let wakes = 2000;
+                for i in 0..wakes {
                     println!("{i}");
                     let mut signaled = false;
                     poll_fn(|cx| {
@@ -561,7 +565,11 @@ mod tests {
         for (backend, fs) in NativeFsBuilder::all_backends().build_each() {
             println!("{backend}");
             fs.unwrap().run(|_| async move {
-                for i in 0..2000 {
+                #[cfg(miri)]
+                let wakes = 20;
+                #[cfg(not(miri))]
+                let wakes = 2000;
+                for i in 0..wakes {
                     println!("{i}");
                     let mut signaled = false;
                     poll_fn(|cx| {
