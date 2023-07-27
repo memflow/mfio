@@ -191,7 +191,7 @@ macro_rules! fs_dispatch {
 
         impl Default for NativeFs {
             fn default() -> Self {
-                NativeFsBuilder::all_backends()
+                NativeFsBuilder::env_backends()
                     .build()
                     .expect("Could not initialize any FS backend")
             }
@@ -231,9 +231,30 @@ macro_rules! fs_dispatch {
         }
 
         impl NativeFsBuilder {
+            /// Get a `NativeFsBuilder` with all backends enabled.
             pub fn all_backends() -> Self {
                 Self {
                     $($(#[cfg($meta)])* $mod: true),*
+                }
+            }
+
+            /// Get a `NativeFsBuilder` with backends specified by environment.
+            ///
+            /// This function attempts to parse `MFIO_FS_BACKENDS` environment variable and load
+            /// backends specified by it. If the environment variable is not present, or
+            /// non-unicode, this function falls back to using
+            /// [`all_backends`](NativeFsBuilder::all_backends).
+            pub fn env_backends() -> Self {
+                match std::env::var("MFIO_FS_BACKENDS") {
+                    Ok(val) => {
+                        let vals = val.split(',').collect::<Vec<_>>();
+                        Self {
+                            $($(#[cfg($meta)])* $mod: vals.contains(&stringify!($mod))),*
+                        }
+                    }
+                    Err(_) => {
+                        Self::all_backends()
+                    }
                 }
             }
 
