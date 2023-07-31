@@ -287,6 +287,11 @@ impl<'a, Perms: PacketPerms, Param: core::fmt::Debug> core::fmt::Debug
 }
 
 impl<'a, Perms: PacketPerms, Param> PacketStream<'a, Perms, Param> {
+    pub fn num_streams(&self) -> usize {
+        let stack = self.ctx.output.stack.lock();
+        stack.total() - stack.free()
+    }
+
     pub fn poll_id(
         &self,
         id: Pin<&PacketId<'a, Perms, Param>>,

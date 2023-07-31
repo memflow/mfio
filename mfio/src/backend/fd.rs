@@ -55,6 +55,7 @@ impl<F: AsRawFd> FdWaker<F> {
     pub fn wake_by_ref(&self) {
         let inner = unsafe { &*self.0 };
         let flags = inner.flags.fetch_or(0b1, Ordering::AcqRel);
+        log::trace!("Flags {flags:b}");
         if flags & 0b11 == 0 {
             let mut f = unsafe { File::from_raw_fd(inner.fd.as_raw_fd()) };
             f.write_all(&1u64.to_ne_bytes())

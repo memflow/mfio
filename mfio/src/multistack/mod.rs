@@ -57,6 +57,18 @@ impl<T> MultiStack<T> {
         }
     }
 
+    pub fn free(&self) -> usize {
+        MultiStackIterator {
+            stack: self,
+            idx: self.free_list.head,
+        }
+        .count()
+    }
+
+    pub fn total(&self) -> usize {
+        self.elems.len()
+    }
+
     pub fn free_stack(&mut self, id: &StackHandle) {
         while self.pop(id).is_some() {}
     }

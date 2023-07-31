@@ -126,6 +126,16 @@ struct IoOpsHandle<Perms: IntoOp, Param: PosMap> {
     state: BaseArc<Mutex<IoUringState>>,
 }
 
+impl<Perms: IntoOp, Param: PosMap> Drop for IoOpsHandle<Perms, Param> {
+    fn drop(&mut self) {
+        log::trace!(
+            "Drop handle {} {}",
+            std::any::type_name::<Perms>(),
+            self.state.strong_count()
+        );
+    }
+}
+
 impl<Perms: IntoOp, Param: PosMap> IoOpsHandle<Perms, Param> {
     fn new(key: usize, state: BaseArc<Mutex<IoUringState>>) -> Self {
         Self {
@@ -174,8 +184,8 @@ impl<Perms: IntoOp, Param: PosMap> PacketIoHandleable<'static, Perms, Param>
 pub struct IoWrapper<Param> {
     key: usize,
     state: BaseArc<Mutex<IoUringState>>,
-    read_stream: BaseArc<PacketStream<'static, WrPerm, Param>>,
-    write_stream: BaseArc<PacketStream<'static, RdPerm, Param>>,
+    read_stream: PacketStream<'static, WrPerm, Param>,
+    write_stream: PacketStream<'static, RdPerm, Param>,
 }
 
 impl<Param> IoWrapper<Param> {
@@ -185,15 +195,15 @@ impl<Param> IoWrapper<Param> {
     {
         let write_io = BaseArc::new(IoOpsHandle::new(key, state.clone()));
 
-        let write_stream = BaseArc::from(PacketStream {
+        let write_stream = PacketStream {
             ctx: PacketCtx::new(write_io).into(),
-        });
+        };
 
         let read_io = BaseArc::new(IoOpsHandle::new(key, state.clone()));
 
-        let read_stream = BaseArc::from(PacketStream {
+        let read_stream = PacketStream {
             ctx: PacketCtx::new(read_io).into(),
-        });
+        };
 
         Self {
             key,
@@ -207,13 +217,22 @@ impl<Param> IoWrapper<Param> {
 impl<Param> Drop for IoWrapper<Param> {
     fn drop(&mut self) {
         let mut state = self.state.lock();
-        let _ = state.files.remove(self.key);
+        let v = state.files.remove(self.key);
 
-        state
+        log::trace!("Dropping {} {}", self.key, v.as_raw_fd());
+
+        let r = state
             .ring
             .submitter()
             .register_files_update(self.key as _, &[-1])
             .unwrap();
+
+        log::trace!(
+            "{r} {} | {} {}",
+            self.state.strong_count(),
+            self.read_stream.ctx.strong_count(),
+            self.write_stream.ctx.strong_count(),
+        );
     }
 }
 
@@ -240,6 +259,12 @@ struct IoUringState {
     all_sub: usize,
     all_comp: usize,
     flushed: bool,
+}
+
+impl Drop for IoUringState {
+    fn drop(&mut self) {
+        log::trace!("Dropping uring!");
+    }
 }
 
 impl IoUringState {
@@ -309,6 +334,22 @@ pub struct NativeFs {
     backend: BackendContainer<DynBackend>,
     state: BaseArc<Mutex<IoUringState>>,
     waker: FdWaker<RawFd>,
+}
+
+impl Drop for NativeFs {
+    fn drop(&mut self) {
+        {
+            let mut state = self.state.lock();
+            log::trace!("clear {} pending_ops", state.pending_ops.len());
+            state.pending_ops.clear();
+            // Clearing this normally is dangerous, because any completions being polled in the
+            // backend would lead to a panic. However, here it is safe to do, because dropping
+            // `NativeFs` implies drop of the backend handle.
+            log::trace!("clear {} ops", state.ops.len());
+            state.ops.clear();
+        }
+        log::trace!("Drop native FS {}", self.state.strong_count());
+    }
 }
 
 impl NativeFs {
