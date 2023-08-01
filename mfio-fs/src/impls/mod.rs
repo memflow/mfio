@@ -138,3 +138,35 @@ impl<T: AsRawSocket + IntoRawSocket + FromRawSocket> RawHandleConv for T {
         Self::from_raw_socket(handle)
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
+pub enum Key {
+    File(usize),
+    Stream(usize),
+}
+
+impl From<usize> for Key {
+    fn from(raw: usize) -> Self {
+        if raw & 1 != 0 {
+            Self::Stream(raw >> 1)
+        } else {
+            Self::File(raw >> 1)
+        }
+    }
+}
+
+impl Key {
+    pub fn idx(self) -> usize {
+        match self {
+            Self::File(v) => v,
+            Self::Stream(v) => v,
+        }
+    }
+
+    pub fn key(self) -> usize {
+        match self {
+            Self::File(v) => v << 1,
+            Self::Stream(v) => (v << 1) | 1,
+        }
+    }
+}

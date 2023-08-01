@@ -13,7 +13,7 @@ use mfio::backend::fd::FdWaker;
 use mfio::backend::*;
 use mfio::tarc::BaseArc;
 
-use super::StreamHandleConv;
+use super::{Key, StreamHandleConv};
 use tracing::instrument::Instrument;
 
 use file::FileInner;
@@ -66,38 +66,6 @@ impl MioState {
             streams: Default::default(),
             opqueue: vec![],
         })
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum Key {
-    File(usize),
-    Stream(usize),
-}
-
-impl From<usize> for Key {
-    fn from(raw: usize) -> Self {
-        if raw & 1 != 0 {
-            Self::Stream(raw >> 1)
-        } else {
-            Self::File(raw >> 1)
-        }
-    }
-}
-
-impl Key {
-    fn idx(self) -> usize {
-        match self {
-            Self::File(v) => v,
-            Self::Stream(v) => v,
-        }
-    }
-
-    fn key(self) -> usize {
-        match self {
-            Self::File(v) => v << 1,
-            Self::Stream(v) => (v << 1) | 1,
-        }
     }
 }
 
