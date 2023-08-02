@@ -1,9 +1,12 @@
 use std::fs::File;
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
+use core::cell::UnsafeCell;
 use core::future::pending;
 use core::mem::{ManuallyDrop, MaybeUninit};
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::time::Duration;
 
 use super::{OwnedStreamHandle, StreamBorrow, StreamHandleConv};
 
@@ -13,11 +16,6 @@ use std::os::unix::fs::FileExt;
 #[cfg(all(windows, not(miri)))]
 use std::os::windows::fs::FileExt;
 
-#[cfg(windows)]
-use std::os::windows::io::{
-    AsRawHandle, FromRawHandle, IntoRawHandle as IntoRaw, IntoRawSocket, OwnedHandle, OwnedSocked,
-};
-
 use mfio::backend::*;
 use mfio::packet::*;
 use mfio::tarc::BaseArc;
@@ -26,18 +24,39 @@ use crate::util::io_err;
 use mfio::error::State;
 
 struct IoInner<Handle, Param> {
-    handle: Handle,
+    handle: UnsafeCell<Handle>,
+    closed: AtomicBool,
     read_at: fn(&Handle, &mut [u8], Param) -> io::Result<usize>,
     write_at: fn(&Handle, &[u8], Param) -> io::Result<usize>,
 }
 
+unsafe impl<Handle: Send, Param> Send for IoInner<Handle, Param> {}
+unsafe impl<Handle: Sync, Param> Sync for IoInner<Handle, Param> {}
+
 impl<Handle, Param> IoInner<Handle, Param> {
     fn read_at(&self, buf: &mut [u8], pos: Param) -> io::Result<usize> {
-        (self.read_at)(&self.handle, buf, pos)
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        let handle = unsafe { &*self.handle.get() };
+        (self.read_at)(handle, buf, pos)
     }
 
     fn write_at(&self, buf: &[u8], pos: Param) -> io::Result<usize> {
-        (self.write_at)(&self.handle, buf, pos)
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        let handle = unsafe { &*self.handle.get() };
+        (self.write_at)(handle, buf, pos)
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+        // SAFETY: what we are doing here is very dubious at best. We want to close the file handle
+        // in order to interrupt outstanding reads. No new read requests will come after this
+        unsafe {
+            core::ptr::drop_in_place(self.handle.get());
+        }
     }
 }
 
@@ -76,7 +95,8 @@ impl From<File> for IoInner<File, u64> {
         }
 
         Self {
-            handle,
+            handle: handle.into(),
+            closed: AtomicBool::new(false),
             read_at,
             write_at,
         }
@@ -109,7 +129,8 @@ impl<T: StreamHandleConv> From<T> for IoInner<OwnedStreamHandle, NoPos> {
         let handle = stream.into_owned();
 
         Self {
-            handle,
+            handle: handle.into(),
+            closed: AtomicBool::new(false),
             read_at: read_at::<T>,
             write_at: write_at::<T>,
         }
@@ -147,21 +168,40 @@ impl<Perms: PacketPerms, Param> PacketIoHandleable<'static, Perms, Param>
 }
 
 struct IoWrapper<Handle, Param> {
-    _file: BaseArc<IoInner<Handle, Param>>,
+    _file: ManuallyDrop<BaseArc<IoInner<Handle, Param>>>,
     read_stream: ManuallyDrop<BaseArc<PacketStream<'static, Write, Param>>>,
     write_stream: ManuallyDrop<BaseArc<PacketStream<'static, Read, Param>>>,
-    read_thread: Option<JoinHandle<()>>,
+    read_thread: Option<(Receiver<()>, JoinHandle<()>)>,
     write_thread: Option<JoinHandle<()>>,
 }
 
+// We are accessing the Receivers only in drop, therefore it's safe to mark this as Sync.
+unsafe impl<Handle, Param> Sync for IoWrapper<Handle, Param> where IoWrapper<Handle, Param>: Send {}
+
 impl<Handle, Param> Drop for IoWrapper<Handle, Param> {
     fn drop(&mut self) {
+        // SAFETY: we are dropping only here and not accessing the value anywhere else.
         unsafe {
             ManuallyDrop::drop(&mut self.read_stream);
             ManuallyDrop::drop(&mut self.write_stream);
         }
-        self.read_thread.take().unwrap().join().unwrap();
+
         self.write_thread.take().unwrap().join().unwrap();
+
+        self._file.close();
+
+        unsafe {
+            ManuallyDrop::drop(&mut self._file);
+        }
+
+        let (rrx, rjoin) = self.read_thread.take().unwrap();
+        if rrx.recv_timeout(Duration::from_millis(500)).is_ok() {
+            rjoin.join().unwrap();
+        } else {
+            log::error!(
+                "Unable to join read thread in 500 milliseconds! Leaving the thread detached."
+            );
+        }
     }
 }
 
@@ -172,58 +212,64 @@ impl<Handle: Send + Sync + 'static, Param: Send + 'static> From<BaseArc<IoInner<
         let (read_tx, read_rx) = mpsc::channel();
         let read_io = BaseArc::new(IoThreadHandle::<Write, Param>::new(read_tx));
 
-        let read_thread = Some(thread::spawn({
-            let file = file.clone();
-            move || {
-                let mut tmp_buf = vec![];
-                for (pos, buf) in read_rx {
-                    let copy_buf = |buf: &mut [MaybeUninit<u8>]| {
-                        // SAFETY: assume MaybeUninit<u8> is initialized,
-                        // as God intended :upside_down:
-                        let buf = unsafe {
-                            let ptr = buf.as_mut_ptr();
-                            let len = buf.len();
-                            core::slice::from_raw_parts_mut(ptr as *mut u8, len)
+        let (rtx, rrx) = mpsc::channel();
+        let read_thread = Some((
+            rrx,
+            thread::spawn({
+                let file = file.clone();
+                move || {
+                    let mut tmp_buf = vec![];
+                    for (pos, buf) in read_rx {
+                        let copy_buf = |buf: &mut [MaybeUninit<u8>]| {
+                            // SAFETY: assume MaybeUninit<u8> is initialized,
+                            // as God intended :upside_down:
+                            let buf = unsafe {
+                                let ptr = buf.as_mut_ptr();
+                                let len = buf.len();
+                                core::slice::from_raw_parts_mut(ptr as *mut u8, len)
+                            };
+
+                            file.read_at(buf, pos)
                         };
 
-                        file.read_at(buf, pos)
-                    };
-
-                    if !buf.is_empty() {
-                        match buf.try_alloc() {
-                            Ok(mut alloced) => match copy_buf(&mut alloced[..]) {
-                                Ok(read) if read < alloced.len() => {
-                                    let (_, right) = alloced.split_at(read);
-                                    right.error(io_err(State::Nop));
-                                }
-                                Err(e) => alloced.error(io_err(e.kind().into())),
-                                _ => (),
-                            },
-                            Err(buf) => {
-                                // TODO: size limit the temp buffer.
-                                if tmp_buf.len() < buf.len() {
-                                    tmp_buf.reserve(buf.len() - tmp_buf.len());
-                                    // SAFETY: assume MaybeUninit<u8> is initialized,
-                                    // as God intended :upside_down:
-                                    unsafe { tmp_buf.set_len(tmp_buf.capacity()) }
-                                }
-                                match copy_buf(&mut tmp_buf[..buf.len()]) {
-                                    Ok(read) if read < buf.len() => {
-                                        let (left, right) = buf.split_at(read);
-                                        unsafe { left.transfer_data(tmp_buf.as_ptr().cast()) };
+                        if !buf.is_empty() {
+                            match buf.try_alloc() {
+                                Ok(mut alloced) => match copy_buf(&mut alloced[..]) {
+                                    Ok(read) if read < alloced.len() => {
+                                        let (_, right) = alloced.split_at(read);
                                         right.error(io_err(State::Nop));
                                     }
-                                    Err(e) => buf.error(io_err(e.kind().into())),
-                                    _ => {
-                                        unsafe { buf.transfer_data(tmp_buf.as_ptr().cast()) };
+                                    Err(e) => alloced.error(io_err(e.kind().into())),
+                                    _ => (),
+                                },
+                                Err(buf) => {
+                                    // TODO: size limit the temp buffer.
+                                    if tmp_buf.len() < buf.len() {
+                                        tmp_buf.reserve(buf.len() - tmp_buf.len());
+                                        // SAFETY: assume MaybeUninit<u8> is initialized,
+                                        // as God intended :upside_down:
+                                        unsafe { tmp_buf.set_len(tmp_buf.capacity()) }
+                                    }
+                                    match copy_buf(&mut tmp_buf[..buf.len()]) {
+                                        Ok(read) if read < buf.len() => {
+                                            let (left, right) = buf.split_at(read);
+                                            unsafe { left.transfer_data(tmp_buf.as_ptr().cast()) };
+                                            right.error(io_err(State::Nop));
+                                        }
+                                        Err(e) => buf.error(io_err(e.kind().into())),
+                                        _ => {
+                                            unsafe { buf.transfer_data(tmp_buf.as_ptr().cast()) };
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+
+                    let _ = rtx.send(());
                 }
-            }
-        }));
+            }),
+        ));
 
         let (write_tx, write_rx) = mpsc::channel();
         let write_io = BaseArc::new(IoThreadHandle::new(write_tx));
@@ -281,7 +327,7 @@ impl<Handle: Send + Sync + 'static, Param: Send + 'static> From<BaseArc<IoInner<
         }));
 
         Self {
-            _file: file,
+            _file: ManuallyDrop::new(file),
             read_thread,
             write_thread,
             read_stream,
