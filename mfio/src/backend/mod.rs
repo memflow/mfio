@@ -30,7 +30,16 @@ pub type DefaultHandle = RawHandle;
 
 pub type DynBackend = dyn Future<Output = ()> + Send;
 
+#[repr(C)]
+struct NestedBackend {
+    owner: *const (),
+    poll: unsafe extern "C" fn(*const (), &mut Context),
+    release: unsafe extern "C" fn(*const ()),
+}
+
+#[repr(C)]
 pub struct BackendContainer<B: ?Sized> {
+    nest: UnsafeCell<Option<NestedBackend>>,
     backend: UnsafeCell<Pin<Box<B>>>,
     lock: AtomicBool,
 }
@@ -52,12 +61,55 @@ impl<B: ?Sized> BackendContainer<B> {
             wake_flags,
         }
     }
+
+    pub fn acquire_nested<B2: ?Sized + Future<Output = ()>>(
+        &self,
+        mut handle: BackendHandle<B2>,
+    ) -> BackendHandle<B> {
+        let wake_flags = handle.wake_flags.take();
+        let owner = handle.owner;
+
+        let our_handle = self.acquire(wake_flags);
+
+        unsafe extern "C" fn poll<B: ?Sized + Future<Output = ()>>(
+            data: *const (),
+            context: &mut Context,
+        ) {
+            let data = &*(data as *const BackendContainer<B>);
+            if Pin::new_unchecked(&mut *data.backend.get())
+                .poll(context)
+                .is_ready()
+            {
+                panic!("Backend polled to completion!")
+            }
+        }
+
+        unsafe extern "C" fn release<B: ?Sized>(data: *const ()) {
+            let data = &*(data as *const BackendContainer<B>);
+            data.lock.store(false, Ordering::Release);
+        }
+
+        // We must prevent drop from being called, since we are replacing the release mechanism
+        // ourselves.
+        core::mem::forget(handle);
+
+        unsafe {
+            *self.nest.get() = Some(NestedBackend {
+                owner: owner as *const _ as *const (),
+                poll: poll::<B2>,
+                release: release::<B2>,
+            });
+        }
+
+        our_handle
+    }
 }
 
 impl BackendContainer<DynBackend> {
     pub fn new_dyn<T: Future<Output = ()> + Send + 'static>(backend: T) -> Self {
         Self {
             backend: UnsafeCell::new(Box::pin(backend) as Pin<Box<dyn Future<Output = ()> + Send>>),
+            nest: UnsafeCell::new(None),
             lock: Default::default(),
         }
     }
@@ -71,6 +123,15 @@ pub struct BackendHandle<'a, B: ?Sized> {
 
 impl<'a, B: ?Sized> Drop for BackendHandle<'a, B> {
     fn drop(&mut self) {
+        // SAFETY: we are still holding the lock to this data
+        if let Some(NestedBackend { owner, release, .. }) =
+            unsafe { (*self.owner.nest.get()).take() }
+        {
+            // SAFETY: this structure is constructed only in acquire_nested. We assume it
+            // constructs the structure correctly.
+            unsafe { release(owner) }
+        }
+
         self.owner.lock.store(false, Ordering::Release);
     }
 }
@@ -117,7 +178,16 @@ impl<'a, Backend: Future + ?Sized, Fut: Future + ?Sized> Future for WithBackend<
                 }
                 Poll::Pending => match backend.poll(cx) {
                     Poll::Ready(_) => panic!("Backend future completed"),
-                    Poll::Pending => (),
+                    Poll::Pending => {
+                        // SAFETY: we are holding the lock to the backend.
+                        if let Some(NestedBackend { owner, poll, .. }) =
+                            unsafe { &*this.backend.owner.nest.get() }
+                        {
+                            // SAFETY: this structure is constructed only in acquire_nested. We
+                            // assume it constructs the structure correctly.
+                            unsafe { poll(*owner, cx) };
+                        }
+                    }
                 },
             }
 

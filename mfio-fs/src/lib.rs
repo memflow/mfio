@@ -4,6 +4,7 @@ use mfio::backend::*;
 use mfio::error::{Code, Error, Location, Result as MfioResult, State, Subject};
 use mfio::packet::{FastCWaker, NoPos, PacketId, PacketIo, Read, Write};
 use mfio::stdeq::{AsyncRead, AsyncWrite, Seekable};
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
@@ -11,7 +12,7 @@ pub mod impls;
 pub(crate) mod util;
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq, PartialOrd, Ord)]
 pub struct OpenOptions {
     pub read: bool,
     pub write: bool,

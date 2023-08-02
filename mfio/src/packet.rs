@@ -509,12 +509,12 @@ pub trait PacketPerms: 'static + core::fmt::Debug + Clone + Copy {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ReadWrite {
-    get_mut: for<'a> unsafe extern "C" fn(
+    pub get_mut: for<'a> unsafe extern "C" fn(
         &mut ManuallyDrop<BoundPacketObj<'a, Self>>,
         usize,
         &mut MaybeUninit<ReadWritePacketObj<'a>>,
     ) -> bool,
-    transfer_data: for<'a, 'b> unsafe extern "C" fn(&'a mut BoundPacketObj<'b, Self>, *mut ()),
+    pub transfer_data: for<'a, 'b> unsafe extern "C" fn(&'a mut BoundPacketObj<'b, Self>, *mut ()),
 }
 
 impl core::fmt::Debug for ReadWrite {
@@ -540,12 +540,13 @@ impl PacketPerms for ReadWrite {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Write {
-    get_mut: for<'a> unsafe extern "C" fn(
+    pub get_mut: for<'a> unsafe extern "C" fn(
         &mut ManuallyDrop<BoundPacketObj<'a, Self>>,
         usize,
         &mut MaybeUninit<WritePacketObj<'a>>,
     ) -> bool,
-    transfer_data: for<'a, 'b> unsafe extern "C" fn(&'a mut BoundPacketObj<'b, Self>, *const ()),
+    pub transfer_data:
+        for<'a, 'b> unsafe extern "C" fn(&'a mut BoundPacketObj<'b, Self>, *const ()),
 }
 
 impl core::fmt::Debug for Write {
@@ -571,12 +572,12 @@ impl PacketPerms for Write {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Read {
-    get: for<'a> unsafe extern "C" fn(
+    pub get: for<'a> unsafe extern "C" fn(
         &mut ManuallyDrop<BoundPacketObj<'a, Self>>,
         usize,
         &mut MaybeUninit<ReadPacketObj<'a>>,
     ) -> bool,
-    transfer_data: for<'a, 'b> unsafe extern "C" fn(&'a mut BoundPacketObj<'b, Self>, *mut ()),
+    pub transfer_data: for<'a, 'b> unsafe extern "C" fn(&'a mut BoundPacketObj<'b, Self>, *mut ()),
 }
 
 impl core::fmt::Debug for Read {
@@ -690,11 +691,17 @@ pub struct Packet<'a, Perms: PacketPerms> {
     obj: PacketObj<'a, Perms::DataType>,
 }
 
-/*impl<'a, Perms: PacketPerms> Packet<'a, Perms> {
-    pub unsafe fn upgrade(self) -> Packet<'static, Perms> {
-        core::mem::transmute(self)
+impl<'a, Perms: PacketPerms> Packet<'a, Perms> {
+    /// Create a new packet from parts
+    ///
+    /// # Safety
+    ///
+    /// `vtable` argument must contain correct function definitions meant for `obj`, and not cause
+    /// undefined behavior when called against `obj`.
+    pub unsafe fn new(vtable: &'static Perms, obj: PacketObj<'a, Perms::DataType>) -> Self {
+        Self { vtable, obj }
     }
-}*/
+}
 
 impl<'a> From<&'a mut [u8]> for Packet<'a, ReadWrite> {
     fn from(slc: &'a mut [u8]) -> Self {
@@ -925,6 +932,7 @@ impl<'a> AllocatedPacket for ReadWritePacketObj<'a> {
 }
 
 unsafe impl<'a> Send for ReadWritePacketObj<'a> {}
+unsafe impl Sync for ReadWritePacketObj<'_> {}
 
 impl core::ops::Deref for ReadWritePacketObj<'_> {
     type Target = [u8];
@@ -986,6 +994,7 @@ impl<'a> AllocatedPacket for WritePacketObj<'a> {
 }
 
 unsafe impl<'a> Send for WritePacketObj<'a> {}
+unsafe impl Sync for WritePacketObj<'_> {}
 
 impl core::ops::Deref for WritePacketObj<'_> {
     type Target = [MaybeUninit<u8>];
@@ -1047,6 +1056,7 @@ impl<'a> AllocatedPacket for ReadPacketObj<'a> {
 }
 
 unsafe impl<'a> Send for ReadPacketObj<'a> {}
+unsafe impl Sync for ReadPacketObj<'_> {}
 
 impl core::ops::Deref for ReadPacketObj<'_> {
     type Target = [u8];
@@ -1142,6 +1152,16 @@ impl<'a, T: PacketPerms> Errorable for BoundPacketObj<'a, T> {
 }
 
 impl<'a, T: PacketPerms> BoundPacketObj<'a, T> {
+    /// Get direct access to packet buffer.
+    ///
+    /// # Safety
+    ///
+    /// Currently `PacketObj` is not properly encapsulated - modifying the packet in unexpected
+    /// ways may lead to undefined behavior.
+    pub unsafe fn buffer(&mut self) -> &mut PacketObj<'a, T::DataType> {
+        &mut self.buffer
+    }
+
     fn output(&mut self, err: Option<Error>) {
         let id = &self.id.id;
         let mut output_stack = self.output.stack.lock();
