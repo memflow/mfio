@@ -7,12 +7,14 @@ members = [
 	"mfio",
 	"mfio-fs",
 	"mfio-derive",
+	"mfio-netfs",
 ]
 
 default-members = [
 	"mfio",
 	"mfio-fs",
 	"mfio-derive",
+	"mfio-netfs",
 ]
 
 [patch.crates-io]

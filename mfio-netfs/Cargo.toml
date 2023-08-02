@@ -1,0 +1,58 @@
+[package]
+name = "mfio-netfs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+bench = false
+
+[[bench]]
+name = "main"
+harness = false
+required-features = ["mfio/tokio"]
+
+[[example]]
+name = "trace"
+required-features = ["tokio/net"]
+
+[[bin]]
+name = "mfio-netfs-server"
+test = false
+bench = false
+required-features = ["bin-deps"]
+
+[dependencies]
+mfio = { version = "0.1", path = "../mfio" }
+mfio-fs = { version = "0.1", path = "../mfio-fs" }
+bincode = "1"
+cglue = { version = "0.2", git = "https://github.com/h33p/cglue", features = ["task_unstable"] }
+flume = "0.10"
+log = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+async-rwlock = "1"
+serde = { version = "1", features = ["derive"] }
+parking_lot = "0.12"
+futures = "0.3.28"
+futures-io = "0.3"
+slab = "0.4"
+tracing = "0.1"
+
+clap = { version = "4", features = ["cargo", "derive"], optional = true }
+anyhow = { version = "1", optional = true }
+env_logger = { version = "0.10", optional = true }
+
+tokio = { version = "1.24", features = ["rt", "net", "macros"], optional = true }
+
+[dev-dependencies]
+env_logger = "0.10"
+criterion = { version = "0.5", git = "https://github.com/h33p/criterion.rs", branch = "tput2", features = ["async_tokio", "async_smol", "async_futures"] }
+rand = "0.8"
+tracing-tracy = { version = "0.10", features = ["fibers", "only-localhost"] }
+tracing-subscriber = "0.3"
+
+[target.'cfg(not(miri))'.dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[features]
+default = []
+bin-deps = ["clap", "tokio", "anyhow", "env_logger", "mfio/tokio"]
