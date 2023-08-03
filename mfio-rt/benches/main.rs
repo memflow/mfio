@@ -5,7 +5,7 @@ use criterion::*;
 use mfio::backend::integrations::{async_io::AsyncIo, tokio::Tokio};
 use mfio::backend::*;
 use mfio::traits::*;
-use mfio_fs::*;
+use mfio_rt::*;
 use rand::prelude::*;
 use std::fs::{write, File};
 use std::path::Path;
@@ -73,7 +73,7 @@ fn file_read(c: &mut Criterion) {
 
                 let mut elapsed = Duration::default();
 
-                NativeFs::default().run(|fs| async move {
+                NativeRt::default().run(|fs| async move {
                     let file = fs
                         .open(temp_path, OpenOptions::new().read(true))
                         .await
@@ -123,7 +123,7 @@ fn file_read(c: &mut Criterion) {
 
                     let mut elapsed = Duration::default();
 
-                    let mut fs = NativeFs::default();
+                    let mut fs = NativeRt::default();
 
                     Tokio::run_with_mut(&mut fs, |fs| async move {
                         let file = fs
@@ -175,7 +175,7 @@ fn file_read(c: &mut Criterion) {
 
                     let mut elapsed = Duration::default();
 
-                    let mut fs = NativeFs::default();
+                    let mut fs = NativeRt::default();
 
                     AsyncIo::run_with_mut(&mut fs, |fs| async move {
                         let file = fs

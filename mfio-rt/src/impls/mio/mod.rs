@@ -69,13 +69,13 @@ impl MioState {
     }
 }
 
-pub struct NativeFs {
+pub struct Runtime {
     state: BaseArc<Mutex<MioState>>,
     backend: BackendContainer<DynBackend>,
     waker: FdWakerOwner<OwnedFd>,
 }
 
-impl NativeFs {
+impl Runtime {
     pub fn try_new() -> std::io::Result<Self> {
         let state = MioState::try_new()?;
 
@@ -248,7 +248,7 @@ impl NativeFs {
     }
 }
 
-impl IoBackend for NativeFs {
+impl IoBackend for Runtime {
     type Backend = DynBackend;
 
     fn polling_handle(&self) -> Option<PollingHandle> {
@@ -266,7 +266,7 @@ impl IoBackend for NativeFs {
     }
 }
 
-impl NativeFs {
+impl Runtime {
     pub fn register_file(&self, file: File) -> FileWrapper {
         let fd = file.as_raw_fd();
         set_nonblock(fd).unwrap();

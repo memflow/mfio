@@ -11,7 +11,7 @@ use mfio::error::Error;
 use mfio::packet::{NoPos, PacketIo};
 use mfio::stdeq::Seekable;
 use mfio::tarc::BaseArc;
-use mfio_fs::{FileWrapper, Fs, NativeFs};
+use mfio_rt::{FileWrapper, Fs, NativeRt};
 use parking_lot::Mutex;
 use slab::Slab;
 use tracing::instrument::Instrument;
@@ -21,7 +21,7 @@ use futures::{
     pin_mut,
     stream::{FusedStream, FuturesUnordered, Stream, StreamExt},
 };
-use mfio_fs::OpenOptions;
+use mfio_rt::OpenOptions;
 use std::path::Path;
 
 struct SessionState {
@@ -111,7 +111,7 @@ impl<'a> From<&'a ReadPacket> for Packet<'a, Write> {
 }
 
 impl SessionState {
-    async fn run(mut self, fs: &NativeFs) {
+    async fn run(mut self, fs: &NativeRt) {
         let stream_raw = &fs.register_stream(self.stream);
         let file_handles = core::cell::RefCell::new(&mut self.file_handles);
 
@@ -408,7 +408,7 @@ impl SessionState {
 
     //#[tracing::instrument(skip_all)]
     fn block_on(self) {
-        let fs = NativeFs::default();
+        let fs = NativeRt::default();
         fs.block_on(self.run(&fs))
     }
 }
@@ -441,7 +441,7 @@ pub fn single_client_server(addr: SocketAddr) -> std::thread::JoinHandle<()> {
     ret
 }
 
-pub async fn server_bind(fs: &NativeFs, bind_addr: SocketAddr) {
+pub async fn server_bind(fs: &NativeRt, bind_addr: SocketAddr) {
     let (tx, rx) = flume::bounded(0);
 
     let listener = TcpListener::bind(bind_addr).unwrap();
@@ -458,7 +458,7 @@ pub async fn server_bind(fs: &NativeFs, bind_addr: SocketAddr) {
     server(fs, rx.into_stream()).await
 }
 
-pub async fn server<T: Stream<Item = TcpStream> + FusedStream>(fs: &NativeFs, clients: T) {
+pub async fn server<T: Stream<Item = TcpStream> + FusedStream>(fs: &NativeRt, clients: T) {
     futures::pin_mut!(clients);
 
     // TODO: load balance clients with multiple FS instances per-thread.
@@ -496,7 +496,7 @@ mod tests {
     use super::super::client::NetworkFs;
     use super::*;
     use mfio::traits::IoRead;
-    use mfio_fs::Fs;
+    use mfio_rt::Fs;
     use std::path::Path;
 
     #[test]
@@ -506,7 +506,7 @@ mod tests {
 
         let server = single_client_server(addr);
 
-        let fs = mfio_fs::NativeFs::default();
+        let fs = mfio_rt::NativeRt::default();
         let fs = NetworkFs::with_fs(addr, fs.into()).unwrap();
 
         fs.block_on(async {

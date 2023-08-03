@@ -2,7 +2,7 @@ use core::mem::MaybeUninit;
 use futures::stream::{FuturesUnordered, StreamExt};
 use mfio::backend::*;
 use mfio::traits::*;
-use mfio_fs::*;
+use mfio_rt::*;
 use rand::prelude::*;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};

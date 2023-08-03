@@ -250,7 +250,7 @@ impl IoUringState {
     }
 }
 
-pub struct NativeFs {
+pub struct Runtime {
     // NOTE: this must be before `state`, because `backend` contains references to data, owned by
     // `state`.
     backend: BackendContainer<DynBackend>,
@@ -258,7 +258,7 @@ pub struct NativeFs {
     waker: FdWakerOwner<RawFd>,
 }
 
-impl Drop for NativeFs {
+impl Drop for Runtime {
     fn drop(&mut self) {
         {
             let mut state = self.state.lock();
@@ -266,7 +266,7 @@ impl Drop for NativeFs {
             state.pending_ops.clear();
             // Clearing this normally is dangerous, because any completions being polled in the
             // backend would lead to a panic. However, here it is safe to do, because dropping
-            // `NativeFs` implies drop of the backend handle.
+            // `Runtime` implies drop of the backend handle.
             log::trace!("clear {} ops", state.ops.len());
             state.ops.clear();
 
@@ -286,7 +286,7 @@ impl Drop for NativeFs {
     }
 }
 
-impl NativeFs {
+impl Runtime {
     pub fn try_new() -> std::io::Result<Self> {
         let mut state = IoUringState::try_new()?;
 
@@ -469,7 +469,7 @@ impl NativeFs {
     }
 }
 
-impl IoBackend for NativeFs {
+impl IoBackend for Runtime {
     type Backend = DynBackend;
 
     fn polling_handle(&self) -> Option<PollingHandle> {
@@ -487,7 +487,7 @@ impl IoBackend for NativeFs {
     }
 }
 
-impl NativeFs {
+impl Runtime {
     pub fn register_file(&self, file: File) -> FileWrapper {
         let mut state = self.state.lock();
         let key = state.register_file(file);

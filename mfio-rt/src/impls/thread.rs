@@ -372,11 +372,11 @@ impl PacketIo<Write, NoPos> for StreamWrapper {
     }
 }
 
-pub struct NativeFs {
+pub struct Runtime {
     backend: BackendContainer<DynBackend>,
 }
 
-impl NativeFs {
+impl Runtime {
     pub fn try_new() -> Result<Self, std::convert::Infallible> {
         Ok(Self {
             backend: BackendContainer::new_dyn(pending()),
@@ -384,7 +384,7 @@ impl NativeFs {
     }
 }
 
-impl IoBackend for NativeFs {
+impl IoBackend for Runtime {
     type Backend = DynBackend;
 
     fn polling_handle(&self) -> Option<PollingHandle> {
@@ -399,7 +399,7 @@ impl IoBackend for NativeFs {
 pub struct FileWrapper(IoWrapper<File, u64>);
 pub struct StreamWrapper(IoWrapper<OwnedStreamHandle, NoPos>);
 
-impl NativeFs {
+impl Runtime {
     pub fn register_file(&self, file: File) -> FileWrapper {
         FileWrapper(IoWrapper::from(BaseArc::from(IoInner::from(file))))
     }

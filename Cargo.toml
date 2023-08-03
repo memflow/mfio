@@ -5,14 +5,14 @@ debug = true
 [workspace]
 members = [
 	"mfio",
-	"mfio-fs",
+	"mfio-rt",
 	"mfio-derive",
 	"mfio-netfs",
 ]
 
 default-members = [
 	"mfio",
-	"mfio-fs",
+	"mfio-rt",
 	"mfio-derive",
 	"mfio-netfs",
 ]

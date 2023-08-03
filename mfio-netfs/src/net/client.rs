@@ -18,7 +18,7 @@ use super::{HeaderRouter, Request, Response};
 use cglue::result::IntError;
 use futures::{future::FutureExt, pin_mut};
 use mfio::error::Error;
-use mfio_fs::Fs;
+use mfio_rt::Fs;
 
 use std::io::{self /*, Read as _, Write as _*/};
 use std::net::{SocketAddr, TcpStream};
@@ -178,13 +178,13 @@ pub struct NetworkFs {
     state: BaseArc<Mutex<NetFsState>>,
     backend: BackendContainer<DynBackend>,
     senders: BaseArc<Senders>,
-    fs: Arc<mfio_fs::NativeFs>,
+    fs: Arc<mfio_rt::NativeRt>,
 }
 
 impl NetworkFs {
     pub fn try_new(addr: SocketAddr) -> Result<Self> {
         let fs = Arc::new(
-            mfio_fs::NativeFs::builder()
+            mfio_rt::NativeRt::builder()
                 .thread(true)
                 .enable_all()
                 .build()
@@ -193,7 +193,7 @@ impl NetworkFs {
         Self::with_fs(addr, fs)
     }
 
-    pub fn with_fs(addr: SocketAddr, fs: Arc<mfio_fs::NativeFs>) -> Result<Self> {
+    pub fn with_fs(addr: SocketAddr, fs: Arc<mfio_rt::NativeRt>) -> Result<Self> {
         let stream = TcpStream::connect(addr)?;
 
         let stream = fs.register_stream(stream);
@@ -559,7 +559,7 @@ impl Fs for NetworkFs {
 use core::future::Future;
 use core::pin::Pin;
 use mfio::stdeq::Seekable;
-use mfio_fs::OpenOptions;
+use mfio_rt::OpenOptions;
 use std::path::Path;
 
 pub struct OpenFuture<'a> {

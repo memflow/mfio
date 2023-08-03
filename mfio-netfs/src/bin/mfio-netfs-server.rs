@@ -17,7 +17,7 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    let mut fs = mfio_fs::NativeFs::default();
+    let mut fs = mfio_rt::NativeRt::default();
 
     let listener = TcpListener::bind(args.bind).await?;
 

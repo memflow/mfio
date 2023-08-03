@@ -6,7 +6,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use mfio::backend::integrations::tokio::Tokio;
 use mfio::backend::*;
 use mfio::traits::*;
-use mfio_fs::*;
+use mfio_rt::*;
 use rand::prelude::*;
 use std::fs::{write, File};
 use std::path::Path;
@@ -222,7 +222,7 @@ fn file_read(c: &mut Criterion) {
 
                 let _elapsed = Duration::default();
 
-                NativeFs::default().run(|fs| mfio_bench(fs, size, iters, order, temp_path))
+                NativeRt::default().run(|fs| mfio_bench(fs, size, iters, order, temp_path))
             });
         });
     }
@@ -236,7 +236,7 @@ fn file_read(c: &mut Criterion) {
                 .iter_custom(|iters| async move {
                     drop_cache(temp_path).unwrap();
 
-                    let mut fs = NativeFs::default();
+                    let mut fs = NativeRt::default();
 
                     Tokio::run_with_mut(&mut fs, |fs| mfio_bench(fs, size, iters, order, temp_path))
                         .await

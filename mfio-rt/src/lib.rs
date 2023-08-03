@@ -84,7 +84,7 @@ macro_rules! fs_dispatch {
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// use mfio::packet::*;
 /// use mfio::stdeq::*;
-/// use mfio_fs::*;
+/// use mfio_rt::*;
 /// use std::fs::write;
 /// use std::path::Path;
 ///
@@ -96,7 +96,7 @@ macro_rules! fs_dispatch {
 /// write(&filepath, test_string.as_bytes())?;
 ///
 /// // Create mfio's filesystem
-/// NativeFs::default().run(|fs| async move {
+/// NativeRt::default().run(|fs| async move {
 ///     let fh = fs.open(&filepath, OpenOptions::new().read(true)).await?;
 ///
 ///     let mut output = vec![];
@@ -117,7 +117,7 @@ macro_rules! fs_dispatch {
 /// # pollster::block_on(async move {
 /// use mfio::packet::*;
 /// use mfio::stdeq::*;
-/// use mfio_fs::*;
+/// use mfio_rt::*;
 /// use std::path::Path;
 /// use std::io::Seek;
 ///
@@ -131,7 +131,7 @@ macro_rules! fs_dispatch {
 /// filepath.push("mfio-fs-test-write");
 ///
 /// // Create mfio's filesystem
-/// NativeFs::default().run(|fs| async move {
+/// NativeRt::default().run(|fs| async move {
 ///     let mut fh = fs.open(
 ///         &filepath,
 ///         OpenOptions::new()
@@ -159,11 +159,11 @@ macro_rules! fs_dispatch {
 /// # })
 /// # }
 /// ```
-        pub enum NativeFs {
-            $($(#[cfg($meta)])* $name(impls::$mod::NativeFs)),*
+        pub enum NativeRt {
+            $($(#[cfg($meta)])* $name(impls::$mod::Runtime)),*
         }
 
-        impl NativeFs {
+        impl NativeRt {
             pub fn register_file(&self, file: std::fs::File) -> FileWrapper {
                 match self {
                     $($(#[cfg($meta)])* Self::$name(v) => FileWrapper::$name(v.register_file(file))),*
@@ -177,28 +177,28 @@ macro_rules! fs_dispatch {
                 }
             }
 
-            pub fn builder() -> NativeFsBuilder {
-                NativeFsBuilder::default()
+            pub fn builder() -> NativeRtBuilder {
+                NativeRtBuilder::default()
             }
         }
 
-        impl core::fmt::Debug for NativeFs {
+        impl core::fmt::Debug for NativeRt {
             fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
                 match self {
-                    $($(#[cfg($meta)])* Self::$name(_) => write!(f, stringify!(NativeFs::$name))),*
+                    $($(#[cfg($meta)])* Self::$name(_) => write!(f, stringify!(NativeRt::$name))),*
                 }
             }
         }
 
-        impl Default for NativeFs {
+        impl Default for NativeRt {
             fn default() -> Self {
-                NativeFsBuilder::env_backends()
+                NativeRtBuilder::env_backends()
                     .build()
                     .expect("Could not initialize any FS backend")
             }
         }
 
-        impl IoBackend for NativeFs {
+        impl IoBackend for NativeRt {
             type Backend = DynBackend;
 
             fn polling_handle(&self) -> Option<PollingHandle> {
@@ -214,7 +214,7 @@ macro_rules! fs_dispatch {
             }
         }
 
-        /// Builder for the [`NativeFs`](NativeFs).
+        /// Builder for the [`NativeRt`](NativeRt).
         ///
         /// This builder allows configuring the I/O backends to try to construct for the filesystem
         /// handle. Note that the order of backends is fixed, and is as follows:
@@ -227,24 +227,24 @@ macro_rules! fs_dispatch {
         ///
         /// If you wish to customize the construction order, please use multiple builders.
         #[derive(Default)]
-        pub struct NativeFsBuilder {
+        pub struct NativeRtBuilder {
             $($(#[cfg($meta)])* $mod: bool),*
         }
 
-        impl NativeFsBuilder {
-            /// Get a `NativeFsBuilder` with all backends enabled.
+        impl NativeRtBuilder {
+            /// Get a `NativeRtBuilder` with all backends enabled.
             pub fn all_backends() -> Self {
                 Self {
                     $($(#[cfg($meta)])* $mod: true),*
                 }
             }
 
-            /// Get a `NativeFsBuilder` with backends specified by environment.
+            /// Get a `NativeRtBuilder` with backends specified by environment.
             ///
             /// This function attempts to parse `MFIO_FS_BACKENDS` environment variable and load
             /// backends specified by it. If the environment variable is not present, or
             /// non-unicode, this function falls back to using
-            /// [`all_backends`](NativeFsBuilder::all_backends).
+            /// [`all_backends`](NativeRtBuilder::all_backends).
             pub fn env_backends() -> Self {
                 match std::env::var("MFIO_FS_BACKENDS") {
                     Ok(val) => {
@@ -273,10 +273,10 @@ macro_rules! fs_dispatch {
                 }
             })*
 
-            pub fn build(self) -> mfio::error::Result<NativeFs> {
+            pub fn build(self) -> mfio::error::Result<NativeRt> {
                 $($(#[cfg($meta)])* if self.$mod {
-                    if let Ok(v) = impls::$mod::NativeFs::try_new() {
-                        return Ok(NativeFs::$name(v));
+                    if let Ok(v) = impls::$mod::Runtime::try_new() {
+                        return Ok(NativeRt::$name(v));
                     }
                 })*
 
@@ -288,15 +288,15 @@ macro_rules! fs_dispatch {
                 })
             }
 
-            pub fn build_each(self) -> Vec<(&'static str, mfio::error::Result<NativeFs>)> {
+            pub fn build_each(self) -> Vec<(&'static str, mfio::error::Result<NativeRt>)> {
                 let mut ret = vec![];
 
                 $($(#[cfg($meta)])* if self.$mod {
                     ret.push((
                         stringify!($mod),
-                        impls::$mod::NativeFs::try_new()
+                        impls::$mod::Runtime::try_new()
                             .map_err(|e| e.into())
-                            .map(|v| NativeFs::$name(v))
+                            .map(|v| NativeRt::$name(v))
                     ));
                 })*
 
@@ -354,7 +354,7 @@ fs_dispatch! {
     Default => thread,
 }
 
-impl Fs for NativeFs {
+impl Fs for NativeRt {
     type FileHandle = Seekable<FileWrapper, u64>;
     type StreamHandle = StreamWrapper;
     type OpenFuture<'a> = core::future::Ready<MfioResult<Self::FileHandle>>;
@@ -373,8 +373,8 @@ impl Fs for NativeFs {
     }
 }
 
-impl NativeFs {
-    pub fn run<'a, Func: FnOnce(&'a NativeFs) -> F, F: Future>(
+impl NativeRt {
+    pub fn run<'a, Func: FnOnce(&'a NativeRt) -> F, F: Future>(
         &'a mut self,
         func: Func,
     ) -> F::Output {
@@ -408,7 +408,7 @@ mod tests {
 
         write(&filepath, test_string.as_bytes()).unwrap();
 
-        for (backend, fs) in NativeFsBuilder::all_backends().build_each() {
+        for (backend, fs) in NativeRtBuilder::all_backends().build_each() {
             println!("{backend}");
             fs.unwrap().run(|fs| async {
                 let fh = fs
@@ -434,7 +434,7 @@ mod tests {
 
         write(&filepath, test_string.as_bytes()).unwrap();
 
-        for (backend, fs) in NativeFsBuilder::all_backends().build_each() {
+        for (backend, fs) in NativeRtBuilder::all_backends().build_each() {
             println!("{backend}");
             fs.unwrap().run(|fs| async {
                 let fh = fs
@@ -460,7 +460,7 @@ mod tests {
         let mut filepath = std::env::temp_dir();
         filepath.push("mfio-fs-test-write");
 
-        for (backend, fs) in NativeFsBuilder::all_backends().build_each() {
+        for (backend, fs) in NativeRtBuilder::all_backends().build_each() {
             println!("{backend}");
             fs.unwrap().run(|fs| async {
                 let mut fh = fs
@@ -502,7 +502,7 @@ mod tests {
         // Create a test file:
         write(&filepath, test_string.as_bytes()).unwrap();
 
-        for (backend, fs) in NativeFsBuilder::all_backends().build_each() {
+        for (backend, fs) in NativeRtBuilder::all_backends().build_each() {
             println!("{backend}");
             fs.unwrap().run(|fs| async {
                 let fh = fs
@@ -521,7 +521,7 @@ mod tests {
 
     #[test]
     fn wake_test_single() {
-        for (backend, fs) in NativeFsBuilder::all_backends().build_each() {
+        for (backend, fs) in NativeRtBuilder::all_backends().build_each() {
             println!("{backend}");
             fs.unwrap().run(|_| async move {
                 for i in 0..2 {
@@ -550,7 +550,7 @@ mod tests {
 
     #[test]
     fn wake_test_lot() {
-        for (backend, fs) in NativeFsBuilder::all_backends().build_each() {
+        for (backend, fs) in NativeRtBuilder::all_backends().build_each() {
             println!("{backend}");
             fs.unwrap().run(|_| async move {
                 #[cfg(miri)]
@@ -584,7 +584,7 @@ mod tests {
     #[test]
     fn self_wake() {
         // Verifies that all backends support self waking correctly
-        for (backend, fs) in NativeFsBuilder::all_backends().build_each() {
+        for (backend, fs) in NativeRtBuilder::all_backends().build_each() {
             println!("{backend}");
             fs.unwrap().run(|_| async move {
                 #[cfg(miri)]
@@ -613,7 +613,7 @@ mod tests {
     #[test]
     fn self_no_doublewake() {
         // Verifies that no backend incorrectly wakes itself up when not needed
-        for (backend, fs) in NativeFsBuilder::all_backends().build_each() {
+        for (backend, fs) in NativeRtBuilder::all_backends().build_each() {
             println!("{backend}");
 
             let (tx, rx) = std::sync::mpsc::channel();

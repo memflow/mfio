@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use bytemuck::{Pod, Zeroable};
 use core::num::NonZeroI32;
-use mfio_fs::OpenOptions;
+use mfio_rt::OpenOptions;
 
 unsafe impl Zeroable for Request {}
 unsafe impl Pod for Request {}
