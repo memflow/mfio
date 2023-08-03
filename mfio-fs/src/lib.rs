@@ -520,7 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn wake_test() {
+    fn wake_test_single() {
         for (backend, fs) in NativeFsBuilder::all_backends().build_each() {
             println!("{backend}");
             fs.unwrap().run(|_| async move {

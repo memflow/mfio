@@ -20,7 +20,7 @@ use core::task::Poll;
 
 use crate::util::io_err;
 
-use mfio::backend::fd::FdWaker;
+use mfio::backend::fd::FdWakerOwner;
 use mfio::backend::*;
 use mfio::error::State;
 use mfio::packet::{Read as RdPerm, Write as WrPerm, *};
@@ -255,7 +255,7 @@ pub struct NativeFs {
     // `state`.
     backend: BackendContainer<DynBackend>,
     state: BaseArc<Mutex<IoUringState>>,
-    waker: FdWaker<RawFd>,
+    waker: FdWakerOwner<RawFd>,
 }
 
 impl Drop for NativeFs {
@@ -291,10 +291,9 @@ impl NativeFs {
         let mut state = IoUringState::try_new()?;
 
         let wake_fd = eventfd(0, EfdFlags::all())?;
-        set_nonblock(wake_fd)?;
         let wake_read = unsafe { File::from_raw_fd(wake_fd) };
         let wake_key = state.register_file(wake_read);
-        let waker = FdWaker::from(wake_fd);
+        let waker = FdWakerOwner::from(wake_fd);
 
         let poll_event = opcode::PollAdd::new(
             Fixed(wake_key.key() as _),

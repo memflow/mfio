@@ -9,7 +9,7 @@ use slab::Slab;
 use core::future::poll_fn;
 use core::task::Poll;
 
-use mfio::backend::fd::FdWaker;
+use mfio::backend::fd::FdWakerOwner;
 use mfio::backend::*;
 use mfio::tarc::BaseArc;
 
@@ -72,7 +72,7 @@ impl MioState {
 pub struct NativeFs {
     state: BaseArc<Mutex<MioState>>,
     backend: BackendContainer<DynBackend>,
-    waker: FdWaker<OwnedFd>,
+    waker: FdWakerOwner<OwnedFd>,
 }
 
 impl NativeFs {
@@ -88,7 +88,7 @@ impl NativeFs {
 
         let mut wake_read = unsafe { File::from_raw_fd(wake_read) };
         let wake_write = unsafe { OwnedFd::from_raw_fd(wake_write) };
-        let waker = FdWaker::from(wake_write);
+        let waker = FdWakerOwner::from(wake_write);
 
         // Register the waker in a special manner
         state.poll.registry().register(

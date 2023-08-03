@@ -5,6 +5,35 @@ use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use tarc::{Arc, BaseArc};
 
+#[repr(transparent)]
+pub struct FdWakerOwner<F: AsRawFd>(FdWaker<F>);
+
+impl<F: AsRawFd> Drop for FdWakerOwner<F> {
+    fn drop(&mut self) {
+        self.0.close()
+    }
+}
+
+impl<F: AsRawFd> From<F> for FdWakerOwner<F> {
+    fn from(fd: F) -> Self {
+        Self(FdWaker(
+            BaseArc::new(FdWakerInner {
+                fd,
+                flags: Default::default(),
+            })
+            .into_raw(),
+        ))
+    }
+}
+
+impl<F: AsRawFd> core::ops::Deref for FdWakerOwner<F> {
+    type Target = FdWaker<F>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 /// An eventfd/pipe backed waker.
 ///
 /// This waker simply writes a 8 byte value (little endian 1) to the provided file descriptor upon
@@ -32,18 +61,6 @@ impl<F: AsRawFd> Drop for FdWaker<F> {
     }
 }
 
-impl<F: AsRawFd> From<F> for FdWaker<F> {
-    fn from(fd: F) -> Self {
-        Self(
-            BaseArc::new(FdWakerInner {
-                fd,
-                flags: Default::default(),
-            })
-            .into_raw(),
-        )
-    }
-}
-
 impl<F: AsRawFd> FdWaker<F> {
     pub fn flags(&self) -> Arc<AtomicU8> {
         unsafe {
@@ -56,12 +73,17 @@ impl<F: AsRawFd> FdWaker<F> {
         let inner = unsafe { &*self.0 };
         let flags = inner.flags.fetch_or(0b1, Ordering::AcqRel);
         log::trace!("Flags {flags:b}");
-        if flags & 0b11 == 0 {
+        if flags & 0b111 == 0 {
             let mut f = unsafe { File::from_raw_fd(inner.fd.as_raw_fd()) };
             f.write_all(&1u64.to_ne_bytes())
                 .expect("Could not wake the waker up");
             let _ = f.into_raw_fd();
         }
+    }
+
+    pub fn close(&self) {
+        let inner = unsafe { &*self.0 };
+        inner.flags.fetch_or(0b100, Ordering::AcqRel);
     }
 
     pub fn into_raw_waker(self) -> RawWaker {
