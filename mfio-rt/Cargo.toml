@@ -57,5 +57,6 @@ rio = "0.9"
 glommio = { version = "0.8", git = "https://github.com/DataDog/glommio", rev = "517326bb2b63b6f6ddcf5deec7a283ee510f44df" }
 
 [features]
-default = ["mio", "io-uring"]
+default = ["mio", "io-uring", "native"]
+native = []
 __bench = ["mfio/tokio", "mfio/async-io"]

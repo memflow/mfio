@@ -11,7 +11,7 @@ use mfio::error::Error;
 use mfio::packet::{NoPos, PacketIo};
 use mfio::stdeq::Seekable;
 use mfio::tarc::BaseArc;
-use mfio_rt::{FileWrapper, Fs, NativeRt};
+use mfio_rt::{NativeFile, Fs, NativeRt};
 use parking_lot::Mutex;
 use slab::Slab;
 use tracing::instrument::Instrument;
@@ -26,7 +26,7 @@ use std::path::Path;
 
 struct SessionState {
     stream: TcpStream,
-    file_handles: Slab<BaseArc<Seekable<FileWrapper, u64>>>,
+    file_handles: Slab<BaseArc<Seekable<NativeFile, u64>>>,
 }
 
 impl From<TcpStream> for SessionState {

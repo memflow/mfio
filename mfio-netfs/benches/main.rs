@@ -13,7 +13,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 #[no_mangle]
-static mut FH: *const mfio::stdeq::Seekable<FileWrapper, u64> = core::ptr::null();
+static mut FH: *const mfio::stdeq::Seekable<NativeFile, u64> = core::ptr::null();
 
 const MB: usize = 0x10000;
 const SPARSE: usize = 256 * 4;

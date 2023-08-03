@@ -20,7 +20,7 @@ impl AsyncExecutor for PollsterExecutor {
 }
 
 #[no_mangle]
-static mut FH: *const mfio::stdeq::Seekable<FileWrapper, u64> = core::ptr::null();
+static mut FH: *const mfio::stdeq::Seekable<NativeFile, u64> = core::ptr::null();
 
 fn file_read(c: &mut Criterion) {
     env_logger::init();
