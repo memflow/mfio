@@ -1,5 +1,6 @@
 use std::fs::File;
-use std::io::{ErrorKind, Read};
+use std::io::Read;
+use std::net::ToSocketAddrs;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use mio::{unix::SourceFd, Events, Interest, Token};
@@ -13,17 +14,21 @@ use mfio::backend::fd::FdWakerOwner;
 use mfio::backend::*;
 use mfio::tarc::BaseArc;
 
-use super::{Key, StreamHandleConv};
+use super::Key;
 use tracing::instrument::Instrument;
 
 use file::FileInner;
 pub use file::FileWrapper;
 
-use stream::StreamInner;
-pub use stream::StreamWrapper;
+use tcp_stream::StreamInner;
+pub use tcp_stream::{TcpConnectFuture, TcpStream};
+
+use tcp_listener::ListenerInner;
+pub use tcp_listener::TcpListener;
 
 mod file;
-mod stream;
+mod tcp_listener;
+mod tcp_stream;
 
 const RW_INTERESTS: Interest = Interest::READABLE.add(Interest::WRITABLE);
 
@@ -55,6 +60,7 @@ struct MioState {
     poll: mio::Poll,
     files: Slab<FileInner>,
     streams: Slab<StreamInner>,
+    listeners: Slab<ListenerInner>,
     opqueue: Vec<Key>,
 }
 
@@ -64,6 +70,7 @@ impl MioState {
             poll: mio::Poll::new()?,
             files: Default::default(),
             streams: Default::default(),
+            listeners: Default::default(),
             opqueue: vec![],
         })
     }
@@ -150,6 +157,17 @@ impl Runtime {
                                             stream.do_ops(event.is_readable(), event.is_writable());
                                         }
                                     }
+                                    Key::TcpListener(v) => {
+                                        if let Some(listener) = state.listeners.get_mut(v) {
+                                            log::trace!(
+                                                "readable={} writeable={}",
+                                                event.is_readable(),
+                                                event.is_writable()
+                                            );
+                                            listener
+                                                .do_ops(event.is_readable(), event.is_writable());
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -168,6 +186,7 @@ impl Runtime {
                                         stream.on_queue();
                                     }
                                 }
+                                Key::TcpListener(_) => (),
                             }
                         }
 
@@ -188,6 +207,13 @@ impl Runtime {
                                         Ok(())
                                     }
                                 }
+                                Key::TcpListener(v) => {
+                                    if let Some(listener) = state.listeners.get_mut(v) {
+                                        listener.update_interests(key.key(), state.poll.registry())
+                                    } else {
+                                        Ok(())
+                                    }
+                                }
                             };
 
                             // TODO: handle errors
@@ -196,7 +222,7 @@ impl Runtime {
                                 // However, this also comes with a caveat that even though the file always shows up as
                                 // ready, it does not necessarily work in non-blocking mode.
                                 #[cfg(target_os = "linux")]
-                                Err(e) if e.kind() == ErrorKind::PermissionDenied => (),
+                                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => (),
                                 Err(e) => panic!("Unable to update interests: {e}"),
                                 Ok(_) => (),
                             }
@@ -289,27 +315,19 @@ impl Runtime {
         FileWrapper::new(key.idx(), self.state.clone())
     }
 
-    pub fn register_stream(&self, stream: impl StreamHandleConv) -> StreamWrapper {
-        // TODO: make this portable
-        let fd = stream.as_raw();
-        set_nonblock(fd).unwrap();
+    pub fn register_stream(&self, stream: std::net::TcpStream) -> TcpStream {
+        TcpStream::register_stream(&self.state, mio::net::TcpStream::from_std(stream))
+    }
 
-        let state = &mut *self.state.lock();
-        let entry = state.streams.vacant_entry();
-        // 2N mapping, to accomodate for streams
-        let key = Key::Stream(entry.key());
-        let stream = StreamInner::from(stream);
+    pub fn register_listener(&self, listener: std::net::TcpListener) -> TcpListener {
+        TcpListener::register_listener(&self.state, mio::net::TcpListener::from_std(listener))
+    }
 
-        log::trace!(
-            "Register stream={:?} self={:?} state={:?}: key={key:?}",
-            stream.as_raw_fd(),
-            self as *const _,
-            self.state.as_ptr()
-        );
-
-        entry.insert(stream);
-
-        StreamWrapper::new(key.idx(), self.state.clone())
+    pub fn tcp_connect<'a, A: ToSocketAddrs + Send + 'a>(
+        &'a self,
+        addrs: A,
+    ) -> TcpConnectFuture<'a, A> {
+        TcpStream::tcp_connect(&self.state, addrs)
     }
 }
 

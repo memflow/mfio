@@ -1,9 +1,10 @@
 use clap::Parser;
+use futures::StreamExt;
 #[cfg(unix)]
 use mfio::backend::integrations::tokio::Tokio;
 use mfio::backend::*;
+use mfio_rt::{NativeRt, Tcp, TcpListenerHandle};
 use std::net::SocketAddr;
-use tokio::net::TcpListener;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -11,34 +12,16 @@ struct Args {
     bind: SocketAddr,
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     env_logger::init();
 
     let args = Args::parse();
 
-    let mut fs = mfio_rt::NativeRt::default();
+    let mut fs = NativeRt::default();
 
-    let listener = TcpListener::bind(args.bind).await?;
-
-    let (tx, rx) = flume::bounded(4);
-
-    let accept = async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            if let Ok(stream) = stream.into_std() {
-                if tx.send_async(stream).await.is_err() {
-                    break;
-                }
-            }
-        }
-    };
-
-    #[cfg(unix)]
-    let serve = Tokio::run_with_mut(&mut fs, |fs| mfio_netfs::server(fs, rx.into_stream()));
-    #[cfg(not(unix))]
-    let serve = Null::run_with_mut(&mut fs, |fs| mfio_netfs::server(fs, rx.into_stream()));
-
-    tokio::join!(accept, serve);
-
-    Ok(())
+    fs.block_on(async {
+        let listener = fs.bind(args.bind).await?;
+        mfio_netfs::server(&fs, listener).await;
+        Ok(())
+    })
 }

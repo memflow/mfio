@@ -1,14 +1,17 @@
 use std::fs::File;
+use std::net::{self, Shutdown, SocketAddr, ToSocketAddrs};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
-use core::cell::UnsafeCell;
-use core::future::pending;
+use core::future::{pending, Future};
+use core::marker::PhantomData;
 use core::mem::{ManuallyDrop, MaybeUninit};
+use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
+use core::task::{Context, Poll, Waker};
 use core::time::Duration;
-
-use super::{OwnedStreamHandle, StreamBorrow, StreamHandleConv};
+use futures::Stream;
+use parking_lot::Mutex;
 
 use std::io;
 #[cfg(all(unix, not(miri)))]
@@ -20,119 +23,116 @@ use mfio::backend::*;
 use mfio::packet::*;
 use mfio::tarc::BaseArc;
 
-use crate::util::io_err;
+use crate::util::{from_io_error, io_err};
+use crate::{TcpListenerHandle, TcpStreamHandle};
 use mfio::error::State;
 
-struct IoInner<Handle, Param> {
-    handle: UnsafeCell<Handle>,
-    closed: AtomicBool,
-    read_at: fn(&Handle, &mut [u8], Param) -> io::Result<usize>,
-    write_at: fn(&Handle, &[u8], Param) -> io::Result<usize>,
+pub trait IoHandle {
+    type Param: Send + Sync + 'static;
+
+    fn read_at(io: &Self, buf: &mut [u8], offset: Self::Param) -> io::Result<usize>;
+    fn write_at(io: &Self, buf: &[u8], offset: Self::Param) -> io::Result<usize>;
+    fn close(&self) {}
 }
 
-unsafe impl<Handle: Send, Param> Send for IoInner<Handle, Param> {}
-unsafe impl<Handle: Sync, Param> Sync for IoInner<Handle, Param> {}
+impl IoHandle for File {
+    type Param = u64;
 
-impl<Handle, Param> IoInner<Handle, Param> {
-    fn read_at(&self, buf: &mut [u8], pos: Param) -> io::Result<usize> {
-        if self.closed.load(Ordering::Relaxed) {
-            return Err(io::ErrorKind::BrokenPipe.into());
+    fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        #[cfg(miri)]
+        {
+            use io::{Read, Seek, SeekFrom};
+            (&*file).seek(SeekFrom::Start(offset))?;
+            return (&*file).read(buf);
         }
-        let handle = unsafe { &*self.handle.get() };
-        (self.read_at)(handle, buf, pos)
+        #[cfg(not(miri))]
+        {
+            #[cfg(unix)]
+            return file.read_at(buf, offset);
+            #[cfg(windows)]
+            return file.seek_read(buf, offset);
+        }
     }
 
-    fn write_at(&self, buf: &[u8], pos: Param) -> io::Result<usize> {
+    fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
+        #[cfg(miri)]
+        {
+            use io::{Seek, SeekFrom, Write};
+            (&*file).seek(SeekFrom::Start(offset))?;
+            (&*file).write(buf)
+        }
+        #[cfg(not(miri))]
+        {
+            #[cfg(unix)]
+            return file.write_at(buf, offset);
+            #[cfg(windows)]
+            return file.seek_write(buf, offset);
+        }
+    }
+}
+impl IoHandle for net::TcpStream {
+    type Param = NoPos;
+
+    fn read_at(mut stream: &net::TcpStream, buf: &mut [u8], _: NoPos) -> io::Result<usize> {
+        use std::io::Read;
+        stream.read(buf)
+    }
+
+    fn write_at(mut stream: &net::TcpStream, buf: &[u8], _: NoPos) -> io::Result<usize> {
+        use std::io::Write;
+        log::debug!("Write {}", buf.len());
+        let ret = stream.write(buf);
+        log::debug!("Written");
+        ret
+    }
+
+    fn close(&self) {
+        let _ = self.shutdown(Shutdown::Both);
+    }
+}
+
+struct IoInner<Handle: IoHandle> {
+    handle: Handle,
+    closed: AtomicBool,
+    //read_at: fn(&Handle, &mut [u8], Param) -> io::Result<usize>,
+    //write_at: fn(&Handle, &[u8], Param) -> io::Result<usize>,
+}
+
+impl<Handle: IoHandle> IoInner<Handle> {
+    fn read_at(&self, buf: &mut [u8], pos: Handle::Param) -> io::Result<usize> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
-        let handle = unsafe { &*self.handle.get() };
-        (self.write_at)(handle, buf, pos)
+        Handle::read_at(&self.handle, buf, pos)
+    }
+
+    fn write_at(&self, buf: &[u8], pos: Handle::Param) -> io::Result<usize> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        Handle::write_at(&self.handle, buf, pos)
     }
 
     fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
-        // SAFETY: what we are doing here is very dubious at best. We want to close the file handle
-        // in order to interrupt outstanding reads. No new read requests will come after this
-        unsafe {
-            core::ptr::drop_in_place(self.handle.get());
-        }
+        self.handle.close();
     }
 }
 
-impl From<File> for IoInner<File, u64> {
+impl From<File> for IoInner<File> {
     fn from(handle: File) -> Self {
-        fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-            #[cfg(miri)]
-            {
-                use io::{Read, Seek, SeekFrom};
-                (&*file).seek(SeekFrom::Start(offset))?;
-                return (&*file).read(buf);
-            }
-            #[cfg(not(miri))]
-            {
-                #[cfg(unix)]
-                return file.read_at(buf, offset);
-                #[cfg(windows)]
-                return file.seek_read(buf, offset);
-            }
-        }
-
-        fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
-            #[cfg(miri)]
-            {
-                use io::{Seek, SeekFrom, Write};
-                (&*file).seek(SeekFrom::Start(offset))?;
-                (&*file).write(buf)
-            }
-            #[cfg(not(miri))]
-            {
-                #[cfg(unix)]
-                return file.write_at(buf, offset);
-                #[cfg(windows)]
-                return file.seek_write(buf, offset);
-            }
-        }
-
         Self {
-            handle: handle.into(),
+            handle,
             closed: AtomicBool::new(false),
-            read_at,
-            write_at,
         }
     }
 }
 
-impl<T: StreamHandleConv> From<T> for IoInner<OwnedStreamHandle, NoPos> {
-    fn from(stream: T) -> Self {
-        fn read_at<T: StreamHandleConv>(
-            stream: &OwnedStreamHandle,
-            buf: &mut [u8],
-            _: NoPos,
-        ) -> io::Result<usize> {
-            let mut stream = unsafe { StreamBorrow::<T>::get(stream) };
-            stream.read(buf)
-        }
-
-        fn write_at<T: StreamHandleConv>(
-            stream: &OwnedStreamHandle,
-            buf: &[u8],
-            _: NoPos,
-        ) -> io::Result<usize> {
-            log::debug!("Write {}", buf.len());
-            let mut stream = unsafe { StreamBorrow::<T>::get(stream) };
-            let ret = stream.write(buf);
-            log::debug!("Written");
-            ret
-        }
-
-        let handle = stream.into_owned();
-
+impl From<net::TcpStream> for IoInner<net::TcpStream> {
+    fn from(handle: net::TcpStream) -> Self {
         Self {
-            handle: handle.into(),
+            handle,
             closed: AtomicBool::new(false),
-            read_at: read_at::<T>,
-            write_at: write_at::<T>,
         }
     }
 }
@@ -167,18 +167,18 @@ impl<Perms: PacketPerms, Param> PacketIoHandleable<'static, Perms, Param>
     }
 }
 
-struct IoWrapper<Handle, Param> {
-    _file: ManuallyDrop<BaseArc<IoInner<Handle, Param>>>,
-    read_stream: ManuallyDrop<BaseArc<PacketStream<'static, Write, Param>>>,
-    write_stream: ManuallyDrop<BaseArc<PacketStream<'static, Read, Param>>>,
+struct IoWrapper<Handle: IoHandle> {
+    file: ManuallyDrop<BaseArc<IoInner<Handle>>>,
+    read_stream: ManuallyDrop<BaseArc<PacketStream<'static, Write, Handle::Param>>>,
+    write_stream: ManuallyDrop<BaseArc<PacketStream<'static, Read, Handle::Param>>>,
     read_thread: Option<(Receiver<()>, JoinHandle<()>)>,
     write_thread: Option<JoinHandle<()>>,
 }
 
 // We are accessing the Receivers only in drop, therefore it's safe to mark this as Sync.
-unsafe impl<Handle, Param> Sync for IoWrapper<Handle, Param> where IoWrapper<Handle, Param>: Send {}
+unsafe impl<Handle: IoHandle> Sync for IoWrapper<Handle> where IoWrapper<Handle>: Send {}
 
-impl<Handle, Param> Drop for IoWrapper<Handle, Param> {
+impl<Handle: IoHandle> Drop for IoWrapper<Handle> {
     fn drop(&mut self) {
         // SAFETY: we are dropping only here and not accessing the value anywhere else.
         unsafe {
@@ -188,10 +188,10 @@ impl<Handle, Param> Drop for IoWrapper<Handle, Param> {
 
         self.write_thread.take().unwrap().join().unwrap();
 
-        self._file.close();
+        self.file.close();
 
         unsafe {
-            ManuallyDrop::drop(&mut self._file);
+            ManuallyDrop::drop(&mut self.file);
         }
 
         let (rrx, rjoin) = self.read_thread.take().unwrap();
@@ -205,12 +205,12 @@ impl<Handle, Param> Drop for IoWrapper<Handle, Param> {
     }
 }
 
-impl<Handle: Send + Sync + 'static, Param: Send + 'static> From<BaseArc<IoInner<Handle, Param>>>
-    for IoWrapper<Handle, Param>
+impl<Handle: IoHandle + Send + Sync + 'static> From<BaseArc<IoInner<Handle>>>
+    for IoWrapper<Handle>
 {
-    fn from(file: BaseArc<IoInner<Handle, Param>>) -> Self {
+    fn from(file: BaseArc<IoInner<Handle>>) -> Self {
         let (read_tx, read_rx) = mpsc::channel();
-        let read_io = BaseArc::new(IoThreadHandle::<Write, Param>::new(read_tx));
+        let read_io = BaseArc::new(IoThreadHandle::<Write, Handle::Param>::new(read_tx));
 
         let (rtx, rrx) = mpsc::channel();
         let read_thread = Some((
@@ -327,7 +327,7 @@ impl<Handle: Send + Sync + 'static, Param: Send + 'static> From<BaseArc<IoInner<
         }));
 
         Self {
-            _file: ManuallyDrop::new(file),
+            file: ManuallyDrop::new(file),
             read_thread,
             write_thread,
             read_stream,
@@ -336,14 +336,14 @@ impl<Handle: Send + Sync + 'static, Param: Send + 'static> From<BaseArc<IoInner<
     }
 }
 
-impl<Handle, Param> PacketIo<Read, Param> for IoWrapper<Handle, Param> {
-    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, Read, Param>> {
+impl<Handle: IoHandle> PacketIo<Read, Handle::Param> for IoWrapper<Handle> {
+    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, Read, Handle::Param>> {
         Some(self.write_stream.new_packet_id())
     }
 }
 
-impl<Handle, Param> PacketIo<Write, Param> for IoWrapper<Handle, Param> {
-    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, Write, Param>> {
+impl<Handle: IoHandle> PacketIo<Write, Handle::Param> for IoWrapper<Handle> {
+    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, Write, Handle::Param>> {
         Some(self.read_stream.new_packet_id())
     }
 }
@@ -360,13 +360,13 @@ impl PacketIo<Write, u64> for FileWrapper {
     }
 }
 
-impl PacketIo<Read, NoPos> for StreamWrapper {
+impl PacketIo<Read, NoPos> for TcpStream {
     fn try_new_id<'a>(&'a self, w: &mut FastCWaker) -> Option<PacketId<'a, Read, NoPos>> {
         self.0.try_new_id(w)
     }
 }
 
-impl PacketIo<Write, NoPos> for StreamWrapper {
+impl PacketIo<Write, NoPos> for TcpStream {
     fn try_new_id<'a>(&'a self, cx: &mut FastCWaker) -> Option<PacketId<'a, Write, NoPos>> {
         self.0.try_new_id(cx)
     }
@@ -396,17 +396,159 @@ impl IoBackend for Runtime {
     }
 }
 
-pub struct FileWrapper(IoWrapper<File, u64>);
-pub struct StreamWrapper(IoWrapper<OwnedStreamHandle, NoPos>);
+pub struct FileWrapper(IoWrapper<File>);
+pub struct TcpStream(IoWrapper<net::TcpStream>);
+
+impl From<net::TcpStream> for TcpStream {
+    fn from(stream: net::TcpStream) -> Self {
+        Self(IoWrapper::from(BaseArc::from(<net::TcpStream as Into<
+            IoInner<_>,
+        >>::into(stream))))
+    }
+}
+
+impl TcpStreamHandle for TcpStream {
+    fn local_addr(&self) -> mfio::error::Result<SocketAddr> {
+        self.0.file.handle.local_addr().map_err(from_io_error)
+    }
+
+    fn peer_addr(&self) -> mfio::error::Result<SocketAddr> {
+        self.0.file.handle.local_addr().map_err(from_io_error)
+    }
+}
+
+struct TcpConnectCtx {
+    waker: Option<Waker>,
+    res: Option<mfio::error::Result<net::TcpStream>>,
+}
+
+pub struct TcpConnectFuture<'a, A> {
+    backend: &'a Runtime,
+    ctx: BaseArc<Mutex<TcpConnectCtx>>,
+    _phantom: PhantomData<A>,
+}
+
+impl<'a, A> Future for TcpConnectFuture<'a, A> {
+    type Output = mfio::error::Result<TcpStream>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+
+        let mut ctx = this.ctx.lock();
+
+        if let Some(ret) = ctx.res.take() {
+            Poll::Ready(ret.map(|v| this.backend.register_stream(v)))
+        } else {
+            ctx.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+pub struct TcpListener {
+    listener: BaseArc<net::TcpListener>,
+    rx: flume::r#async::RecvStream<'static, (net::TcpStream, SocketAddr)>,
+}
+
+impl From<net::TcpListener> for TcpListener {
+    fn from(listener: net::TcpListener) -> Self {
+        let (tx, rx) = flume::bounded(16);
+        let listener = BaseArc::from(listener);
+        let rx = rx.into_stream();
+
+        thread::spawn({
+            let listener = listener.clone();
+            move || loop {
+                match listener.accept() {
+                    Err(e) if e.kind() != io::ErrorKind::ConnectionAborted => break,
+                    Ok(v) => {
+                        if tx.send(v).is_err() {
+                            break;
+                        }
+                    }
+                    _ => (),
+                }
+            }
+        });
+
+        Self { listener, rx }
+    }
+}
+
+impl TcpListenerHandle for TcpListener {
+    type StreamHandle = TcpStream;
+
+    fn local_addr(&self) -> mfio::error::Result<SocketAddr> {
+        self.listener.local_addr().map_err(from_io_error)
+    }
+}
+
+impl Stream for TcpListener {
+    type Item = (TcpStream, SocketAddr);
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        let this = unsafe { self.map_unchecked_mut(|v| &mut v.rx) };
+
+        match this.poll_next(cx) {
+            Poll::Ready(v) => Poll::Ready(v.map(|(v, a)| (TcpStream::from(v), a))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
 
 impl Runtime {
     pub fn register_file(&self, file: File) -> FileWrapper {
         FileWrapper(IoWrapper::from(BaseArc::from(IoInner::from(file))))
     }
 
-    pub fn register_stream<T: StreamHandleConv>(&self, stream: T) -> StreamWrapper {
-        StreamWrapper(IoWrapper::from(BaseArc::from(
-            <T as Into<IoInner<_, _>>>::into(stream),
-        )))
+    pub fn register_stream(&self, stream: net::TcpStream) -> TcpStream {
+        stream.into()
+    }
+
+    pub fn register_listener(&self, listener: net::TcpListener) -> TcpListener {
+        TcpListener::from(listener)
+    }
+
+    pub fn tcp_connect<'a, A: ToSocketAddrs + Send + 'a>(
+        &'a self,
+        addrs: A,
+    ) -> TcpConnectFuture<'a, A> {
+        let ctx = if let Ok(addrs) = addrs.to_socket_addrs() {
+            let ctx = BaseArc::new(Mutex::new(TcpConnectCtx {
+                waker: None,
+                res: None,
+            }));
+
+            let addrs = addrs.collect::<Vec<_>>();
+
+            // TODO: find out a way to interrupt this
+            thread::spawn({
+                let ctx = ctx.clone();
+                move || {
+                    let res = net::TcpStream::connect(&addrs[..]).map_err(from_io_error);
+
+                    let mut ctx = ctx.lock();
+
+                    ctx.res = Some(res);
+
+                    if let Some(waker) = ctx.waker.take() {
+                        waker.wake();
+                    }
+                }
+            });
+
+            ctx
+        } else {
+            BaseArc::new(Mutex::new(TcpConnectCtx {
+                waker: None,
+                res: Some(Err(io_err(State::Nop))),
+            }))
+        };
+
+        TcpConnectFuture {
+            backend: self,
+            ctx,
+            _phantom: PhantomData,
+        }
     }
 }

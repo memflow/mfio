@@ -1,18 +1,20 @@
-use std::path::Path;
 use core::future::Future;
+
+use futures::Stream;
 use mfio::backend::*;
 use mfio::error::Result as MfioResult;
 use mfio::packet::NoPos;
 use mfio::stdeq::{AsyncRead, AsyncWrite};
 use serde::{Deserialize, Serialize};
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::Path;
 
 #[cfg(feature = "native")]
 pub mod native;
 mod util;
 
 #[cfg(feature = "native")]
-pub use native::{NativeRt, NativeRtBuilder, NativeFile};
-
+pub use native::{NativeFile, NativeRt, NativeRtBuilder};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq, PartialOrd, Ord)]
@@ -61,7 +63,6 @@ impl OpenOptions {
 
 pub trait Fs: IoBackend {
     type FileHandle: FileHandle;
-    type StreamHandle: StreamHandle;
     type OpenFuture<'a>: Future<Output = MfioResult<Self::FileHandle>> + 'a
     where
         Self: 'a;
@@ -75,4 +76,40 @@ impl<T: AsyncRead<u64> + AsyncWrite<u64>> FileHandle for T {}
 pub trait StreamHandle: AsyncRead<NoPos> + AsyncWrite<NoPos> {}
 impl<T: AsyncRead<NoPos> + AsyncWrite<NoPos>> StreamHandle for T {}
 
+pub trait Tcp: IoBackend {
+    type StreamHandle: TcpStreamHandle;
+    type ListenerHandle: TcpListenerHandle<StreamHandle = Self::StreamHandle>;
+    type ConnectFuture<'a, A: ToSocketAddrs + Send + 'a>: Future<Output = MfioResult<Self::StreamHandle>>
+        + 'a
+    where
+        Self: 'a;
+    type BindFuture<'a, A: ToSocketAddrs + Send + 'a>: Future<Output = MfioResult<Self::ListenerHandle>>
+        + 'a
+    where
+        Self: 'a;
 
+    fn connect<'a, A: ToSocketAddrs + Send + 'a>(&'a self, addrs: A) -> Self::ConnectFuture<'a, A>;
+
+    fn bind<'a, A: ToSocketAddrs + Send + 'a>(&'a self, addrs: A) -> Self::BindFuture<'a, A>;
+}
+
+pub trait TcpStreamHandle: StreamHandle {
+    fn local_addr(&self) -> MfioResult<SocketAddr>;
+    fn peer_addr(&self) -> MfioResult<SocketAddr>;
+
+    // These interfaces may be slightly trickier to implement, so we omit them for now.
+    //fn set_ttl(&self, ttl: u32) -> MfioResult<()>;
+    //fn ttl(&self) -> MfioResult<u32>;
+    //fn set_nodelay(&self, nodelay: bool) -> MfioResult<()>;
+    //fn nodelay(&self) -> MfioResult<bool>;
+}
+
+pub trait TcpListenerHandle: Stream<Item = (Self::StreamHandle, SocketAddr)> {
+    type StreamHandle: TcpStreamHandle;
+
+    fn local_addr(&self) -> MfioResult<SocketAddr>;
+
+    // These interfaces may be slightly trickier to implement, so we omit them for now.
+    //fn set_ttl(&self, ttl: u32) -> MfioResult<()>;
+    //fn ttl(&self) -> MfioResult<u32>;
+}

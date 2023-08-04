@@ -11,7 +11,6 @@ use core::mem::MaybeUninit;
 use mfio::packet::{FastCWaker, Read as RdPerm, Splittable, Write as WrPerm, *};
 use mfio::tarc::BaseArc;
 
-use super::super::RawHandleConv;
 use super::{BlockTrack, Key, MioState};
 use crate::util::io_err;
 use mfio::error::State;
@@ -49,7 +48,7 @@ impl Source for FileInner {
         interests: Interest,
     ) -> io::Result<()> {
         self.track.cur_interests = Some(interests);
-        registry.register(&mut SourceFd(&self.file.as_raw()), token, interests)
+        registry.register(&mut SourceFd(&self.file.as_raw_fd()), token, interests)
     }
     fn reregister(
         &mut self,
@@ -58,11 +57,11 @@ impl Source for FileInner {
         interests: Interest,
     ) -> io::Result<()> {
         self.track.cur_interests = Some(interests);
-        registry.reregister(&mut SourceFd(&self.file.as_raw()), token, interests)
+        registry.reregister(&mut SourceFd(&self.file.as_raw_fd()), token, interests)
     }
     fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
         self.track.cur_interests = None;
-        registry.deregister(&mut SourceFd(&self.file.as_raw()))
+        registry.deregister(&mut SourceFd(&self.file.as_raw_fd()))
     }
 }
 
@@ -125,7 +124,7 @@ impl FileInner {
     pub fn do_ops(&mut self, read: bool, write: bool) {
         log::trace!(
             "Do ops file={:?} read={read} write={write} (to read={} to write={})",
-            self.file.as_raw(),
+            self.file.as_raw_fd(),
             self.read_ops.len(),
             self.write_ops.len()
         );

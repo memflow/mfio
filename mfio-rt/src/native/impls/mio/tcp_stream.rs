@@ -1,22 +1,32 @@
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::io::{IoSlice, IoSliceMut};
+use std::net::SocketAddr;
+use std::net::ToSocketAddrs;
+use std::os::fd::{AsRawFd, RawFd};
+
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll, Waker};
 
 use mio::{event::Source, unix::SourceFd, Interest, Registry, Token};
 use parking_lot::Mutex;
 
+use mfio::error::State;
 use mfio::packet::{FastCWaker, Read as RdPerm, Write as WrPerm, *};
 use mfio::tarc::BaseArc;
 
-use super::super::{unix_extra::StreamBuf, OwnedStreamHandle, StreamBorrow, StreamHandleConv};
+use super::super::unix_extra::StreamBuf;
 use super::{BlockTrack, Key, MioState};
-use std::io::{IoSlice, IoSliceMut};
+use crate::util::{from_io_error, io_err};
+use crate::TcpStreamHandle;
+
+use mio::net;
 
 pub struct StreamInner {
-    fd: OwnedFd,
+    fd: net::TcpStream,
     stream: StreamBuf,
     track: BlockTrack,
-    read: fn(&OwnedStreamHandle, &mut [IoSliceMut]) -> io::Result<usize>,
-    write: fn(&OwnedStreamHandle, &[IoSlice]) -> io::Result<usize>,
+    poll_waker: Option<Waker>,
 }
 
 impl AsRawFd for StreamInner {
@@ -52,36 +62,30 @@ impl Source for StreamInner {
     }
 }
 
-impl<T: StreamHandleConv> From<T> for StreamInner {
-    fn from(stream: T) -> Self {
-        fn read<T: StreamHandleConv>(
-            stream: &OwnedStreamHandle,
-            iov: &mut [IoSliceMut],
-        ) -> io::Result<usize> {
-            let mut stream = unsafe { StreamBorrow::<T>::get(stream) };
-            stream.read_vectored(iov)
-        }
-
-        fn write<T: StreamHandleConv>(
-            stream: &OwnedStreamHandle,
-            iov: &[IoSlice],
-        ) -> io::Result<usize> {
-            let mut stream = unsafe { StreamBorrow::<T>::get(stream) };
-            stream.write_vectored(iov)
-        }
-
-        let fd = stream.into_owned();
+impl From<net::TcpStream> for StreamInner {
+    fn from(fd: net::TcpStream) -> Self {
         Self {
             fd,
             stream: StreamBuf::default(),
             track: Default::default(),
-            read: read::<T>,
-            write: write::<T>,
+            //read: read::<T>,
+            //write: write::<T>,
+            poll_waker: None,
         }
     }
 }
 
 impl StreamInner {
+    fn read(mut stream: &net::TcpStream, iov: &mut [IoSliceMut]) -> io::Result<usize> {
+        use std::io::Read;
+        stream.read_vectored(iov)
+    }
+
+    fn write(mut stream: &net::TcpStream, iov: &[IoSlice]) -> io::Result<usize> {
+        use std::io::Write;
+        stream.write_vectored(iov)
+    }
+
     pub fn update_interests(&mut self, key: usize, registry: &Registry) -> std::io::Result<()> {
         let expected_interests = self.track.expected_interests();
 
@@ -108,6 +112,11 @@ impl StreamInner {
             self.stream.read_ops(),
             self.stream.write_ops()
         );
+
+        if let Some(waker) = self.poll_waker.take() {
+            waker.wake();
+        }
+
         if read || !self.track.read_blocked {
             while self.stream.read_ops() > 0 {
                 let rd_span =
@@ -116,7 +125,7 @@ impl StreamInner {
                 self.track.read_blocked = false;
                 let queue = self.stream.read_queue();
                 if !queue.is_empty() {
-                    let res = (self.read)(&self.fd, queue);
+                    let res = Self::read(&self.fd, queue);
 
                     if res
                         .as_ref()
@@ -145,7 +154,7 @@ impl StreamInner {
                 self.track.write_blocked = false;
                 let queue = self.stream.write_queue();
                 if !queue.is_empty() {
-                    let res = (self.write)(&self.fd, queue);
+                    let res = Self::write(&self.fd, queue);
 
                     if res
                         .as_ref()
@@ -230,14 +239,14 @@ impl<Perms: IntoOp> PacketIoHandleable<'static, Perms, NoPos> for StreamOpsHandl
     }
 }
 
-pub struct StreamWrapper {
+pub struct TcpStream {
     idx: usize,
     state: BaseArc<Mutex<MioState>>,
     read_stream: BaseArc<PacketStream<'static, WrPerm, NoPos>>,
     write_stream: BaseArc<PacketStream<'static, RdPerm, NoPos>>,
 }
 
-impl StreamWrapper {
+impl TcpStream {
     pub(super) fn new(idx: usize, state: BaseArc<Mutex<MioState>>) -> Self {
         let write_io = BaseArc::new(StreamOpsHandle::new(idx, state.clone()));
 
@@ -258,9 +267,45 @@ impl StreamWrapper {
             read_stream,
         }
     }
+
+    pub(super) fn register_stream(
+        state_arc: &BaseArc<Mutex<MioState>>,
+        stream: net::TcpStream,
+    ) -> Self {
+        // TODO: make this portable
+        let fd = stream.as_raw_fd();
+        super::set_nonblock(fd).unwrap();
+
+        let state = &mut *state_arc.lock();
+        let entry = state.streams.vacant_entry();
+        // 2N mapping, to accomodate for streams
+        let key = Key::Stream(entry.key());
+        let stream = StreamInner::from(stream);
+
+        log::trace!(
+            "Register stream={:?} state={:?}: key={key:?}",
+            stream.as_raw_fd(),
+            state_arc.as_ptr()
+        );
+
+        entry.insert(stream);
+
+        TcpStream::new(key.idx(), state_arc.clone())
+    }
+
+    pub(super) fn tcp_connect<'a, A: ToSocketAddrs + Send + 'a>(
+        backend: &'a BaseArc<Mutex<MioState>>,
+        addrs: A,
+    ) -> TcpConnectFuture<'a, A> {
+        TcpConnectFuture {
+            backend,
+            addrs: addrs.to_socket_addrs().ok(),
+            idx: None,
+        }
+    }
 }
 
-impl Drop for StreamWrapper {
+impl Drop for TcpStream {
     fn drop(&mut self) {
         let mut state = self.state.lock();
         let mut stream = state.streams.remove(self.idx);
@@ -269,14 +314,108 @@ impl Drop for StreamWrapper {
     }
 }
 
-impl PacketIo<RdPerm, NoPos> for StreamWrapper {
+impl PacketIo<RdPerm, NoPos> for TcpStream {
     fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, RdPerm, NoPos>> {
         Some(self.write_stream.new_packet_id())
     }
 }
 
-impl PacketIo<WrPerm, NoPos> for StreamWrapper {
+impl PacketIo<WrPerm, NoPos> for TcpStream {
     fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, WrPerm, NoPos>> {
         Some(self.read_stream.new_packet_id())
+    }
+}
+
+impl TcpStreamHandle for TcpStream {
+    fn local_addr(&self) -> mfio::error::Result<SocketAddr> {
+        let state = self.state.lock();
+        let stream = state
+            .streams
+            .get(self.idx)
+            .ok_or_else(|| io_err(State::NotFound))?;
+        stream.fd.local_addr().map_err(from_io_error)
+    }
+
+    fn peer_addr(&self) -> mfio::error::Result<SocketAddr> {
+        let state = self.state.lock();
+        let stream = state
+            .streams
+            .get(self.idx)
+            .ok_or_else(|| io_err(State::NotFound))?;
+        stream.fd.peer_addr().map_err(from_io_error)
+    }
+}
+
+pub struct TcpConnectFuture<'a, A: ToSocketAddrs + 'a> {
+    backend: &'a BaseArc<Mutex<MioState>>,
+    addrs: Option<A::Iter>,
+    idx: Option<usize>,
+}
+
+impl<'a, A: ToSocketAddrs + 'a> Future for TcpConnectFuture<'a, A> {
+    type Output = mfio::error::Result<TcpStream>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        // SAFETY: we are not moving out of this future
+        let this = unsafe { self.get_unchecked_mut() };
+
+        loop {
+            if let Some(idx) = this.idx.take() {
+                let state = &mut *this.backend.lock();
+                if let Some(stream) = state.streams.get_mut(idx) {
+                    if !stream.track.write_blocked {
+                        let wrapper = TcpStream::new(idx, this.backend.clone());
+
+                        let ret = match stream.fd.take_error() {
+                            Ok(Some(e)) => Err(e),
+                            Err(e) => Err(e),
+                            Ok(None) => Ok(wrapper),
+                        };
+
+                        // We want to continue to the next address if we were not successful
+                        if let Ok(ret) = ret {
+                            break Poll::Ready(Ok(ret));
+                        }
+                    } else {
+                        if stream
+                            .update_interests(Key::Stream(idx).key(), state.poll.registry())
+                            .is_err()
+                        {
+                            let _ = TcpStream::new(idx, this.backend.clone());
+                            continue;
+                        }
+                        stream.poll_waker = Some(cx.waker().clone());
+                        this.idx = Some(idx);
+                        break Poll::Pending;
+                    }
+                } else {
+                    break Poll::Ready(Err(io_err(State::NotFound)));
+                }
+            } else if let Some(addr) = this.addrs.as_mut().and_then(|v| v.next()) {
+                let stream = net::TcpStream::connect(addr);
+
+                if let Ok(stream) = stream {
+                    let mut state = this.backend.lock();
+
+                    let entry = state.streams.vacant_entry();
+                    // 2N mapping, to accomodate for streams
+                    let key = Key::Stream(entry.key());
+                    let mut stream = StreamInner::from(stream);
+
+                    log::trace!(
+                        "Connect stream={:?} state={:?}: key={key:?}",
+                        stream.as_raw_fd(),
+                        this.backend.as_ptr()
+                    );
+
+                    // Mark as write blocked so that we can poll for the writability
+                    stream.track.write_blocked = true;
+
+                    entry.insert(stream);
+                }
+            } else {
+                break Poll::Ready(Err(io_err(State::Exhausted)));
+            }
+        }
     }
 }

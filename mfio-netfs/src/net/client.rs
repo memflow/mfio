@@ -534,7 +534,6 @@ impl IoBackend for NetworkFs {
 
 impl Fs for NetworkFs {
     type FileHandle = Seekable<FileWrapper, u64>;
-    type StreamHandle = StreamWrapper;
     type OpenFuture<'a> = OpenFuture<'a>;
 
     fn open(&self, path: &Path, options: OpenOptions) -> Self::OpenFuture<'_> {
@@ -709,20 +708,7 @@ impl PacketIo<Write, u64> for FileWrapper {
     }
 }
 
-impl PacketIo<Read, NoPos> for StreamWrapper {
-    fn try_new_id<'a>(&'a self, w: &mut FastCWaker) -> Option<PacketId<'a, Read, NoPos>> {
-        self.0.try_new_id(w)
-    }
-}
-
-impl PacketIo<Write, NoPos> for StreamWrapper {
-    fn try_new_id<'a>(&'a self, cx: &mut FastCWaker) -> Option<PacketId<'a, Write, NoPos>> {
-        self.0.try_new_id(cx)
-    }
-}
-
 pub struct FileWrapper(IoWrapper<u64>);
-pub struct StreamWrapper(IoWrapper<NoPos>);
 
 pub trait IoAt: Sized + Clone {
     fn drop_io_wrapper(io: &mut IoWrapper<Self>);
@@ -732,8 +718,4 @@ impl IoAt for u64 {
     fn drop_io_wrapper(io: &mut IoWrapper<Self>) {
         let _ = io.senders.close_reqs.send(io.file_id);
     }
-}
-
-impl IoAt for NoPos {
-    fn drop_io_wrapper(_: &mut IoWrapper<Self>) {}
 }

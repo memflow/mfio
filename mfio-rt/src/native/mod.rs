@@ -1,20 +1,24 @@
 use core::future::Future;
-use impls::StreamHandleConv;
+use core::pin::Pin;
+use core::task::{Context, Poll};
+use futures::Stream;
 use mfio::backend::*;
 use mfio::error::{Code, Error, Location, Result as MfioResult, State, Subject};
 use mfio::packet::{FastCWaker, NoPos, PacketId, PacketIo, Read, Write};
 use mfio::stdeq::Seekable;
 use std::fs;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::Path;
 
-use crate::{OpenOptions, Fs};
+use crate::util::from_io_error;
+use crate::{Fs, OpenOptions, Tcp, TcpListenerHandle, TcpStreamHandle};
 
 mod impls;
 
 macro_rules! fs_dispatch {
     ($($(#[cfg($meta:meta)])* $name:ident => $mod:ident),*$(,)?) => {
 
-/// Native OS's filesystem
+/// Native OS backed runtime
 ///
 /// # Examples
 ///
@@ -110,9 +114,9 @@ macro_rules! fs_dispatch {
             }
 
             /// Registers a non-seekable I/O stream
-            pub fn register_stream(&self, stream: impl StreamHandleConv) -> StreamWrapper {
+            pub fn register_stream(&self, stream: TcpStream) -> NativeTcpStream {
                 match self {
-                    $($(#[cfg($meta)])* Self::$name(v) => StreamWrapper::$name(v.register_stream(stream))),*
+                    $($(#[cfg($meta)])* Self::$name(v) => NativeTcpStream::$name(v.register_stream(stream))),*
                 }
             }
 
@@ -263,11 +267,11 @@ macro_rules! fs_dispatch {
             }
         }
 
-        pub enum StreamWrapper {
-            $($(#[cfg($meta)])* $name(impls::$mod::StreamWrapper)),*
+        pub enum NativeTcpStream {
+            $($(#[cfg($meta)])* $name(impls::$mod::TcpStream)),*
         }
 
-        impl PacketIo<Write, NoPos> for StreamWrapper {
+        impl PacketIo<Write, NoPos> for NativeTcpStream {
             fn try_new_id<'a>(&'a self, context: &mut FastCWaker) -> Option<PacketId<'a, Write, NoPos>> {
                 match self {
                     $($(#[cfg($meta)])* Self::$name(v) => v.try_new_id(context)),*
@@ -275,10 +279,102 @@ macro_rules! fs_dispatch {
             }
         }
 
-        impl PacketIo<Read, NoPos> for StreamWrapper {
+        impl PacketIo<Read, NoPos> for NativeTcpStream {
             fn try_new_id<'a>(&'a self, context: &mut FastCWaker) -> Option<PacketId<'a, Read, NoPos>> {
                 match self {
                     $($(#[cfg($meta)])* Self::$name(v) => v.try_new_id(context)),*
+                }
+            }
+        }
+
+        impl TcpStreamHandle for NativeTcpStream {
+            fn local_addr(&self) -> MfioResult<SocketAddr> {
+                match self {
+                    $($(#[cfg($meta)])* Self::$name(v) => v.local_addr()),*
+                }
+            }
+
+            fn peer_addr(&self) -> MfioResult<SocketAddr> {
+                match self {
+                    $($(#[cfg($meta)])* Self::$name(v) => v.peer_addr()),*
+                }
+            }
+        }
+
+        pub enum NativeTcpConnectFuture<'a, A: ToSocketAddrs + 'a> {
+            $($(#[cfg($meta)])* $name(impls::$mod::TcpConnectFuture<'a, A>)),*
+        }
+
+        impl<'a, A: ToSocketAddrs + Send> Future for NativeTcpConnectFuture<'a, A> {
+            type Output = MfioResult<NativeTcpStream>;
+
+            fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+                // SAFETY: we are not moving the inner value
+                let this = unsafe { self.get_unchecked_mut() };
+                match this {
+                    $($(#[cfg($meta)])* Self::$name(v) => {
+                        if let Poll::Ready(v) = unsafe { Pin::new_unchecked(v).poll(cx) } {
+                            Poll::Ready(v.map(NativeTcpStream::$name))
+                        } else {
+                            Poll::Pending
+                        }
+                    }),*
+                }
+            }
+        }
+
+        impl Tcp for NativeRt {
+            type StreamHandle = NativeTcpStream;
+            type ListenerHandle = NativeTcpListener;
+            type ConnectFuture<'a, A: ToSocketAddrs + Send + 'a> = NativeTcpConnectFuture<'a, A>;
+            type BindFuture<'a, A: ToSocketAddrs + Send + 'a> = core::future::Ready<MfioResult<NativeTcpListener>>;
+
+            fn connect<'a, A: ToSocketAddrs + Send + 'a>(
+                &'a self,
+                addrs: A,
+            ) -> Self::ConnectFuture<'a, A> {
+                match self {
+                    $($(#[cfg($meta)])* Self::$name(v) => NativeTcpConnectFuture::$name(v.tcp_connect(addrs))),*
+                }
+            }
+
+            fn bind<'a, A: ToSocketAddrs + Send + 'a>(&'a self, addrs: A) -> Self::BindFuture<'a, A> {
+                let listener = std::net::TcpListener::bind(addrs);
+                core::future::ready(
+                    listener.map(|l| match self {
+                        $($(#[cfg($meta)])* Self::$name(v) => NativeTcpListener::$name(v.register_listener(l))),*
+                    }).map_err(from_io_error)
+                )
+            }
+        }
+
+        pub enum NativeTcpListener {
+            $($(#[cfg($meta)])* $name(impls::$mod::TcpListener)),*
+        }
+
+        impl Stream for NativeTcpListener {
+            type Item = (NativeTcpStream, SocketAddr);
+
+            fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+                let this = unsafe { self.get_unchecked_mut() };
+                match this {
+                    $($(#[cfg($meta)])* Self::$name(v) => {
+                        if let Poll::Ready(v) = unsafe { Pin::new_unchecked(v).poll_next(cx) } {
+                            Poll::Ready(v.map(|(a, b)| (NativeTcpStream::$name(a), b)))
+                        } else {
+                            Poll::Pending
+                        }
+                    }),*
+                }
+            }
+        }
+
+        impl TcpListenerHandle for NativeTcpListener {
+            type StreamHandle = NativeTcpStream;
+
+            fn local_addr(&self) -> MfioResult<SocketAddr> {
+                match self {
+                    $($(#[cfg($meta)])* Self::$name(v) => v.local_addr()),*
                 }
             }
         }
@@ -295,7 +391,6 @@ fs_dispatch! {
 
 impl Fs for NativeRt {
     type FileHandle = Seekable<NativeFile, u64>;
-    type StreamHandle = StreamWrapper;
     type OpenFuture<'a> = core::future::Ready<MfioResult<Self::FileHandle>>;
 
     fn open(&self, path: &Path, options: OpenOptions) -> Self::OpenFuture<'_> {

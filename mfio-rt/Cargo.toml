@@ -26,9 +26,10 @@ cfg-if = "1"
 log = "0.4"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
+flume = "0.10"
 
 [target.'cfg(unix)'.dependencies]
-mio = { version = "0.8", optional = true, features = ["os-poll", "os-ext"] }
+mio = { version = "0.8", optional = true, features = ["os-poll", "os-ext", "net"] }
 slab = "0.4"
 nix = "0.26"
 
@@ -57,6 +58,7 @@ rio = "0.9"
 glommio = { version = "0.8", git = "https://github.com/DataDog/glommio", rev = "517326bb2b63b6f6ddcf5deec7a283ee510f44df" }
 
 [features]
-default = ["mio", "io-uring", "native"]
+# io-uring currently disabled since it's out of date
+default = ["mio", "native"]
 native = []
 __bench = ["mfio/tokio", "mfio/async-io"]
