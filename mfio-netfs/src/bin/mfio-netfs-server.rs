@@ -1,9 +1,6 @@
 use clap::Parser;
-use futures::StreamExt;
-#[cfg(unix)]
-use mfio::backend::integrations::tokio::Tokio;
 use mfio::backend::*;
-use mfio_rt::{NativeRt, Tcp, TcpListenerHandle};
+use mfio_rt::{NativeRt, Tcp};
 use std::net::SocketAddr;
 
 #[derive(Parser, Debug)]
@@ -17,7 +14,7 @@ fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    let mut fs = NativeRt::default();
+    let fs = NativeRt::default();
 
     fs.block_on(async {
         let listener = fs.bind(args.bind).await?;

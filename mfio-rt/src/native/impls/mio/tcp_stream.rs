@@ -15,7 +15,7 @@ use mfio::error::State;
 use mfio::packet::{FastCWaker, Read as RdPerm, Write as WrPerm, *};
 use mfio::tarc::BaseArc;
 
-use super::super::unix_extra::StreamBuf;
+use super::super::unix_extra::{set_nonblock, StreamBuf};
 use super::{BlockTrack, Key, MioState};
 use crate::util::{from_io_error, io_err};
 use crate::TcpStreamHandle;
@@ -274,7 +274,7 @@ impl TcpStream {
     ) -> Self {
         // TODO: make this portable
         let fd = stream.as_raw_fd();
-        super::set_nonblock(fd).unwrap();
+        set_nonblock(fd).unwrap();
 
         let state = &mut *state_arc.lock();
         let entry = state.streams.vacant_entry();

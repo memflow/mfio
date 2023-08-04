@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::Read;
 use std::net::ToSocketAddrs;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use mio::{unix::SourceFd, Events, Interest, Token};
 use parking_lot::Mutex;
@@ -14,7 +14,7 @@ use mfio::backend::fd::FdWakerOwner;
 use mfio::backend::*;
 use mfio::tarc::BaseArc;
 
-use super::Key;
+use super::{unix_extra::set_nonblock, Key};
 use tracing::instrument::Instrument;
 
 use file::FileInner;
@@ -329,16 +329,4 @@ impl Runtime {
     ) -> TcpConnectFuture<'a, A> {
         TcpStream::tcp_connect(&self.state, addrs)
     }
-}
-
-fn set_nonblock(fd: RawFd) -> Result<(), nix::errno::Errno> {
-    use nix::fcntl::*;
-
-    let flags = fcntl(fd, FcntlArg::F_GETFL)?;
-    fcntl(
-        fd,
-        FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags).union(OFlag::O_NONBLOCK)),
-    )?;
-
-    Ok(())
 }

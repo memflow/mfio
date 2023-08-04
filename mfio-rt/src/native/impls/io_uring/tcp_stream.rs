@@ -1,17 +1,31 @@
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::net::{self, SocketAddr, ToSocketAddrs};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-use io_uring::{opcode, types::Fixed};
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
+
+use io_uring::{
+    opcode,
+    types::{Fd, Fixed},
+};
 use parking_lot::Mutex;
 
 use nix::libc::{iovec, msghdr};
-use nix::sys::socket;
+use nix::sys::socket::{self, SockaddrLike, SockaddrStorage};
 
+use mfio::error::State;
 use mfio::packet::{FastCWaker, Read as RdPerm, Write as WrPerm, *};
 use mfio::tarc::BaseArc;
 
-use super::super::{unix_extra::StreamBuf, Key};
-use super::{IoUringPushHandle, IoUringState, Operation};
+use super::super::{
+    unix_extra::{new_for_addr, StreamBuf},
+    Key,
+};
+use super::{IoUringPushHandle, IoUringState, Operation, TmpAddr};
+use crate::util::{from_io_error, io_err};
+use crate::TcpStreamHandle;
 
 use once_cell::sync::Lazy;
 
@@ -23,7 +37,7 @@ static IOV_MAX: Lazy<usize> = Lazy::new(|| {
 });
 
 pub struct StreamInner {
-    fd: OwnedFd,
+    fd: net::TcpStream,
     stream: StreamBuf,
     in_read: bool,
     in_write: usize,
@@ -45,8 +59,8 @@ impl Drop for StreamInner {
     }
 }
 
-impl From<OwnedFd> for StreamInner {
-    fn from(fd: OwnedFd) -> Self {
+impl From<net::TcpStream> for StreamInner {
+    fn from(fd: net::TcpStream) -> Self {
         Self {
             fd,
             stream: StreamBuf::default(),
@@ -205,14 +219,14 @@ impl<Perms: IntoOp> PacketIoHandleable<'static, Perms, NoPos> for IoOpsHandle<Pe
     }
 }
 
-pub struct StreamWrapper {
+pub struct TcpStream {
     idx: usize,
     state: BaseArc<Mutex<IoUringState>>,
     read_stream: PacketStream<'static, WrPerm, NoPos>,
     write_stream: PacketStream<'static, RdPerm, NoPos>,
 }
 
-impl StreamWrapper {
+impl TcpStream {
     pub(super) fn new(idx: usize, state: BaseArc<Mutex<IoUringState>>) -> Self {
         let write_io = BaseArc::new(IoOpsHandle::new(idx, state.clone()));
 
@@ -233,9 +247,20 @@ impl StreamWrapper {
             read_stream,
         }
     }
+
+    pub(super) fn tcp_connect<'a, A: ToSocketAddrs + Send + 'a>(
+        backend: &'a BaseArc<Mutex<IoUringState>>,
+        addrs: A,
+    ) -> TcpConnectFuture<'a, A> {
+        TcpConnectFuture {
+            backend,
+            addrs: addrs.to_socket_addrs().ok(),
+            idx: None,
+        }
+    }
 }
 
-impl Drop for StreamWrapper {
+impl Drop for TcpStream {
     fn drop(&mut self) {
         let mut state = self.state.lock();
         let v = state.streams.remove(self.idx);
@@ -257,14 +282,117 @@ impl Drop for StreamWrapper {
     }
 }
 
-impl PacketIo<RdPerm, NoPos> for StreamWrapper {
+impl TcpStreamHandle for TcpStream {
+    fn local_addr(&self) -> mfio::error::Result<SocketAddr> {
+        let state = self.state.lock();
+        let stream = state
+            .streams
+            .get(self.idx)
+            .ok_or_else(|| io_err(State::NotFound))?;
+        stream.fd.local_addr().map_err(from_io_error)
+    }
+
+    fn peer_addr(&self) -> mfio::error::Result<SocketAddr> {
+        let state = self.state.lock();
+        let stream = state
+            .streams
+            .get(self.idx)
+            .ok_or_else(|| io_err(State::NotFound))?;
+        stream.fd.peer_addr().map_err(from_io_error)
+    }
+}
+
+impl PacketIo<RdPerm, NoPos> for TcpStream {
     fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, RdPerm, NoPos>> {
         Some(self.write_stream.new_packet_id())
     }
 }
 
-impl PacketIo<WrPerm, NoPos> for StreamWrapper {
+impl PacketIo<WrPerm, NoPos> for TcpStream {
     fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, WrPerm, NoPos>> {
         Some(self.read_stream.new_packet_id())
+    }
+}
+
+pub struct TcpConnectFuture<'a, A: ToSocketAddrs + 'a> {
+    backend: &'a BaseArc<Mutex<IoUringState>>,
+    addrs: Option<A::Iter>,
+    idx: Option<usize>,
+}
+
+impl<'a, A: ToSocketAddrs + 'a> Future for TcpConnectFuture<'a, A> {
+    type Output = mfio::error::Result<TcpStream>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        // SAFETY: we are not moving out of this future
+        let this = unsafe { self.get_unchecked_mut() };
+
+        let backend = &mut *this.backend.lock();
+
+        if let Some(idx) = this.idx {
+            if let Some(conn) = backend.connections.get_mut(idx) {
+                match conn.res.take() {
+                    Some(Ok(stream)) => {
+                        let _ = backend.connections.remove(idx);
+                        return Poll::Ready(Ok(stream));
+                    }
+                    Some(Err(_)) => {
+                        conn.waker = Some(cx.waker().clone());
+                    }
+                    None => {
+                        conn.waker = Some(cx.waker().clone());
+                        return Poll::Pending;
+                    }
+                }
+            } else {
+                return Poll::Ready(Err(io_err(State::NotFound)));
+            }
+        }
+
+        // Push new op to the ring if we've got an address for it
+        loop {
+            if let Some(addr) = this.addrs.as_mut().and_then(|v| v.next()) {
+                let &mut idx = this
+                    .idx
+                    .get_or_insert_with(|| backend.connections.insert(cx.waker().clone().into()));
+
+                // The invariant here is that we have an entry within connections - if we didn't, we
+                // would have returned in the previous block.
+                let conn = backend.connections.get_mut(idx).unwrap();
+
+                let Ok((domain, fd)) = new_for_addr(addr) else {
+                    continue;
+                };
+                let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+
+                let (addr, len) = {
+                    let stor = SockaddrStorage::from(addr);
+                    conn.tmp_addr = Some(TmpAddr {
+                        domain,
+                        addr: Box::pin((stor, 0)),
+                    });
+                    conn.tmp_addr
+                        .as_ref()
+                        .map(|v| (v.addr.0.as_ptr(), v.addr.0.len()))
+                        .unwrap()
+                };
+
+                let entry = opcode::Connect::new(Fd(fd.as_raw_fd()), addr, len).build();
+
+                conn.fd = Some(fd);
+
+                backend
+                    .push_handle()
+                    .try_push_op(entry, Operation::TcpGetSock(idx));
+
+                break Poll::Pending;
+            } else {
+                if let Some(idx) = this.idx {
+                    backend.connections.remove(idx);
+                }
+
+                break Poll::Ready(Err(io_err(State::Exhausted)));
+            }
+        }
     }
 }
