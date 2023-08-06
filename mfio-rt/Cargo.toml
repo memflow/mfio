@@ -27,6 +27,7 @@ log = "0.4"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 flume = "0.10"
+oneshot = "0.1"
 
 [target.'cfg(unix)'.dependencies]
 mio = { version = "0.8", optional = true, features = ["os-poll", "os-ext", "net"] }

@@ -1,9 +1,12 @@
+use core::cell::RefCell;
+use core::num::NonZeroU16;
 use core::pin::Pin;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
-use super::{HeaderRouter, Request, Response};
+use super::{FsRequest, FsResponse, HeaderRouter, Request, Response};
 
+use async_mutex::Mutex as AsyncMutex;
 use cglue::result::IntError;
 use log::*;
 use mfio::backend::IoBackend;
@@ -11,7 +14,10 @@ use mfio::error::Error;
 use mfio::packet::{NoPos, PacketIo};
 use mfio::stdeq::Seekable;
 use mfio::tarc::BaseArc;
-use mfio_rt::{Fs, NativeFile, NativeRt};
+use mfio_rt::{
+    native::{NativeRtDir, ReadDir},
+    DirHandle, Fs, NativeFile, NativeRt,
+};
 use parking_lot::Mutex;
 use slab::Slab;
 use tracing::instrument::Instrument;
@@ -19,11 +25,11 @@ use tracing::instrument::Instrument;
 use futures::{
     future::FutureExt,
     pin_mut,
-    stream::{FuturesUnordered, StreamExt},
+    stream::{Fuse, FusedStream, FuturesUnordered, StreamExt},
 };
 use mfio_rt::{
     native::{NativeTcpListener, NativeTcpStream},
-    OpenOptions, Tcp,
+    Tcp,
 };
 use std::path::Path;
 
@@ -41,13 +47,17 @@ enum Operation {
         pos: u64,
         buf: Vec<u8>,
     },
-    FileOpen {
-        req_id: u32,
-        path: String,
-        options: OpenOptions,
-    },
     FileClose {
         file_id: u32,
+    },
+    ReadDir {
+        stream_id: u16,
+        count: u16,
+    },
+    Fs {
+        req_id: u32,
+        dir_id: u16,
+        req: FsRequest,
     },
 }
 
@@ -102,7 +112,11 @@ impl<'a> From<&'a ReadPacket> for Packet<'a, Write> {
 async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
     let stream_raw = &stream;
     let mut file_handles: Slab<BaseArc<Seekable<NativeFile, u64>>> = Default::default();
-    let file_handles = core::cell::RefCell::new(&mut file_handles);
+    let file_handles = RefCell::new(&mut file_handles);
+    let mut dir_handles: Slab<BaseArc<NativeRtDir>> = Default::default();
+    let dir_handles = RefCell::new(&mut dir_handles);
+    let mut read_dir_streams: Slab<Pin<BaseArc<AsyncMutex<Fuse<ReadDir>>>>> = Default::default();
+    let read_dir_streams = RefCell::new(&mut read_dir_streams);
 
     let router = HeaderRouter::new();
     let write_id = stream_raw.new_id().await;
@@ -158,22 +172,25 @@ async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
                             buf,
                         }
                     }
-                    Request::FileOpen {
+                    Request::Fs {
                         req_id,
-                        options,
-                        path_len,
+                        dir_id,
+                        req_len,
                     } => {
-                        let mut buf = vec![0; path_len as usize];
+                        let mut buf = vec![0; req_len as usize];
                         stream_raw
                             .read_all(NoPos::new(), &mut buf[..])
                             .await
                             .unwrap();
-                        let path = String::from_utf8(buf).unwrap();
-                        Operation::FileOpen {
+                        let req: FsRequest = postcard::from_bytes(&buf).unwrap();
+                        Operation::Fs {
                             req_id,
-                            path,
-                            options,
+                            dir_id,
+                            req,
                         }
+                    }
+                    Request::ReadDir { stream_id, count } => {
+                        Operation::ReadDir { stream_id, count }
                     }
                     Request::FileClose { file_id } => Operation::FileClose { file_id },
                 };
@@ -325,40 +342,193 @@ async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
                                 .instrument(req_span)
                                 .await
                             }
-                            Operation::FileOpen {
+                            Operation::ReadDir { stream_id, count } => {
+                                let read_dir_span = tracing::span!(
+                                    tracing::Level::TRACE,
+                                    "read dir",
+                                    stream_id,
+                                    count,
+                                );
+                                async {
+                                    if let Some(stream) =
+                                        read_dir_streams.borrow().get(stream_id as usize)
+                                    {
+                                        let stream_buf = &mut *stream.lock().await;
+                                        // SAFETY: we already ensure the stream is pinned at the
+                                        // storage level.
+                                        let stream =
+                                            unsafe { Pin::new_unchecked(&mut *stream_buf) };
+
+                                        let res = stream
+                                            .take(count as usize)
+                                            .map(|v| v.map_err(Error::into_int_err))
+                                            .collect::<Vec<_>>()
+                                            .await;
+
+                                        let buf = postcard::to_allocvec(&res).unwrap();
+
+                                        // TODO: we need to somehow ensure that this condition
+                                        // never occurs.
+                                        assert_eq!(buf.len() & (1 << 31), 0);
+                                        assert!(buf.len() < u32::MAX as usize);
+
+                                        let mut len = buf.len() as u32;
+
+                                        // SAFETY: we already ensure the stream is pinned at the
+                                        // storage level.
+                                        let stream = unsafe { Pin::new_unchecked(stream_buf) };
+
+                                        if stream.is_terminated() {
+                                            len |= 1 << 31;
+                                        }
+
+                                        router.send_bytes(
+                                            write_id,
+                                            |_| Response::ReadDir { stream_id, len },
+                                            buf.into_boxed_slice(),
+                                        );
+                                    } else {
+                                        router.send_hdr(write_id, |_| Response::ReadDir {
+                                            stream_id,
+                                            len: 0,
+                                        });
+                                    }
+                                }
+                                .instrument(read_dir_span)
+                                .await
+                            }
+                            Operation::Fs {
                                 req_id,
-                                path,
-                                options,
+                                dir_id,
+                                req,
                             } => {
                                 let req_span = tracing::span!(
                                     tracing::Level::TRACE,
-                                    "open request",
+                                    "fs request",
                                     req_id,
-                                    path
+                                    dir_id,
                                 );
                                 async {
-                                    trace!("Open file");
-                                    let (file_id, err) = match fs
-                                        .open(Path::new(&path), options)
-                                        .await
-                                    {
-                                        Ok(file) => (
-                                            file_handles.borrow_mut().insert(BaseArc::new(file)),
-                                            None,
-                                        ),
-                                        Err(err) => (0, Some(err.into_int_err())),
+                                    let dh = if dir_id > 0 {
+                                        let ret = Some(
+                                            dir_handles.borrow().get(dir_id as usize - 1).cloned(),
+                                        );
+                                        ret
+                                    } else {
+                                        None
                                     };
-                                    trace!("Opened {file_id} {err:?}");
 
-                                    assert!(file_id <= u32::MAX as usize);
+                                    let dh = dh.as_ref().map(|v| v.as_deref());
+                                    let dh = dh.unwrap_or_else(|| Some(fs.current_dir()));
 
-                                    router.send_hdr(write_id, |_| Response::FileOpen {
-                                        req_id,
-                                        file_id: file_id as u32,
-                                        err,
-                                    });
+                                    if let Some(dh) = dh {
+                                        let resp = match req {
+                                            FsRequest::Path => {
+                                                trace!("Get path");
+                                                let path = dh
+                                                    .path()
+                                                    .await
+                                                    .map(|p| p.to_string_lossy().into())
+                                                    .map_err(Error::into_int_err);
+                                                FsResponse::Path { path }
+                                            }
+                                            FsRequest::OpenFile { path, options } => {
+                                                trace!("Open file {path}");
+                                                let file_id = match dh
+                                                    .open_file(Path::new(&path), options)
+                                                    .await
+                                                {
+                                                    Ok(file) => {
+                                                        let file_id = file_handles
+                                                            .borrow_mut()
+                                                            .insert(BaseArc::new(file));
 
-                                    trace!("Written file open");
+                                                        assert!(file_id <= u32::MAX as usize);
+
+                                                        Ok(file_id as u32)
+                                                    }
+                                                    Err(err) => Err(err.into_int_err()),
+                                                };
+                                                trace!("Opened file {file_id:?}");
+
+                                                FsResponse::OpenFile { file_id }
+                                            }
+                                            FsRequest::OpenDir { path } => {
+                                                trace!("Open dir {path}");
+                                                let dir_id = match dh.open_dir(path).await {
+                                                    Ok(dir) => {
+                                                        let dir_id = dir_handles
+                                                            .borrow_mut()
+                                                            .insert(BaseArc::new(dir))
+                                                            + 1;
+
+                                                        assert!(dir_id <= u16::MAX as usize);
+
+                                                        Ok(NonZeroU16::new(dir_id as u16).unwrap())
+                                                    }
+                                                    Err(err) => Err(err.into_int_err()),
+                                                };
+                                                trace!("Opened dir {dir_id:?}");
+
+                                                FsResponse::OpenDir { dir_id }
+                                            }
+                                            FsRequest::ReadDir => {
+                                                trace!("Read dir");
+                                                let stream_id = match dh.read_dir().await {
+                                                    Ok(stream) => {
+                                                        let stream_id =
+                                                            read_dir_streams.borrow_mut().insert(
+                                                                BaseArc::pin(stream.fuse().into()),
+                                                            );
+
+                                                        assert!(stream_id <= u16::MAX as usize);
+
+                                                        Ok(stream_id as u16)
+                                                    }
+                                                    Err(err) => Err(err.into_int_err()),
+                                                };
+                                                trace!("Opened read handle {stream_id:?}");
+
+                                                FsResponse::ReadDir { stream_id }
+                                            }
+                                            FsRequest::Metadata { path } => {
+                                                trace!("Metadata {path}");
+                                                let metadata = dh
+                                                    .metadata(path)
+                                                    .await
+                                                    .map_err(Error::into_int_err);
+                                                FsResponse::Metadata { metadata }
+                                            }
+                                            FsRequest::DirOp(op) => {
+                                                trace!("Do dir op");
+                                                FsResponse::DirOp(
+                                                    dh.do_op(op)
+                                                        .await
+                                                        .map_err(Error::into_int_err)
+                                                        .err(),
+                                                )
+                                            }
+                                        };
+
+                                        let resp = postcard::to_allocvec(&resp).unwrap();
+
+                                        assert!(resp.len() <= u16::MAX as usize);
+
+                                        let resp_len = resp.len() as u16;
+
+                                        router.send_bytes(
+                                            write_id,
+                                            |_| Response::Fs { req_id, resp_len },
+                                            resp.into_boxed_slice(),
+                                        );
+
+                                        trace!("Written response for {req_id}");
+                                    } else {
+                                        router.send_hdr(write_id, |_| Response::Fs {
+                                            req_id,
+                                            resp_len: 0,
+                                        })
+                                    }
                                 }
                                 .instrument(req_span)
                                 .await
@@ -450,7 +620,7 @@ mod tests {
     use super::super::client::NetworkFs;
     use super::*;
     use mfio::traits::IoRead;
-    use mfio_rt::Fs;
+    use mfio_rt::{Fs, OpenOptions};
     use std::path::Path;
 
     #[test]

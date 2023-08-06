@@ -1,112 +1,32 @@
-use core::future::Future;
+use core::future::{ready, Future, Ready};
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use futures::Stream;
 use mfio::backend::*;
 use mfio::error::{Code, Error, Location, Result as MfioResult, State, Subject};
+use mfio::mferr;
 use mfio::packet::{FastCWaker, NoPos, PacketId, PacketIo, Read, Write};
 use mfio::stdeq::Seekable;
+use mfio::tarc::BaseArc;
 use std::fs;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::util::from_io_error;
-use crate::{Fs, OpenOptions, Tcp, TcpListenerHandle, TcpStreamHandle};
+use crate::{
+    DirEntry, DirHandle, DirOp, Fs, Metadata, OpenOptions, Tcp, TcpListenerHandle, TcpStreamHandle,
+};
 
 mod impls;
 
 macro_rules! fs_dispatch {
     ($($(#[cfg($meta:meta)])* $name:ident => $mod:ident),*$(,)?) => {
 
-/// Native OS backed runtime
-///
-/// # Examples
-///
-/// Read a file:
-/// ```
-/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// use mfio::packet::*;
-/// use mfio::stdeq::*;
-/// use mfio_rt::*;
-/// use std::fs::write;
-/// use std::path::Path;
-///
-/// let test_string = "Test test 42";
-/// let mut filepath = std::env::temp_dir();
-/// filepath.push("mfio-fs-test-read");
-///
-/// // Create a test file:
-/// write(&filepath, test_string.as_bytes())?;
-///
-/// // Create mfio's filesystem
-/// NativeRt::default().run(|fs| async move {
-///     let fh = fs.open(&filepath, OpenOptions::new().read(true)).await?;
-///
-///     let mut output = vec![];
-///     fh.read_to_end(&mut output).await?;
-///
-///     assert_eq!(test_string.len(), fh.get_pos() as usize);
-///     assert_eq!(test_string.as_bytes(), output);
-///     mfio::error::Result::Ok(())
-/// }).unwrap();
-///
-/// # Ok(())
-/// # }
-/// ```
-///
-/// Write a file:
-/// ```
-/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// # pollster::block_on(async move {
-/// use mfio::packet::*;
-/// use mfio::stdeq::*;
-/// use mfio_rt::*;
-/// use std::path::Path;
-/// use std::io::Seek;
-///
-/// let mut test_data = vec![];
-///
-/// for i in 0u8..128 {
-///     test_data.extend(i.to_ne_bytes());
-/// }
-///
-/// let mut filepath = std::env::temp_dir();
-/// filepath.push("mfio-fs-test-write");
-///
-/// // Create mfio's filesystem
-/// NativeRt::default().run(|fs| async move {
-///     let mut fh = fs.open(
-///         &filepath,
-///         OpenOptions::new()
-///             .read(true)
-///             .write(true)
-///             .create(true)
-///             .truncate(true)
-///         ).await?;
-///
-///     fh.write(&test_data).await?;
-///
-///     assert_eq!(test_data.len(), fh.get_pos() as usize);
-///
-///     fh.rewind();
-///
-///     // Read the data back out
-///     let mut output = vec![];
-///     fh.read_to_end(&mut output).await?;
-///
-///     assert_eq!(test_data.len(), fh.get_pos() as usize);
-///     assert_eq!(test_data, output);
-///     mfio::error::Result::Ok(())
-/// }).unwrap();
-/// # Ok(())
-/// # })
-/// # }
-/// ```
-        pub enum NativeRt {
+        pub enum NativeRtInstance {
             $($(#[cfg($meta)])* $name(impls::$mod::Runtime)),*
         }
 
-        impl NativeRt {
+        impl NativeRtInstance {
             pub fn register_file(&self, file: std::fs::File) -> NativeFile {
                 match self {
                     $($(#[cfg($meta)])* Self::$name(v) => NativeFile::$name(v.register_file(file))),*
@@ -119,13 +39,9 @@ macro_rules! fs_dispatch {
                     $($(#[cfg($meta)])* Self::$name(v) => NativeTcpStream::$name(v.register_stream(stream))),*
                 }
             }
-
-            pub fn builder() -> NativeRtBuilder {
-                NativeRtBuilder::default()
-            }
         }
 
-        impl core::fmt::Debug for NativeRt {
+        impl core::fmt::Debug for NativeRtInstance {
             fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
                 match self {
                     $($(#[cfg($meta)])* Self::$name(_) => write!(f, stringify!(NativeRt::$name))),*
@@ -133,15 +49,7 @@ macro_rules! fs_dispatch {
             }
         }
 
-        impl Default for NativeRt {
-            fn default() -> Self {
-                NativeRtBuilder::env_backends()
-                    .build()
-                    .expect("Could not initialize any FS backend")
-            }
-        }
-
-        impl IoBackend for NativeRt {
+        impl IoBackend for NativeRtInstance {
             type Backend = DynBackend;
 
             fn polling_handle(&self) -> Option<PollingHandle> {
@@ -219,7 +127,7 @@ macro_rules! fs_dispatch {
             pub fn build(self) -> mfio::error::Result<NativeRt> {
                 $($(#[cfg($meta)])* if self.$mod {
                     if let Ok(v) = impls::$mod::Runtime::try_new() {
-                        return Ok(NativeRt::$name(v));
+                        return Ok(NativeRtInstance::$name(v).into());
                     }
                 })*
 
@@ -239,7 +147,7 @@ macro_rules! fs_dispatch {
                         stringify!($mod),
                         impls::$mod::Runtime::try_new()
                             .map_err(|e| e.into())
-                            .map(|v| NativeRt::$name(v))
+                            .map(|v| NativeRtInstance::$name(v).into())
                     ));
                 })*
 
@@ -323,7 +231,7 @@ macro_rules! fs_dispatch {
             }
         }
 
-        impl Tcp for NativeRt {
+        impl Tcp for NativeRtInstance {
             type StreamHandle = NativeTcpStream;
             type ListenerHandle = NativeTcpListener;
             type ConnectFuture<'a, A: ToSocketAddrs + Send + 'a> = NativeTcpConnectFuture<'a, A>;
@@ -389,31 +297,460 @@ fs_dispatch! {
     Default => thread,
 }
 
+/// Native OS backed runtime
+///
+/// # Examples
+///
+/// Read a file:
+/// ```
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use mfio::packet::*;
+/// use mfio::stdeq::*;
+/// use mfio_rt::*;
+/// use std::fs::write;
+/// use std::path::Path;
+///
+/// let test_string = "Test test 42";
+/// let mut filepath = std::env::temp_dir();
+/// filepath.push("mfio-fs-test-read");
+///
+/// // Create a test file:
+/// write(&filepath, test_string.as_bytes())?;
+///
+/// // Create mfio's filesystem
+/// NativeRt::default()
+///     .run(|fs| async move {
+///         let fh = fs.open(&filepath, OpenOptions::new().read(true)).await?;
+///
+///         let mut output = vec![];
+///         fh.read_to_end(&mut output).await?;
+///
+///         assert_eq!(test_string.len(), fh.get_pos() as usize);
+///         assert_eq!(test_string.as_bytes(), output);
+///         mfio::error::Result::Ok(())
+///     })
+///     .unwrap();
+///
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Write a file:
+/// ```
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # pollster::block_on(async move {
+/// use mfio::packet::*;
+/// use mfio::stdeq::*;
+/// use mfio_rt::*;
+/// use std::io::Seek;
+/// use std::path::Path;
+///
+/// let mut test_data = vec![];
+///
+/// for i in 0u8..128 {
+///     test_data.extend(i.to_ne_bytes());
+/// }
+///
+/// let mut filepath = std::env::temp_dir();
+/// filepath.push("mfio-fs-test-write");
+///
+/// // Create mfio's filesystem
+/// NativeRt::default()
+///     .run(|fs| async move {
+///         let mut fh = fs
+///             .open(
+///                 &filepath,
+///                 OpenOptions::new()
+///                     .read(true)
+///                     .write(true)
+///                     .create(true)
+///                     .truncate(true),
+///             )
+///             .await?;
+///
+///         fh.write(&test_data).await?;
+///
+///         assert_eq!(test_data.len(), fh.get_pos() as usize);
+///
+///         fh.rewind();
+///
+///         // Read the data back out
+///         let mut output = vec![];
+///         fh.read_to_end(&mut output).await?;
+///
+///         assert_eq!(test_data.len(), fh.get_pos() as usize);
+///         assert_eq!(test_data, output);
+///         mfio::error::Result::Ok(())
+///     })
+///     .unwrap();
+/// # Ok(())
+/// # })
+/// # }
+/// ```
+#[derive(Debug)]
+pub struct NativeRt {
+    cwd: NativeRtDir,
+}
+
+impl IoBackend for NativeRt {
+    type Backend = <NativeRtInstance as IoBackend>::Backend;
+
+    fn polling_handle(&self) -> Option<PollingHandle> {
+        self.cwd.instance.polling_handle()
+    }
+
+    fn get_backend(&self) -> BackendHandle<Self::Backend> {
+        self.cwd.instance.get_backend()
+    }
+}
+
+impl Tcp for NativeRt {
+    type StreamHandle = <NativeRtInstance as Tcp>::StreamHandle;
+    type ListenerHandle = <NativeRtInstance as Tcp>::ListenerHandle;
+    type ConnectFuture<'a, A: ToSocketAddrs + Send + 'a> =
+        <NativeRtInstance as Tcp>::ConnectFuture<'a, A>;
+    type BindFuture<'a, A: ToSocketAddrs + Send + 'a> =
+        <NativeRtInstance as Tcp>::BindFuture<'a, A>;
+
+    fn connect<'a, A: ToSocketAddrs + Send + 'a>(&'a self, addrs: A) -> Self::ConnectFuture<'a, A> {
+        self.cwd.instance.connect(addrs)
+    }
+
+    fn bind<'a, A: ToSocketAddrs + Send + 'a>(&'a self, addrs: A) -> Self::BindFuture<'a, A> {
+        self.cwd.instance.bind(addrs)
+    }
+}
+
+impl Default for NativeRt {
+    fn default() -> Self {
+        NativeRtBuilder::env_backends()
+            .build()
+            .expect("Could not initialize any FS backend")
+    }
+}
+
 impl Fs for NativeRt {
-    type FileHandle = Seekable<NativeFile, u64>;
-    type OpenFuture<'a> = core::future::Ready<MfioResult<Self::FileHandle>>;
+    type DirHandle<'a> = NativeRtDir;
 
-    fn open(&self, path: &Path, options: OpenOptions) -> Self::OpenFuture<'_> {
-        let file = fs::OpenOptions::new()
-            .read(options.read)
-            .write(options.write)
-            .create(options.create)
-            .create_new(options.create_new)
-            .truncate(options.truncate)
-            .open(path)
-            .map_err(crate::util::from_io_error);
-
-        core::future::ready(file.map(|file| self.register_file(file).into()))
+    fn current_dir(&self) -> &Self::DirHandle<'_> {
+        &self.cwd
     }
 }
 
 impl NativeRt {
+    pub fn builder() -> NativeRtBuilder {
+        NativeRtBuilder::default()
+    }
+
+    pub fn instance(&self) -> &BaseArc<NativeRtInstance> {
+        &self.cwd.instance
+    }
+
     pub fn run<'a, Func: FnOnce(&'a NativeRt) -> F, F: Future>(
         &'a mut self,
         func: Func,
     ) -> F::Output {
         self.block_on(func(self))
     }
+
+    pub fn register_file(&self, file: std::fs::File) -> NativeFile {
+        self.cwd.instance.register_file(file)
+    }
+
+    /// Registers a non-seekable I/O stream
+    pub fn register_stream(&self, stream: TcpStream) -> NativeTcpStream {
+        self.cwd.instance.register_stream(stream)
+    }
+}
+
+impl From<NativeRtInstance> for NativeRt {
+    fn from(instance: NativeRtInstance) -> Self {
+        let (ops, rx) = flume::bounded(16);
+
+        // TODO: store the join handle
+        std::thread::spawn(move || rx.into_iter().for_each(RtBgOp::process));
+
+        Self {
+            cwd: NativeRtDir {
+                dir: None,
+                ops,
+                instance: BaseArc::from(instance),
+            },
+        }
+    }
+}
+
+impl NativeRtDir {
+    fn join_path<P: AsRef<Path>>(&self, other: P) -> std::io::Result<PathBuf> {
+        if other.as_ref().is_absolute() {
+            Ok(other.as_ref().into())
+        } else {
+            self.get_path().map(|v| v.join(other))
+        }
+    }
+    fn get_path(&self) -> std::io::Result<PathBuf> {
+        if let Some(dir) = self.dir.clone() {
+            Ok(dir)
+        } else {
+            std::env::current_dir()
+        }
+    }
+}
+
+impl DirHandle for NativeRtDir {
+    type FileHandle = Seekable<NativeFile, u64>;
+    type OpenFileFuture<'a> = OpenFileFuture<'a>;
+    type PathFuture<'a> = Ready<MfioResult<PathBuf>>;
+    type OpenDirFuture<'a> = Ready<MfioResult<Self>>;
+    type ReadDir<'a> = ReadDir;
+    type ReadDirFuture<'a> = Ready<MfioResult<ReadDir>>;
+    type MetadataFuture<'a> = MetadataFuture;
+    type OpFuture<'a> = OpFuture;
+
+    /// Gets the absolute path to this `DirHandle`.
+    fn path(&self) -> Self::PathFuture<'_> {
+        ready(self.get_path().map_err(from_io_error))
+    }
+
+    /// Reads the directory contents.
+    ///
+    /// This function, upon success, returns a stream that can be used to list files and
+    /// subdirectories within this dir.
+    ///
+    /// Note that on various platforms this may behave differently. For instance, Unix platforms
+    /// support holding
+    fn read_dir(&self) -> Self::ReadDirFuture<'_> {
+        ready(
+            self.get_path()
+                .and_then(|v| v.read_dir())
+                .map_err(from_io_error)
+                .map(|instance| ReadDir { instance }),
+        )
+    }
+
+    /// Opens a file.
+    ///
+    /// This function accepts an absolute or relative path to a file for reading. If the path is
+    /// relative, it is opened relative to this `DirHandle`.
+    fn open_file<P: AsRef<Path>>(&self, path: P, options: OpenOptions) -> Self::OpenFileFuture<'_> {
+        let (tx, rx) = oneshot::channel();
+
+        if let Ok(path) = self.join_path(path) {
+            let _ = self.ops.send(RtBgOp::OpenFile {
+                path,
+                options,
+                completion: tx,
+            });
+        } else {
+            let _ = tx.send(Err(mferr!(Directory, Unavailable, Filesystem)));
+        }
+
+        OpenFileFuture {
+            rt: self,
+            completion: rx,
+        }
+    }
+
+    /// Opens a directory.
+    ///
+    /// This function accepts an absolute or relative path to a directory for reading. If the path
+    /// is relative, it is opened relative to this `DirHandle`.
+    fn open_dir<P: AsRef<Path>>(&self, path: P) -> Self::OpenDirFuture<'_> {
+        let dir = self.join_path(path).map_err(from_io_error).and_then(|v| {
+            if v.is_dir() {
+                Ok(Self {
+                    dir: Some(v),
+                    ops: self.ops.clone(),
+                    instance: self.instance.clone(),
+                })
+            } else if v.exists() {
+                Err(mferr!(Path, Invalid, Filesystem))
+            } else {
+                Err(mferr!(Path, NotFound, Filesystem))
+            }
+        });
+
+        ready(dir)
+    }
+
+    fn metadata<P: AsRef<Path>>(&self, path: P) -> Self::MetadataFuture<'_> {
+        let (tx, rx) = oneshot::channel();
+
+        if let Ok(path) = self.join_path(path) {
+            let _ = self.ops.send(RtBgOp::Metadata {
+                path,
+                completion: tx,
+            });
+        } else {
+            let _ = tx.send(Err(mferr!(Directory, Unavailable, Filesystem)));
+        }
+
+        MetadataFuture { completion: rx }
+    }
+
+    /// Do an operation.
+    ///
+    /// This function performs an operation from the [`DirOp`](DirOp) enum.
+    fn do_op<P: AsRef<Path>>(&self, operation: DirOp<P>) -> Self::OpFuture<'_> {
+        let (tx, rx) = oneshot::channel();
+
+        let _ = self.ops.send(RtBgOp::DirOp {
+            op: operation.as_path().into_pathbuf(),
+            completion: tx,
+        });
+
+        OpFuture { completion: rx }
+    }
+}
+
+pub struct ReadDir {
+    instance: fs::ReadDir,
+}
+
+impl Stream for ReadDir {
+    type Item = MfioResult<DirEntry>;
+
+    fn poll_next(self: Pin<&mut Self>, _: &mut Context) -> Poll<Option<Self::Item>> {
+        let this = unsafe { self.get_unchecked_mut() };
+
+        Poll::Ready(
+            this.instance
+                .next()
+                .map(|v| v.map(From::from).map_err(from_io_error)),
+        )
+    }
+}
+
+pub struct MetadataFuture {
+    completion: oneshot::Receiver<MfioResult<Metadata>>,
+}
+
+impl Future for MetadataFuture {
+    type Output = MfioResult<Metadata>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+        let completion = unsafe { Pin::new_unchecked(&mut this.completion) };
+        match completion.poll(cx) {
+            Poll::Ready(Ok(res)) => Poll::Ready(res),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(mferr!(Output, BrokenPipe, Filesystem))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+pub struct OpenFileFuture<'a> {
+    rt: &'a NativeRtDir,
+    completion: oneshot::Receiver<MfioResult<std::fs::File>>,
+}
+
+impl<'a> Future for OpenFileFuture<'a> {
+    type Output = MfioResult<<NativeRtDir as DirHandle>::FileHandle>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+        let completion = unsafe { Pin::new_unchecked(&mut this.completion) };
+        match completion.poll(cx) {
+            Poll::Ready(Ok(file)) => {
+                Poll::Ready(file.map(|f| this.rt.instance.register_file(f).into()))
+            }
+            Poll::Ready(Err(_)) => Poll::Ready(Err(mferr!(Output, BrokenPipe, Filesystem))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+pub struct OpFuture {
+    completion: oneshot::Receiver<MfioResult<()>>,
+}
+
+impl Future for OpFuture {
+    type Output = MfioResult<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+        let completion = unsafe { Pin::new_unchecked(&mut this.completion) };
+        match completion.poll(cx) {
+            Poll::Ready(Ok(res)) => Poll::Ready(res),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(mferr!(Output, BrokenPipe, Filesystem))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+enum RtBgOp {
+    OpenFile {
+        path: PathBuf,
+        options: OpenOptions,
+        completion: oneshot::Sender<MfioResult<std::fs::File>>,
+    },
+    DirOp {
+        op: DirOp<PathBuf>,
+        completion: oneshot::Sender<MfioResult<()>>,
+    },
+    Metadata {
+        path: PathBuf,
+        completion: oneshot::Sender<MfioResult<Metadata>>,
+    },
+}
+
+impl RtBgOp {
+    fn process(self) {
+        match self {
+            Self::OpenFile {
+                path,
+                options,
+                completion,
+            } => {
+                let file = fs::OpenOptions::new()
+                    .read(options.read)
+                    .write(options.write)
+                    .create(options.create)
+                    .create_new(options.create_new)
+                    .truncate(options.truncate)
+                    .open(path)
+                    .map_err(crate::util::from_io_error);
+                let _ = completion.send(file);
+            }
+            Self::DirOp { op, completion } => {
+                let ret = match op {
+                    DirOp::SetPermissions { .. } => {
+                        // FIXME
+                        // This needs to be made platform specific, because we don't have a way to
+                        // build permissions object ourselves.
+                        Err(std::io::ErrorKind::Unsupported.into())
+                    }
+                    DirOp::RemoveDir { path } => fs::remove_dir(path),
+                    DirOp::RemoveDirAll { path } => fs::remove_dir_all(path),
+                    DirOp::RemoveFile { path } => fs::remove_file(path),
+                    DirOp::Rename { from, to } => fs::rename(from, to),
+                    DirOp::Copy { from, to } => fs::copy(from, to).map(|_| ()),
+                    DirOp::HardLink { from, to } => fs::hard_link(from, to),
+                };
+                let _ = completion.send(ret.map_err(from_io_error));
+            }
+            Self::Metadata { path, completion } => {
+                let res = path
+                    .metadata()
+                    .map(|m| Metadata {
+                        permissions: m.permissions().into(),
+                        len: m.len(),
+                        modified: m.modified().ok(),
+                        accessed: m.accessed().ok(),
+                        created: m.created().ok(),
+                    })
+                    .map_err(from_io_error);
+                let _ = completion.send(res);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct NativeRtDir {
+    dir: Option<PathBuf>,
+    ops: flume::Sender<RtBgOp>,
+    instance: BaseArc<NativeRtInstance>,
 }
 
 #[cfg(test)]
@@ -444,7 +781,7 @@ mod tests {
 
         for (backend, fs) in NativeRtBuilder::all_backends().build_each() {
             println!("{backend}");
-            fs.unwrap().run(|fs| async {
+            fs.unwrap().run(|fs: &NativeRt| async {
                 let fh = fs
                     .open(&filepath, OpenOptions::new().read(true))
                     .await

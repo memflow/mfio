@@ -1,12 +1,12 @@
 # mfio
 
-[![Build and test]][workflows] [![Rustc 1.66]][rust] [![codecov]][codecov-link]
+[![Build and test]][workflows] [![Rustc 1.67]][rust] [![codecov]][codecov-link]
 
 [Build and test]: https://github.com/memflow/mfio/actions/workflows/build.yml/badge.svg
 [workflows]: https://github.com/memflow/mfio/actions/workflows/build.yml
 [MIT licensed]: https://img.shields.io/badge/license-MIT-blue.svg
-[Rustc 1.66]: https://img.shields.io/badge/rustc-1.66+-lightgray.svg
-[rust]: https://blog.rust-lang.org/2022/12/15/Rust-1.66.0.html
+[Rustc 1.67]: https://img.shields.io/badge/rustc-1.67+-lightgray.svg
+[rust]: https://blog.rust-lang.org/2023/01/26/Rust-1.67.0.html
 [codecov]: https://codecov.io/gh/memflow/mfio/branch/main/graph/badge.svg?token=IJ1K4QPAIM
 [codecov-link]: https://codecov.io/gh/memflow/mfio
 

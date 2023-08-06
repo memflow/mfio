@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use core::future::poll_fn;
 use core::mem::MaybeUninit;
@@ -6,6 +6,7 @@ use core::task::{Context, Poll, Waker};
 
 use mfio::backend::*;
 use mfio::error::Result;
+use mfio::mferr;
 use mfio::packet::*;
 
 use mfio::tarc::{Arc, BaseArc};
@@ -14,17 +15,23 @@ use mfio::traits::*;
 use parking_lot::Mutex;
 use slab::Slab;
 
-use super::{HeaderRouter, Request, Response};
+use super::{FsRequest, FsResponse, HeaderRouter, ReadDirResponse, Request, Response};
 use cglue::result::IntError;
 use futures::{future::FutureExt, pin_mut};
 use mfio::error::Error;
-use mfio_rt::Fs;
+use mfio_rt::{DirEntry, DirHandle, DirOp, Fs, Metadata, OpenOptions};
+
+use core::future::Future;
+use core::pin::Pin;
+use mfio::stdeq::Seekable;
+use std::path::Path;
 
 use std::io::{self /*, Read as _, Write as _*/};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 
 use flume::{r#async::SendFut, Sender};
+use futures::Stream;
 use log::*;
 use tracing::instrument::Instrument;
 
@@ -149,35 +156,36 @@ impl OpType {
 }
 
 #[derive(Debug)]
-enum FileOpenRequest {
+enum FsRequestState {
     Started {
-        options: OpenOptions,
-        path: PathBuf,
+        req: FsRequest,
+        dir_id: u16,
         waker: Option<Waker>,
     },
     Processing {
         waker: Option<Waker>,
     },
     Complete {
-        file_handle: Result<u32>,
+        resp: Option<FsResponse>,
     },
 }
 
 struct NetFsState {
     in_flight_ops: Slab<InFlightOpType>,
-    open_reqs: Slab<FileOpenRequest>,
+    fs_reqs: Slab<FsRequestState>,
+    read_dir_streams: Slab<ReadDirStream>,
 }
 
 struct Senders {
     ops: Sender<FileOperation>,
-    open_reqs: Sender<u32>,
+    fs_reqs: Sender<u32>,
+    read_dir_reqs: Sender<u16>,
     close_reqs: Sender<u32>,
 }
 
 pub struct NetworkFs {
-    state: BaseArc<Mutex<NetFsState>>,
     backend: BackendContainer<DynBackend>,
-    senders: BaseArc<Senders>,
+    cwd: NetworkFsDir,
     fs: Arc<mfio_rt::NativeRt>,
 }
 
@@ -200,17 +208,20 @@ impl NetworkFs {
 
         let state = BaseArc::new(Mutex::new(NetFsState {
             in_flight_ops: Default::default(),
-            open_reqs: Default::default(),
+            fs_reqs: Default::default(),
+            read_dir_streams: Default::default(),
         }));
 
         let (ops, ops_rx) = flume::unbounded();
-        let (open_reqs, open_reqs_rx) = flume::bounded(16);
+        let (fs_reqs, fs_reqs_rx) = flume::bounded(16);
         let (close_reqs, close_reqs_rx) = flume::unbounded();
+        let (read_dir_reqs, read_dir_reqs_rx) = flume::unbounded();
 
         let senders = Senders {
             ops,
-            open_reqs,
+            fs_reqs,
             close_reqs,
+            read_dir_reqs,
         };
 
         let backend = {
@@ -352,39 +363,101 @@ impl NetworkFs {
                                 .instrument(read_span)
                                 .await
                             }
-                            Response::FileOpen {
-                                req_id,
-                                err,
-                                file_id,
-                            } => {
-                                let read_span = tracing::span!(
+                            Response::Fs { req_id, resp_len } => {
+                                let fs_span = tracing::span!(
                                     tracing::Level::TRACE,
-                                    "open response",
+                                    "fs response",
                                     req_id,
-                                    file_id
+                                    resp_len
                                 );
                                 async {
+                                    // TODO: make a wrapper for this...
+                                    let resp_len = resp_len as usize;
+                                    if tmp_buf.capacity() < resp_len {
+                                        tmp_buf.reserve(resp_len - tmp_buf.capacity());
+                                    }
+                                    // SAFETY: the data here is unininitialized
+                                    unsafe { tmp_buf.set_len(resp_len) };
+                                    let buf = unsafe {
+                                        let buf = tmp_buf.as_ptr() as *mut u8;
+                                        core::slice::from_raw_parts_mut(buf, resp_len)
+                                    };
+
+                                    if resp_len > 0 {
+                                        read_end.read_all(NoPos::new(), &mut *buf).await.unwrap();
+                                    }
+
+                                    let resp: Option<FsResponse> = postcard::from_bytes(buf).ok();
+
+                                    log::trace!("Fs Response: {resp:?}");
+
                                     let mut state = state.lock();
-                                    if let Some(req) = state.open_reqs.get_mut(req_id as usize) {
-                                        if let FileOpenRequest::Processing { waker } = req {
+                                    if let Some(req) = state.fs_reqs.get_mut(req_id as usize) {
+                                        log::trace!("State: {req:?}");
+                                        if let FsRequestState::Processing { waker } = req {
                                             let waker = waker.take();
 
-                                            let file_handle =
-                                                if let Some(err) = err.map(Error::from_int_err) {
-                                                    Err(err)
-                                                } else {
-                                                    Ok(file_id)
-                                                };
-
-                                            *req = FileOpenRequest::Complete { file_handle };
+                                            *req = FsRequestState::Complete { resp };
+                                            log::trace!("Move to fin");
 
                                             if let Some(waker) = waker {
+                                                log::trace!("Wake");
                                                 waker.wake();
                                             }
                                         }
                                     }
                                 }
-                                .instrument(read_span)
+                                .instrument(fs_span)
+                                .await
+                            }
+                            Response::ReadDir { stream_id, len } => {
+                                let fs_span = tracing::span!(
+                                    tracing::Level::TRACE,
+                                    "read dir",
+                                    stream_id,
+                                    len,
+                                );
+                                async {
+                                    let closed = (len & (1 << 31)) != 0;
+                                    let len = len & !(1 << 31);
+                                    // TODO: make a wrapper for this...
+                                    let len = len as usize;
+                                    if tmp_buf.capacity() < len {
+                                        tmp_buf.reserve(len - tmp_buf.capacity());
+                                    }
+                                    // SAFETY: the data here is unininitialized
+                                    unsafe { tmp_buf.set_len(len) };
+                                    let buf = unsafe {
+                                        let buf = tmp_buf.as_ptr() as *mut u8;
+                                        core::slice::from_raw_parts_mut(buf, len)
+                                    };
+                                    read_end.read_all(NoPos::new(), &mut *buf).await.unwrap();
+
+                                    let resp: Vec<ReadDirResponse> =
+                                        postcard::from_bytes(buf).unwrap();
+
+                                    let mut state = state.lock();
+                                    if let Some(stream) =
+                                        state.read_dir_streams.get_mut(stream_id as usize)
+                                    {
+                                        let waker = stream.waker.take();
+
+                                        if closed || buf.is_empty() {
+                                            stream.closed = true;
+                                        }
+
+                                        stream.resp_count += resp.len();
+                                        stream.results.extend(
+                                            resp.into_iter()
+                                                .map(|r| r.map_err(Error::from_int_err)),
+                                        );
+
+                                        if let Some(waker) = waker {
+                                            waker.wake();
+                                        }
+                                    }
+                                }
+                                .instrument(fs_span)
                                 .await
                             }
                         }
@@ -410,40 +483,57 @@ impl NetworkFs {
                 .instrument(tracing::span!(tracing::Level::TRACE, "ops_loop"))
                 .fuse();
 
-                let open_loop = async {
-                    while let Ok(req_id) = open_reqs_rx.recv_async().await {
+                let read_dir_loop = async {
+                    while let Ok(stream_id) = read_dir_reqs_rx.recv_async().await {
+                        async {
+                            let mut state = state.lock();
+
+                            if let Some(req) = state.read_dir_streams.get_mut(stream_id as usize) {
+                                if !req.closed {
+                                    let count = req.compute_count();
+                                    core::mem::drop(state);
+                                    router.send_hdr(write_id, |_| Request::ReadDir {
+                                        stream_id,
+                                        count,
+                                    });
+                                }
+                            }
+                        }
+                        .instrument(tracing::span!(
+                            tracing::Level::TRACE,
+                            "read dir more",
+                            stream_id
+                        ))
+                        .await;
+                    }
+                }
+                .instrument(tracing::span!(tracing::Level::TRACE, "open_loop"))
+                .fuse();
+
+                let fs_loop = async {
+                    while let Ok(req_id) = fs_reqs_rx.recv_async().await {
                         async {
                             let msg = {
                                 let mut state = state.lock();
 
-                                if let Some(req) = state.open_reqs.get_mut(req_id as usize) {
-                                    if let FileOpenRequest::Started {
-                                        options,
-                                        path,
-                                        waker,
-                                    } = req
-                                    {
-                                        let path = core::mem::take(path)
-                                            .into_os_string()
-                                            .into_string()
-                                            .unwrap();
-                                        let path_bytes = path.as_bytes();
+                                if let Some(fs_req) = state.fs_reqs.get_mut(req_id as usize) {
+                                    if let FsRequestState::Started { req, dir_id, waker } = fs_req {
+                                        let buf = postcard::to_allocvec(&req).unwrap();
+                                        // TODO: verify buflen
+                                        let ret = Some((
+                                            Request::Fs {
+                                                req_id,
+                                                dir_id: *dir_id,
+                                                req_len: buf.len() as u16,
+                                            },
+                                            buf,
+                                        ));
 
-                                        assert!(path_bytes.len() <= u32::MAX as usize);
-
-                                        let msg = Request::FileOpen {
-                                            req_id,
-                                            path_len: path_bytes.len() as u32,
-                                            options: *options,
-                                        };
-
-                                        trace!("Write open {msg:?}");
-
-                                        *req = FileOpenRequest::Processing {
+                                        *fs_req = FsRequestState::Processing {
                                             waker: waker.take(),
                                         };
 
-                                        Some((msg, path))
+                                        ret
                                     } else {
                                         None
                                     }
@@ -452,12 +542,8 @@ impl NetworkFs {
                                 }
                             };
 
-                            if let Some((msg, path)) = msg {
-                                router.send_bytes(
-                                    write_id,
-                                    |_| msg,
-                                    path.into_bytes().into_boxed_slice(),
-                                );
+                            if let Some((header, buf)) = msg {
+                                router.send_bytes(write_id, |_| header, buf.into_boxed_slice());
                             }
                         }
                         .instrument(tracing::span!(tracing::Level::TRACE, "open send", req_id))
@@ -485,14 +571,16 @@ impl NetworkFs {
                     .fuse();
 
                 let combined = async move {
-                    pin_mut!(open_loop);
+                    pin_mut!(fs_loop);
+                    pin_mut!(read_dir_loop);
                     pin_mut!(close_loop);
                     pin_mut!(ops_loop);
                     pin_mut!(results_loop);
                     pin_mut!(process_loop);
 
                     futures::select! {
-                        _ = open_loop => log::error!("Open done"),
+                        _ = fs_loop => log::error!("Fs done"),
+                        _ = read_dir_loop => log::error!("Read dir done"),
                         _ = close_loop => log::error!("Close done"),
                         _ = ops_loop => log::error!("Ops done"),
                         _ = results_loop => log::error!("Results done"),
@@ -513,8 +601,11 @@ impl NetworkFs {
 
         Ok(Self {
             fs,
-            state,
-            senders: senders.into(),
+            cwd: NetworkFsDir {
+                dir_id: 0,
+                state,
+                senders: senders.into(),
+            },
             backend: BackendContainer::new_dyn(backend),
         })
     }
@@ -533,108 +624,399 @@ impl IoBackend for NetworkFs {
 }
 
 impl Fs for NetworkFs {
+    type DirHandle<'a> = NetworkFsDir;
+
+    fn current_dir(&self) -> &Self::DirHandle<'_> {
+        &self.cwd
+    }
+}
+
+pub struct NetworkFsDir {
+    dir_id: u16,
+    state: BaseArc<Mutex<NetFsState>>,
+    senders: BaseArc<Senders>,
+}
+
+impl DirHandle for NetworkFsDir {
     type FileHandle = Seekable<FileWrapper, u64>;
-    type OpenFuture<'a> = OpenFuture<'a>;
+    type OpenFileFuture<'a> = OpenFileFuture<'a>;
+    type PathFuture<'a> = PathFuture<'a>;
+    type OpenDirFuture<'a> = OpenDirFuture<'a>;
+    type ReadDir<'a> = ReadDir<'a>;
+    type ReadDirFuture<'a> = ReadDirFuture<'a>;
+    type MetadataFuture<'a> = MetadataFuture<'a>;
+    type OpFuture<'a> = OpFuture<'a>;
 
-    fn open(&self, path: &Path, options: OpenOptions) -> Self::OpenFuture<'_> {
-        let state = &mut *self.state.lock();
+    /// Gets the absolute path to this `DirHandle`.
+    fn path(&self) -> Self::PathFuture<'_> {
+        PathOp::make_future(self, FsRequest::Path)
+    }
 
-        let req_id = state.open_reqs.insert(FileOpenRequest::Started {
-            options,
-            path: path.into(),
+    /// Reads the directory contents.
+    ///
+    /// This function, upon success, returns a stream that can be used to list files and
+    /// subdirectories within this dir.
+    ///
+    /// Note that on various platforms this may behave differently. For instance, Unix platforms
+    /// support holding
+    fn read_dir(&self) -> Self::ReadDirFuture<'_> {
+        ReadDirOp::make_future(self, FsRequest::ReadDir)
+    }
+
+    /// Opens a file.
+    ///
+    /// This function accepts an absolute or relative path to a file for reading. If the path is
+    /// relative, it is opened relative to this `DirHandle`.
+    fn open_file<P: AsRef<Path>>(&self, path: P, options: OpenOptions) -> Self::OpenFileFuture<'_> {
+        OpenFileOp::make_future(
+            self,
+            FsRequest::OpenFile {
+                path: path.as_ref().to_string_lossy().into(),
+                options,
+            },
+        )
+    }
+
+    /// Opens a directory.
+    ///
+    /// This function accepts an absolute or relative path to a directory for reading. If the path
+    /// is relative, it is opened relative to this `DirHandle`.
+    fn open_dir<P: AsRef<Path>>(&self, path: P) -> Self::OpenDirFuture<'_> {
+        OpenDirOp::make_future(
+            self,
+            FsRequest::OpenDir {
+                path: path.as_ref().to_string_lossy().into(),
+            },
+        )
+    }
+
+    fn metadata<P: AsRef<Path>>(&self, path: P) -> Self::MetadataFuture<'_> {
+        MetadataOp::make_future(
+            self,
+            FsRequest::Metadata {
+                path: path.as_ref().to_string_lossy().into(),
+            },
+        )
+    }
+
+    /// Do an operation.
+    ///
+    /// This function performs an operation from the [`DirOp`](DirOp) enum.
+    fn do_op<P: AsRef<Path>>(&self, operation: DirOp<P>) -> Self::OpFuture<'_> {
+        OpOp::make_future(self, FsRequest::DirOp(operation.as_path().into_string()))
+    }
+}
+
+trait FsRequestProc {
+    type Output<'a>: 'a;
+    type Future<'a>: Future<Output = Self::Output<'a>> + 'a;
+
+    fn finish<'a>(
+        req: FsResponse,
+        state: &mut NetFsState,
+        dir: &'a NetworkFsDir,
+    ) -> Self::Output<'a>;
+
+    fn make_future2<'a>(
+        fs: &'a NetworkFsDir,
+        req_id: usize,
+        send: Option<SendFut<'a, u32>>,
+    ) -> Self::Future<'a>;
+
+    fn make_future(fs: &NetworkFsDir, req: FsRequest) -> Self::Future<'_> {
+        let state = &mut *fs.state.lock();
+
+        let req_id = state.fs_reqs.insert(FsRequestState::Started {
+            dir_id: fs.dir_id,
             waker: None,
+            req,
         });
 
         assert!(req_id <= u32::MAX as usize);
 
-        OpenFuture {
-            fs: self,
+        Self::make_future2(
+            fs,
             req_id,
-            send: Some(self.senders.open_reqs.send_async(req_id as u32)),
-        }
+            Some(fs.senders.fs_reqs.send_async(req_id as u32)),
+        )
     }
 }
 
-use core::future::Future;
-use core::pin::Pin;
-use mfio::stdeq::Seekable;
-use mfio_rt::OpenOptions;
-use std::path::Path;
-
-pub struct OpenFuture<'a> {
-    fs: &'a NetworkFs,
-    //path: &'a Path,
-    //options: OpenOptions,
-    req_id: usize,
-    send: Option<SendFut<'a, u32>>,
+struct ReadDirStream {
+    queued_read: bool,
+    closed: bool,
+    results: VecDeque<Result<DirEntry>>,
+    waker: Option<Waker>,
+    resp_count: usize,
 }
 
-impl<'a> Future for OpenFuture<'a> {
-    type Output = Result<<NetworkFs as Fs>::FileHandle>;
+impl ReadDirStream {
+    fn compute_count(&self) -> u16 {
+        // Automatically scale the request count to have better performance on larger directories
+        core::cmp::min(128 * (self.resp_count + 1).ilog2(), u16::MAX as u32) as u16
+    }
+}
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        // SAFETY: we are not moving the contents of self, or self itself.
+pub struct ReadDir<'a> {
+    fs: &'a NetworkFsDir,
+    stream_id: u16,
+    send: Option<SendFut<'a, u16>>,
+    cache: VecDeque<Result<DirEntry>>,
+    closed: bool,
+}
+
+impl<'a> Stream for ReadDir<'a> {
+    type Item = Result<DirEntry>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         let this = unsafe { self.get_unchecked_mut() };
 
         loop {
-            if let Some(send) = &mut this.send {
-                let send = unsafe { Pin::new_unchecked(send) };
-                match send.poll(cx) {
-                    Poll::Ready(Ok(_)) => this.send = None,
-                    Poll::Ready(Err(_)) => {
-                        break Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+            if let Some(item) = this.cache.pop_front() {
+                break Poll::Ready(Some(item));
+            } else if !this.closed {
+                // If there's any read request pending to be sent, try to finish sending it.
+                if let Some(send) = this.send.as_mut() {
+                    let send = unsafe { Pin::new_unchecked(send) };
+
+                    if let Poll::Ready(res) = send.poll(cx) {
+                        this.send = None;
+                        if res.is_err() {
+                            this.closed = true;
+                        }
+                    } else {
+                        break Poll::Pending;
                     }
-                    Poll::Pending => break Poll::Pending,
+                }
+
+                let state = &mut *this.fs.state.lock();
+                if let Some(stream) = state.read_dir_streams.get_mut(this.stream_id as usize) {
+                    // TODO: have better read-ahead caching strategy.
+                    if !stream.results.is_empty() {
+                        core::mem::swap(&mut this.cache, &mut stream.results);
+                    }
+
+                    if stream.closed {
+                        state.read_dir_streams.remove(this.stream_id as usize);
+                    } else {
+                        stream.waker = Some(cx.waker().clone());
+                        if !stream.queued_read {
+                            stream.queued_read = true;
+                            this.send =
+                                Some(this.fs.senders.read_dir_reqs.send_async(this.stream_id));
+                        }
+                    }
+                } else {
+                    this.closed = true;
+                    break Poll::Ready(None);
                 }
             } else {
-                let state = &mut *this.fs.state.lock();
-
-                break match state
-                    .open_reqs
-                    .get_mut(this.req_id)
-                    .expect("Request was not found")
-                {
-                    FileOpenRequest::Complete { file_handle } => Poll::Ready(match *file_handle {
-                        Ok(file_id) => {
-                            // Remove the entry
-                            state.open_reqs.remove(this.req_id);
-
-                            let write_io =
-                                BaseArc::new(IoOpsHandle::new(file_id, this.fs.senders.clone()));
-                            let read_io =
-                                BaseArc::new(IoOpsHandle::new(file_id, this.fs.senders.clone()));
-
-                            let write_stream = BaseArc::from(PacketStream {
-                                ctx: PacketCtx::new(write_io).into(),
-                            });
-
-                            let read_stream = BaseArc::from(PacketStream {
-                                ctx: PacketCtx::new(read_io).into(),
-                            });
-
-                            Ok(FileWrapper(IoWrapper {
-                                file_id,
-                                senders: this.fs.senders.clone(),
-                                read_stream,
-                                write_stream,
-                            })
-                            .into())
-                        }
-                        Err(e) => Err(e),
-                    }),
-                    FileOpenRequest::Started { waker, .. } => {
-                        *waker = Some(cx.waker().clone());
-                        Poll::Pending
-                    }
-                    FileOpenRequest::Processing { waker } => {
-                        *waker = Some(cx.waker().clone());
-                        Poll::Pending
-                    }
-                };
+                break Poll::Ready(None);
             }
         }
     }
 }
+
+macro_rules! fs_op {
+    ($fut:ident, $op:ident, $block:expr => $rettype:ty) => {
+
+        pub struct $op;
+
+        impl FsRequestProc for $op {
+            type Output<'a> = $rettype;
+            type Future<'a> = $fut<'a>;
+
+            fn finish<'a>(
+                resp: FsResponse,
+                state: &mut NetFsState,
+                dir: &'a NetworkFsDir,
+            ) -> Self::Output<'a> {
+                #[allow(clippy::redundant_closure_call)]
+                ($block)(resp, state, dir)
+            }
+
+            fn make_future2<'a>(
+                fs: &'a NetworkFsDir,
+                req_id: usize,
+                send: Option<SendFut<'a, u32>>,
+            ) -> Self::Future<'a> {
+                $fut {
+                    fs,
+                    req_id,
+                    send,
+                }
+            }
+        }
+
+        pub struct $fut<'a> {
+            fs: &'a NetworkFsDir,
+            req_id: usize,
+            send: Option<SendFut<'a, u32>>,
+        }
+
+        impl<'a> Future for $fut<'a> {
+            type Output = $rettype;
+
+            fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+                // SAFETY: we are not moving the contents of self, or self itself.
+                let this = unsafe { self.get_unchecked_mut() };
+
+                loop {
+                    if let Some(send) = &mut this.send {
+                        let send = unsafe { Pin::new_unchecked(send) };
+                        match send.poll(cx) {
+                            Poll::Ready(Ok(_)) => this.send = None,
+                            Poll::Ready(Err(_)) => {
+                                break Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+                            }
+                            Poll::Pending => break Poll::Pending,
+                        }
+                    } else {
+                        let state = &mut *this.fs.state.lock();
+
+                        break match state
+                            .fs_reqs
+                            .get_mut(this.req_id)
+                            .expect("Request was not found")
+                        {
+                            FsRequestState::Complete { .. } => Poll::Ready({
+                                // Remove the entry
+                                let resp = state.fs_reqs.remove(this.req_id);
+
+                                let FsRequestState::Complete { resp } = resp else { unreachable!() };
+
+                                if let Some(resp) = resp {
+                                    $op::finish(resp, state, this.fs)
+                                } else {
+                                    Err(mferr!(Response, NotFound, Filesystem))
+                                }
+                            }),
+                            FsRequestState::Started { waker, .. } => {
+                                *waker = Some(cx.waker().clone());
+                                Poll::Pending
+                            }
+                            FsRequestState::Processing { waker } => {
+                                *waker = Some(cx.waker().clone());
+                                Poll::Pending
+                            }
+                        };
+                    }
+                }
+            }
+        }
+    };
+}
+
+fs_op!(
+    OpenFileFuture,
+    OpenFileOp,
+    |resp, _, dir: &NetworkFsDir| {
+        if let FsResponse::OpenFile { file_id } = resp {
+            file_id
+                .map(|file_id| {
+                    let write_io = BaseArc::new(IoOpsHandle::new(file_id, dir.senders.clone()));
+                    let read_io = BaseArc::new(IoOpsHandle::new(file_id, dir.senders.clone()));
+
+                    let write_stream = BaseArc::from(PacketStream {
+                        ctx: PacketCtx::new(write_io).into(),
+                    });
+
+                    let read_stream = BaseArc::from(PacketStream {
+                        ctx: PacketCtx::new(read_io).into(),
+                    });
+
+                    FileWrapper(IoWrapper {
+                        file_id,
+                        senders: dir.senders.clone(),
+                        read_stream,
+                        write_stream,
+                    })
+                    .into()
+                })
+                .map_err(Error::from_int_err)
+        } else {
+            Err(mferr!(Response, Invalid, Filesystem))
+        }
+    } => Result<Seekable<FileWrapper, u64>>
+);
+
+fs_op!(
+    PathFuture,
+    PathOp,
+    |resp, _, _| {
+        if let FsResponse::Path { path } = resp {
+            path.map(From::from).map_err(Error::from_int_err)
+        } else {
+            Err(mferr!(Response, Invalid, Filesystem))
+        }
+    } => Result<PathBuf>
+);
+
+fs_op!(
+    ReadDirFuture,
+    ReadDirOp,
+    |resp, _, dir| {
+        if let FsResponse::ReadDir { stream_id } = resp {
+            stream_id
+                .map(|stream_id| ReadDir {
+                    fs: dir,
+                    stream_id,
+                    cache: Default::default(),
+                    closed: false,
+                    send: None,
+                })
+                .map_err(Error::from_int_err)
+        } else {
+            Err(mferr!(Response, Invalid, Filesystem))
+        }
+    } => Result<ReadDir<'a>>
+);
+
+fs_op!(
+    OpenDirFuture,
+    OpenDirOp,
+    |resp, _, dir: &NetworkFsDir| {
+        if let FsResponse::OpenDir { dir_id } = resp {
+            dir_id
+                .map(|dir_id| NetworkFsDir {
+                    dir_id: dir_id.into(),
+                    senders: dir.senders.clone(),
+                    state: dir.state.clone(),
+                })
+                .map_err(Error::from_int_err)
+        } else {
+            Err(mferr!(Response, Invalid, Filesystem))
+        }
+    } => Result<NetworkFsDir>
+);
+
+fs_op!(
+    MetadataFuture,
+    MetadataOp,
+    |resp, _, _| {
+        if let FsResponse::Metadata { metadata } = resp {
+            metadata.map_err(Error::from_int_err)
+        } else {
+            Err(mferr!(Response, Invalid, Filesystem))
+        }
+    } => Result<Metadata>
+);
+
+fs_op!(
+    OpFuture,
+    OpOp,
+    |resp, _, _| {
+        if let FsResponse::DirOp(res) = resp {
+            if let Some(err) = res.map(Error::from_int_err) {
+                Err(err)
+            } else {
+                Ok(())
+            }
+        } else {
+            Err(mferr!(Response, Invalid, Filesystem))
+        }
+    } => Result<()>
+);
 
 struct IoOpsHandle<Perms: IntoOp> {
     handle: PacketIoHandle<'static, Perms, u64>,

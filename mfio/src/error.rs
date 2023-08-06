@@ -150,6 +150,28 @@ impl IntError for Error {
     }
 }
 
+/// Shorthand for building mfio error structure.
+///
+/// All enum variants act as if they are imported, therefore in this macro they are to be used
+/// without specifying the type.
+#[macro_export]
+macro_rules! mferr {
+    ($code:expr, $subject:ident, $state:ident, $location:ident) => {
+        $crate::error::Error {
+            code: {
+                const CODE: $crate::error::Code = $crate::error::Code::from_http_const($code);
+                CODE
+            },
+            subject: $crate::error::Subject::$subject,
+            state: $crate::error::State::$state,
+            location: $crate::error::Location::$location,
+        }
+    };
+    ($subject:ident, $state:ident, $location:ident) => {
+        $crate::mferr!(500, $subject, $state, $location)
+    };
+}
+
 macro_rules! ienum {
     (
         $(#[$meta:meta])*
@@ -221,6 +243,7 @@ ienum! {
         Address,
         Connection,
         Architecture,
+        Response,
         Abi,
         Api,
         Process,

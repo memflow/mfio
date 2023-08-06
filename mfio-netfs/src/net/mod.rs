@@ -6,8 +6,8 @@ pub use client::NetworkFs;
 use serde::{Deserialize, Serialize};
 
 use bytemuck::{Pod, Zeroable};
-use core::num::NonZeroI32;
-use mfio_rt::OpenOptions;
+use core::num::{NonZeroI32, NonZeroU16};
+use mfio_rt::{DirEntry, DirOp, Metadata, OpenOptions};
 
 unsafe impl Zeroable for Request {}
 unsafe impl Pod for Request {}
@@ -15,7 +15,7 @@ unsafe impl Zeroable for Response {}
 unsafe impl Pod for Response {}
 
 #[repr(u8, C)]
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum Request {
     Read {
         file_id: u32,
@@ -29,36 +29,78 @@ enum Request {
         pos: u64,
         len: usize,
     },
-    FileOpen {
-        req_id: u32,
-        options: OpenOptions,
-        path_len: u32,
-    },
     FileClose {
         file_id: u32,
     },
+    ReadDir {
+        // If OpenDir results in 16-bit value there is no reason to have 32-bits for read streams.
+        // If we end up bottlenecked, we will first be bottlenecked by OpenDir.
+        stream_id: u16,
+        count: u16,
+    },
+    Fs {
+        req_id: u32,
+        dir_id: u16,
+        req_len: u16,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+enum FsRequest {
+    Path,
+    ReadDir,
+    OpenDir { path: String },
+    OpenFile { path: String, options: OpenOptions },
+    Metadata { path: String },
+    DirOp(DirOp<String>),
 }
 
 #[repr(u8, C)]
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum Response {
     Read {
+        err: Option<NonZeroI32>,
         packet_id: u32,
         idx: usize,
         len: usize,
-        err: Option<NonZeroI32>,
     },
     Write {
+        err: Option<NonZeroI32>,
         packet_id: u32,
         idx: usize,
         len: usize,
-        err: Option<NonZeroI32>,
     },
-    FileOpen {
+    ReadDir {
+        stream_id: u16,
+        // Highest bit being set means the stream is closing.
+        len: u32,
+    },
+    Fs {
         req_id: u32,
-        err: Option<NonZeroI32>,
-        file_id: u32,
+        resp_len: u16,
     },
+}
+
+type ReadDirResponse = Result<DirEntry, NonZeroI32>;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+enum FsResponse {
+    Path {
+        path: Result<String, NonZeroI32>,
+    },
+    ReadDir {
+        stream_id: Result<u16, NonZeroI32>,
+    },
+    OpenDir {
+        dir_id: Result<NonZeroU16, NonZeroI32>,
+    },
+    OpenFile {
+        file_id: Result<u32, NonZeroI32>,
+    },
+    Metadata {
+        metadata: Result<Metadata, NonZeroI32>,
+    },
+    DirOp(Option<NonZeroI32>),
 }
 
 use core::pin::Pin;

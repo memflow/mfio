@@ -29,13 +29,14 @@ cglue = { version = "0.2", git = "https://github.com/h33p/cglue", features = ["t
 flume = "0.10"
 log = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
-async-rwlock = "1"
+async-mutex = "1"
 serde = { version = "1", features = ["derive"] }
 parking_lot = "0.12"
 futures = "0.3.28"
 futures-io = "0.3"
 slab = "0.4"
 tracing = "0.1"
+postcard = { version = "1", features = ["alloc"] }
 
 clap = { version = "4", features = ["cargo", "derive"], optional = true }
 anyhow = { version = "1", optional = true }
