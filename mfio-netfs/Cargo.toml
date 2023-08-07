@@ -37,6 +37,7 @@ futures-io = "0.3"
 slab = "0.4"
 tracing = "0.1"
 postcard = { version = "1", features = ["alloc"] }
+debug-ignore = "1"
 
 clap = { version = "4", features = ["cargo", "derive"], optional = true }
 anyhow = { version = "1", optional = true }
@@ -45,6 +46,7 @@ env_logger = { version = "0.10", optional = true }
 tokio = { version = "1.24", features = ["rt", "net", "macros"], optional = true }
 
 [dev-dependencies]
+mfio-rt = { version = "0.1", path = "../mfio-rt", features = ["test_suite"] }
 env_logger = "0.10"
 criterion = { version = "0.5", git = "https://github.com/h33p/criterion.rs", branch = "tput2", features = ["async_tokio", "async_smol", "async_futures"] }
 rand = "0.8"

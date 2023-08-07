@@ -1491,10 +1491,19 @@ impl<'a, T: PacketPerms> ReboundPacket<'a, T> {
         let mut o = self.ranges.overlapping(&range);
         let o = o.next().unwrap();
         assert!(o.contains(&start));
-        assert!(o.contains(&(start + len)));
+        assert!(o.contains(&(start + len.saturating_sub(1))));
         self.ranges.remove(range);
+
         // SAFETY: we verified uniqueness of the range.
         let pkt = unsafe { self.orig.extract_packet(start, len) };
+
+        // We just extracted the last packet from the range, we are not going to do it again, as
+        // per the API contract, we must forget this packet right now.
+        if self.ranges.is_empty() {
+            let orig = unsafe { ManuallyDrop::take(&mut self.orig) };
+            unsafe { orig.forget() };
+        }
+
         if let Some(err) = err {
             pkt.error(err)
         }
@@ -1517,8 +1526,6 @@ impl<'a, T: PacketPerms> From<BoundPacket<'a, T>> for ReboundPacket<'a, T> {
 
 impl<'a, T: PacketPerms> Drop for ReboundPacket<'a, T> {
     fn drop(&mut self) {
-        let orig = unsafe { ManuallyDrop::take(&mut self.orig) };
-
         if *self.unbound.get_mut() {
             let mut prev = None;
 
@@ -1526,9 +1533,14 @@ impl<'a, T: PacketPerms> Drop for ReboundPacket<'a, T> {
                 prev = Some(unsafe { self.orig.extract_packet(range.start, range.len()) });
             }
 
-            unsafe { orig.forget() };
+            // Only forget if we haven't been taken before
+            if prev.is_some() {
+                unsafe { ManuallyDrop::take(&mut self.orig).forget() };
+            }
 
             core::mem::drop(prev);
+        } else {
+            unsafe { ManuallyDrop::drop(&mut self.orig) };
         }
     }
 }

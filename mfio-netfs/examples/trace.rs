@@ -143,7 +143,7 @@ fn bench(mut iters: usize, size: usize, order: &[usize], path: &Path) -> (Durati
 
     drop_cache(path).unwrap();
 
-    let server = mfio_netfs::single_client_server(addr);
+    let (server, addr) = mfio_netfs::single_client_server(addr);
     let fs = mfio_netfs::NetworkFs::try_new(addr).unwrap();
 
     let elapsed = fs.block_on(async {

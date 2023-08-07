@@ -2,7 +2,7 @@ use crate::packet::*;
 
 use crate::backend::IoBackend;
 use crate::error::Error;
-use crate::util::PosShift;
+use crate::util::{CopyPos, UsizeMath};
 use bytemuck::Pod;
 use cglue::prelude::v1::*;
 use core::future::Future;
@@ -170,7 +170,9 @@ pub enum ReadToEndFutState<'a, Io: PacketIo<Write, Param>, Param: 'a> {
     Finished,
 }
 
-impl<'a, Io: PacketIo<Write, Param>, Param: PosShift<Io>> Future for ReadToEndFut<'a, Io, Param> {
+impl<'a, Io: PacketIo<Write, Param>, Param: CopyPos + UsizeMath> Future
+    for ReadToEndFut<'a, Io, Param>
+{
     type Output = Option<usize>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {

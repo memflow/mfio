@@ -28,6 +28,8 @@ tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 flume = "0.10"
 oneshot = "0.1"
+tempdir = { version = "0.3", optional = true }
+pathdiff = { version = "0.2", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 mio = { version = "0.8", optional = true, features = ["os-poll", "os-ext", "net"] }
@@ -46,6 +48,8 @@ flume = "0.10"
 smol = "1"
 env_logger = "0.10"
 tracing-tracy = { version = "0.10", features = ["fibers", "only-localhost"] }
+tempdir = "0.3"
+pathdiff = "0.2"
 
 [target.'cfg(not(miri))'.dependencies]
 tokio = { version = "1.24", features = ["rt", "rt-multi-thread", "fs", "io-util"] }
@@ -61,4 +65,5 @@ glommio = { version = "0.8", git = "https://github.com/DataDog/glommio", rev = "
 [features]
 default = ["mio", "io-uring", "native"]
 native = []
+test_suite = ["tempdir", "pathdiff"]
 __bench = ["mfio/tokio", "mfio/async-io"]

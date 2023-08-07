@@ -94,18 +94,23 @@ impl UsizeMath for NoPos {
     }
 }
 
-// This trait unifies implementations on NoPos (streams) with seekable I/O
-pub(crate) trait PosShift<Io>: Sized + UsizeMath {
+pub(crate) trait CopyPos: Sized {
     fn copy_pos(&self) -> Self;
+}
+
+// This trait unifies implementations on NoPos (streams) with seekable I/O
+pub(crate) trait PosShift<Io>: CopyPos + UsizeMath {
     fn add_pos(&mut self, out: usize, io: &Io);
     fn add_io_pos(io: &Io, out: usize);
 }
 
-impl<Param: Copy + UsizeMath, Io: crate::stdeq::StreamPos<Param>> PosShift<Io> for Param {
+impl<Param: Copy> CopyPos for Param {
     fn copy_pos(&self) -> Self {
         *self
     }
+}
 
+impl<Param: Copy + UsizeMath, Io: crate::stdeq::StreamPos<Param>> PosShift<Io> for Param {
     fn add_pos(&mut self, out: usize, io: &Io) {
         self.add_assign(out);
         io.set_pos(*self);
@@ -116,11 +121,13 @@ impl<Param: Copy + UsizeMath, Io: crate::stdeq::StreamPos<Param>> PosShift<Io> f
     }
 }
 
-impl<Io> PosShift<Io> for NoPos {
+impl CopyPos for NoPos {
     fn copy_pos(&self) -> Self {
         Self::new()
     }
+}
 
+impl<Io> PosShift<Io> for NoPos {
     fn add_pos(&mut self, _: usize, _: &Io) {}
     fn add_io_pos(_: &Io, _: usize) {}
 }

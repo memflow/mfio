@@ -3,6 +3,7 @@ use core::num::NonZeroU16;
 use core::pin::Pin;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::path::Path;
 
 use super::{FsRequest, FsResponse, HeaderRouter, Request, Response};
 
@@ -16,12 +17,13 @@ use mfio::stdeq::Seekable;
 use mfio::tarc::BaseArc;
 use mfio_rt::{
     native::{NativeRtDir, ReadDir},
-    DirHandle, Fs, NativeFile, NativeRt,
+    DirHandle, Fs, NativeFile, NativeRt, TcpListenerHandle,
 };
 use parking_lot::Mutex;
 use slab::Slab;
 use tracing::instrument::Instrument;
 
+use debug_ignore::DebugIgnore;
 use futures::{
     future::FutureExt,
     pin_mut,
@@ -31,7 +33,6 @@ use mfio_rt::{
     native::{NativeTcpListener, NativeTcpStream},
     Tcp,
 };
-use std::path::Path;
 
 #[derive(Debug)]
 enum Operation {
@@ -45,7 +46,7 @@ enum Operation {
         file_id: u32,
         packet_id: u32,
         pos: u64,
-        buf: Vec<u8>,
+        buf: DebugIgnore<Vec<u8>>,
     },
     FileClose {
         file_id: u32,
@@ -169,7 +170,7 @@ async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
                             file_id,
                             packet_id,
                             pos,
-                            buf,
+                            buf: buf.into(),
                         }
                     }
                     Request::Fs {
@@ -194,8 +195,6 @@ async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
                     }
                     Request::FileClose { file_id } => Operation::FileClose { file_id },
                 };
-
-                trace!("Parsed op: {op:?}");
 
                 op
             }
@@ -350,7 +349,7 @@ async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
                                     count,
                                 );
                                 async {
-                                    if let Some(stream) =
+                                    let rm_stream = if let Some(stream) =
                                         read_dir_streams.borrow().get(stream_id as usize)
                                     {
                                         let stream_buf = &mut *stream.lock().await;
@@ -374,7 +373,7 @@ async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
 
                                         let mut len = buf.len() as u32;
 
-                                        // SAFETY: we already ensure the stream is pinned at the
+                                        // SAFETY: we already ensure the stream is pinned at its
                                         // storage level.
                                         let stream = unsafe { Pin::new_unchecked(stream_buf) };
 
@@ -387,11 +386,18 @@ async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
                                             |_| Response::ReadDir { stream_id, len },
                                             buf.into_boxed_slice(),
                                         );
+
+                                        stream.is_terminated()
                                     } else {
                                         router.send_hdr(write_id, |_| Response::ReadDir {
                                             stream_id,
                                             len: 0,
                                         });
+                                        false
+                                    };
+
+                                    if rm_stream {
+                                        read_dir_streams.borrow_mut().remove(stream_id as usize);
                                     }
                                 }
                                 .instrument(read_dir_span)
@@ -547,6 +553,8 @@ async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
                 Err(_) => {}
             }
         }
+
+        log::trace!("Process loop done");
     }
     .instrument(tracing::span!(tracing::Level::TRACE, "server process_loop"));
 
@@ -562,7 +570,7 @@ async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
     futures::select!(_ = l1 => (), _ = l2 => ());
 }
 
-pub fn single_client_server(addr: SocketAddr) -> std::thread::JoinHandle<()> {
+pub fn single_client_server(addr: SocketAddr) -> (std::thread::JoinHandle<()>, SocketAddr) {
     let (tx, rx) = flume::bounded(1);
 
     let ret = std::thread::spawn(move || {
@@ -570,15 +578,15 @@ pub fn single_client_server(addr: SocketAddr) -> std::thread::JoinHandle<()> {
 
         fs.block_on(async {
             let mut listener = fs.bind(addr).await.unwrap();
-            let _ = tx.send_async(()).await;
+            let _ = tx.send_async(listener.local_addr().unwrap()).await;
             let (stream, _) = listener.next().await.unwrap();
             run_server(stream, &fs).await
         })
     });
 
-    let _ = rx.recv();
+    let addr = rx.recv().unwrap();
 
-    ret
+    (ret, addr)
 }
 
 pub async fn server_bind(fs: &NativeRt, bind_addr: SocketAddr) {
@@ -625,10 +633,10 @@ mod tests {
 
     #[test]
     fn fs_test() {
-        env_logger::init();
+        let _ = ::env_logger::builder().is_test(true).try_init();
         let addr: SocketAddr = "127.0.0.1:54321".parse().unwrap();
 
-        let server = single_client_server(addr);
+        let (server, addr) = single_client_server(addr);
 
         let fs = mfio_rt::NativeRt::default();
         let fs = NetworkFs::with_fs(addr, fs.into()).unwrap();
@@ -652,4 +660,31 @@ mod tests {
 
         server.join().unwrap();
     }
+
+    mfio_rt::test_suite!(tests, |closure| {
+        let _ = ::env_logger::builder().is_test(true).try_init();
+        use super::{single_client_server, NetworkFs, SocketAddr};
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (server, addr) = single_client_server(addr);
+
+        let rt = mfio_rt::NativeRt::default();
+        let mut rt = NetworkFs::with_fs(addr, rt.into()).unwrap();
+
+        let fs = staticify(&mut rt);
+
+        pub fn run<'a, Func: FnOnce(&'a NetworkFs) -> F, F: Future>(
+            fs: &'a mut NetworkFs,
+            func: Func,
+        ) -> F::Output {
+            fs.block_on(func(fs))
+        }
+
+        run(fs, closure);
+
+        core::mem::drop(rt);
+
+        log::trace!("Joining thread");
+
+        server.join().unwrap();
+    });
 }

@@ -17,6 +17,9 @@ mod util;
 #[doc(hidden)]
 pub mod __doctest;
 
+#[cfg(any(feature = "test_suite", test))]
+pub mod test_suite;
+
 #[cfg(feature = "native")]
 pub use native::{NativeFile, NativeRt, NativeRtBuilder};
 

@@ -200,7 +200,7 @@ fn file_read(c: &mut Criterion) {
 
                 //println!("Create thing");
 
-                let server = mfio_netfs::single_client_server(addr);
+                let (server, addr) = mfio_netfs::single_client_server(addr);
                 let fs = mfio_netfs::NetworkFs::try_new(addr).unwrap();
 
                 let elapsed = fs.block_on(mfio_bench(&fs, size, iters, order, temp_path));

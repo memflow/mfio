@@ -173,7 +173,7 @@ enum FsRequestState {
 struct NetFsState {
     in_flight_ops: Slab<InFlightOpType>,
     fs_reqs: Slab<FsRequestState>,
-    read_dir_streams: Slab<ReadDirStream>,
+    read_dir_streams: BTreeMap<u16, ReadDirStream>,
 }
 
 struct Senders {
@@ -258,8 +258,7 @@ impl NetworkFs {
                             }
                         };
 
-                        debug!("Response: {resp:?}");
-                        //let resp = bincode::deserialize_from(&mut state.stream).unwrap();
+                        trace!("Response: {resp:?}");
 
                         match resp {
                             Response::Read {
@@ -308,7 +307,7 @@ impl NetworkFs {
                                             Err(v) => {
                                                 // TODO: limit allocation size
                                                 if tmp_buf.capacity() < v.len() {
-                                                    tmp_buf.reserve(v.len() - tmp_buf.capacity());
+                                                    tmp_buf.reserve(v.len() - tmp_buf.len());
                                                 }
                                                 // SAFETY: the data here is unininitialized
                                                 unsafe { tmp_buf.set_len(v.len()) };
@@ -374,7 +373,7 @@ impl NetworkFs {
                                     // TODO: make a wrapper for this...
                                     let resp_len = resp_len as usize;
                                     if tmp_buf.capacity() < resp_len {
-                                        tmp_buf.reserve(resp_len - tmp_buf.capacity());
+                                        tmp_buf.reserve(resp_len - tmp_buf.len());
                                     }
                                     // SAFETY: the data here is unininitialized
                                     unsafe { tmp_buf.set_len(resp_len) };
@@ -389,7 +388,7 @@ impl NetworkFs {
 
                                     let resp: Option<FsResponse> = postcard::from_bytes(buf).ok();
 
-                                    log::trace!("Fs Response: {resp:?}");
+                                    log::trace!("Fs Response {req_id}: {resp:?}");
 
                                     let mut state = state.lock();
                                     if let Some(req) = state.fs_reqs.get_mut(req_id as usize) {
@@ -398,10 +397,8 @@ impl NetworkFs {
                                             let waker = waker.take();
 
                                             *req = FsRequestState::Complete { resp };
-                                            log::trace!("Move to fin");
 
                                             if let Some(waker) = waker {
-                                                log::trace!("Wake");
                                                 waker.wake();
                                             }
                                         }
@@ -420,10 +417,11 @@ impl NetworkFs {
                                 async {
                                     let closed = (len & (1 << 31)) != 0;
                                     let len = len & !(1 << 31);
+                                    log::trace!("ReadDir resp: {closed} {len}");
                                     // TODO: make a wrapper for this...
                                     let len = len as usize;
                                     if tmp_buf.capacity() < len {
-                                        tmp_buf.reserve(len - tmp_buf.capacity());
+                                        tmp_buf.reserve(len - tmp_buf.len());
                                     }
                                     // SAFETY: the data here is unininitialized
                                     unsafe { tmp_buf.set_len(len) };
@@ -436,13 +434,15 @@ impl NetworkFs {
                                     let resp: Vec<ReadDirResponse> =
                                         postcard::from_bytes(buf).unwrap();
 
+                                    log::trace!("Resulting: {}", resp.len());
+
                                     let mut state = state.lock();
-                                    if let Some(stream) =
-                                        state.read_dir_streams.get_mut(stream_id as usize)
+                                    if let Some(stream) = state.read_dir_streams.get_mut(&stream_id)
                                     {
                                         let waker = stream.waker.take();
 
-                                        if closed || buf.is_empty() {
+                                        if closed || resp.is_empty() {
+                                            log::trace!("Closing {closed}");
                                             stream.closed = true;
                                         }
 
@@ -485,10 +485,11 @@ impl NetworkFs {
 
                 let read_dir_loop = async {
                     while let Ok(stream_id) = read_dir_reqs_rx.recv_async().await {
+                        log::trace!("Read dir {stream_id}");
                         async {
                             let mut state = state.lock();
 
-                            if let Some(req) = state.read_dir_streams.get_mut(stream_id as usize) {
+                            if let Some(req) = state.read_dir_streams.get_mut(&stream_id) {
                                 if !req.closed {
                                     let count = req.compute_count();
                                     core::mem::drop(state);
@@ -502,7 +503,7 @@ impl NetworkFs {
                         .instrument(tracing::span!(
                             tracing::Level::TRACE,
                             "read dir more",
-                            stream_id
+                            stream_id,
                         ))
                         .await;
                     }
@@ -518,6 +519,7 @@ impl NetworkFs {
 
                                 if let Some(fs_req) = state.fs_reqs.get_mut(req_id as usize) {
                                     if let FsRequestState::Started { req, dir_id, waker } = fs_req {
+                                        log::trace!("Request: {req:?}");
                                         let buf = postcard::to_allocvec(&req).unwrap();
                                         // TODO: verify buflen
                                         let ret = Some((
@@ -753,7 +755,7 @@ struct ReadDirStream {
 impl ReadDirStream {
     fn compute_count(&self) -> u16 {
         // Automatically scale the request count to have better performance on larger directories
-        core::cmp::min(128 * (self.resp_count + 1).ilog2(), u16::MAX as u32) as u16
+        core::cmp::min(128 * ((self.resp_count + 1).ilog2() + 1), u16::MAX as u32) as u16
     }
 }
 
@@ -790,21 +792,24 @@ impl<'a> Stream for ReadDir<'a> {
                 }
 
                 let state = &mut *this.fs.state.lock();
-                if let Some(stream) = state.read_dir_streams.get_mut(this.stream_id as usize) {
+                if let Some(stream) = state.read_dir_streams.get_mut(&this.stream_id) {
                     // TODO: have better read-ahead caching strategy.
                     if !stream.results.is_empty() {
                         core::mem::swap(&mut this.cache, &mut stream.results);
                     }
 
                     if stream.closed {
-                        state.read_dir_streams.remove(this.stream_id as usize);
-                    } else {
+                        state.read_dir_streams.remove(&this.stream_id);
+                    } else if !stream.queued_read {
                         stream.waker = Some(cx.waker().clone());
                         if !stream.queued_read {
                             stream.queued_read = true;
                             this.send =
                                 Some(this.fs.senders.read_dir_reqs.send_async(this.stream_id));
                         }
+                    } else {
+                        stream.waker = Some(cx.waker().clone());
+                        break Poll::Pending;
                     }
                 } else {
                     this.closed = true;
@@ -955,15 +960,24 @@ fs_op!(
 fs_op!(
     ReadDirFuture,
     ReadDirOp,
-    |resp, _, dir| {
+    |resp, state: &mut NetFsState, dir| {
         if let FsResponse::ReadDir { stream_id } = resp {
             stream_id
-                .map(|stream_id| ReadDir {
-                    fs: dir,
-                    stream_id,
-                    cache: Default::default(),
-                    closed: false,
-                    send: None,
+                .map(|stream_id| {
+                    state.read_dir_streams.insert(stream_id, ReadDirStream {
+                        queued_read: false,
+                        closed: false,
+                        results: Default::default(),
+                        waker: None,
+                        resp_count: 0,
+                    });
+                    ReadDir {
+                        fs: dir,
+                        stream_id,
+                        cache: Default::default(),
+                        closed: false,
+                        send: None,
+                    }
                 })
                 .map_err(Error::from_int_err)
         } else {
