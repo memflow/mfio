@@ -1,6 +1,7 @@
+use super::deferred::DeferredPackets;
 use core::ops::Range;
 use mfio::error::*;
-use mfio::packet::*;
+use mfio::io::*;
 use nix::libc;
 use nix::sys::socket::*;
 use std::alloc::{alloc, dealloc, Layout};
@@ -215,10 +216,10 @@ impl Default for CircularBuf {
 }
 
 enum WriteOp {
-    Alloced(<Read as PacketPerms>::Alloced<'static>),
+    Alloced(<Read as PacketPerms>::Alloced),
     Unalloced {
-        transferred: VecDeque<TransferredPacket<'static, Read>>,
-        queued: Option<BoundPacket<'static, Read>>,
+        transferred: VecDeque<TransferredPacket<Read>>,
+        queued: Option<BoundPacketView<Read>>,
     },
 }
 
@@ -226,11 +227,11 @@ enum WriteOp {
 pub struct StreamBuf {
     read_buf: CircularBuf,
     read_cached: usize,
-    read_ops1: VecDeque<MaybeAlloced<'static, Write>>,
-    read_ops2: VecDeque<MaybeAlloced<'static, Write>>,
+    read_ops1: VecDeque<MaybeAlloced<Write>>,
+    read_ops2: VecDeque<MaybeAlloced<Write>>,
     read_queue: Vec<IoSliceMut<'static>>,
     write_ops: VecDeque<WriteOp>,
-    write_ops_cache: Vec<VecDeque<TransferredPacket<'static, Read>>>,
+    write_ops_cache: Vec<VecDeque<TransferredPacket<Read>>>,
     write_buf: CircularBuf,
     write_queue: Vec<IoSlice<'static>>,
     eof_read: bool,
@@ -238,15 +239,26 @@ pub struct StreamBuf {
 }
 
 impl StreamBuf {
-    pub fn queue_read(&mut self, mut packet: BoundPacket<'static, Write>) {
+    pub fn queue_read(
+        &mut self,
+        mut packet: BoundPacketView<Write>,
+        mut deferred_pkts: Option<&mut DeferredPackets>,
+    ) {
         // Ignore 0 byte requests. Letting such request in leads to livelock
         if packet.is_empty() {
+            if let Some(v) = deferred_pkts {
+                v.ok(packet)
+            }
             return;
         }
 
         if self.eof_read {
             log::trace!("Reached eof read");
-            packet.error(EOF);
+            if let Some(d) = deferred_pkts {
+                d.error(packet, EOF);
+            } else {
+                packet.error(EOF);
+            }
             return;
         }
 
@@ -256,16 +268,22 @@ impl StreamBuf {
             let spare = self.read_buf.bufs().0;
             let spare_len = core::cmp::min(spare.len(), self.read_cached);
 
-            if spare_len < packet.len() {
-                let (a, b) = packet.split_at(spare_len);
+            if (spare_len as u64) < packet.len() {
+                let (a, b) = packet.split_at(spare_len as u64);
                 let transferred = unsafe { a.transfer_data(spare.as_mut_ptr().cast()) };
-                self.read_buf.release(transferred.len());
-                self.read_cached -= transferred.len();
+                self.read_buf.release(transferred.len() as usize);
+                self.read_cached -= transferred.len() as usize;
+                if let Some(v) = deferred_pkts.as_mut() {
+                    v.ok(transferred)
+                }
                 packet = b;
             } else {
                 let transferred = unsafe { packet.transfer_data(spare.as_mut_ptr().cast()) };
-                self.read_buf.release(transferred.len());
-                self.read_cached -= transferred.len();
+                self.read_buf.release(transferred.len() as usize);
+                self.read_cached -= transferred.len() as usize;
+                if let Some(v) = deferred_pkts.as_mut() {
+                    v.ok(transferred)
+                }
                 log::trace!("Cached read done :)");
                 return;
             }
@@ -282,14 +300,25 @@ impl StreamBuf {
         self.write_ops.len()
     }
 
-    pub fn queue_write(&mut self, packet: BoundPacket<'static, Read>) {
+    pub fn queue_write(
+        &mut self,
+        packet: BoundPacketView<Read>,
+        deferred_pkts: Option<&mut DeferredPackets>,
+    ) {
         if packet.is_empty() {
+            if let Some(v) = deferred_pkts {
+                v.ok(packet)
+            }
             return;
         }
 
         if self.eof_write {
             log::trace!("Reached eof write");
-            packet.error(EOF);
+            if let Some(d) = deferred_pkts {
+                d.error(packet, EOF);
+            } else {
+                packet.error(EOF);
+            }
             return;
         }
 
@@ -307,41 +336,60 @@ impl StreamBuf {
         }
     }
 
-    pub fn on_read(&mut self, res: std::io::Result<usize>) {
+    pub fn on_read(
+        &mut self,
+        res: std::io::Result<usize>,
+        mut deferred_pkts: Option<&mut DeferredPackets>,
+    ) {
         match res {
             Ok(0) => {
                 log::trace!("Read EOF");
                 self.eof_read = true;
 
                 for v in self.read_ops2.drain(..) {
-                    v.error(EOF);
+                    if let Some(ref mut d) = deferred_pkts {
+                        d.error(v, EOF);
+                    } else {
+                        v.error(EOF);
+                    }
                 }
 
                 for v in self.read_ops1.drain(..) {
-                    v.error(EOF);
+                    if let Some(ref mut d) = deferred_pkts {
+                        d.error(v, EOF);
+                    } else {
+                        v.error(EOF);
+                    }
                 }
             }
             Ok(mut len) => {
                 log::trace!("Read {len:x}");
                 while len > 0 {
                     if let Some(packet) = self.read_ops2.pop_front() {
-                        let packet = if len >= packet.len() {
+                        let packet = if len as u64 >= packet.len() {
                             packet
                         } else {
-                            let (a, b) = packet.split_at(len);
+                            let (a, b) = packet.split_at(len as u64);
                             self.read_ops2.push_front(b);
                             a
                         };
 
-                        len -= packet.len();
+                        len -= packet.len() as usize;
 
                         match packet {
-                            Ok(_) => (),
+                            Ok(v) => {
+                                if let Some(d) = deferred_pkts.as_mut() {
+                                    d.ok(v)
+                                }
+                            }
                             Err(v) => {
                                 let buf = self.read_buf.bufs().0;
-                                assert!(buf.len() >= v.len());
+                                assert!(buf.len() as u64 >= v.len());
                                 let transferred = unsafe { v.transfer_data(buf.as_ptr().cast()) };
-                                self.read_buf.release(transferred.len());
+                                self.read_buf.release(transferred.len() as usize);
+                                if let Some(d) = deferred_pkts.as_mut() {
+                                    d.ok(transferred)
+                                }
                             }
                         }
                     } else {
@@ -355,33 +403,59 @@ impl StreamBuf {
                 let e = Error::from(e);
                 // TODO: decide on whether we want to fail just one request, or all of them
                 while let Some(packet) = self.read_ops2.pop_front() {
-                    packet.error(e);
+                    if let Some(ref mut d) = deferred_pkts {
+                        d.error(packet, e);
+                    } else {
+                        packet.error(e);
+                    }
                 }
 
                 while let Some(packet) = self.read_ops1.pop_front() {
-                    packet.error(e);
+                    if let Some(ref mut d) = deferred_pkts {
+                        d.error(packet, e);
+                    } else {
+                        packet.error(e);
+                    }
                 }
             }
         }
     }
 
-    pub fn on_write(&mut self, res: std::io::Result<usize>) {
+    pub fn on_write(
+        &mut self,
+        res: std::io::Result<usize>,
+        mut deferred_pkts: Option<&mut DeferredPackets>,
+    ) {
         match res {
             Ok(0) => {
                 self.eof_write = true;
                 for v in self.write_ops.drain(..) {
                     match v {
-                        WriteOp::Alloced(v) => v.error(EOF),
+                        WriteOp::Alloced(v) => {
+                            if let Some(ref mut d) = deferred_pkts {
+                                d.error(v, EOF);
+                            } else {
+                                v.error(EOF);
+                            }
+                        }
                         WriteOp::Unalloced {
                             mut transferred,
                             queued,
                         } => {
                             for v in transferred.drain(..) {
-                                v.error(EOF);
+                                if let Some(ref mut d) = deferred_pkts {
+                                    d.error(v, EOF);
+                                } else {
+                                    v.error(EOF);
+                                }
                             }
                             self.write_ops_cache.push(transferred);
                             if let Some(v) = queued {
-                                v.error(EOF);
+                                if let Some(ref mut d) = deferred_pkts {
+                                    d.error(v, EOF);
+                                } else {
+                                    v.error(EOF);
+                                }
                             }
                         }
                     }
@@ -395,11 +469,14 @@ impl StreamBuf {
                         .expect("written more than total length of ops!")
                     {
                         WriteOp::Alloced(pkt) => {
-                            let pkt_read = core::cmp::min(pkt.len(), len);
-                            len -= pkt_read;
+                            let pkt_read = core::cmp::min(pkt.len(), len as u64);
+                            len -= pkt_read as usize;
 
                             if pkt_read < pkt.len() {
-                                let (_, b) = pkt.split_at(pkt_read);
+                                let (p, b) = pkt.split_at(pkt_read);
+                                if let Some(v) = deferred_pkts.as_mut() {
+                                    v.ok(p)
+                                }
                                 self.write_ops.push_front(WriteOp::Alloced(b));
                                 break;
                             }
@@ -409,12 +486,15 @@ impl StreamBuf {
                             queued,
                         } => {
                             while let Some(pkt) = transferred.pop_front() {
-                                let pkt_read = core::cmp::min(pkt.len(), len);
-                                len -= pkt_read;
-                                self.write_buf.release(pkt_read);
+                                let pkt_read = core::cmp::min(pkt.len(), len as u64);
+                                len -= pkt_read as usize;
+                                self.write_buf.release(pkt_read as usize);
 
                                 if pkt_read < pkt.len() {
-                                    let (_, b) = pkt.split_at(pkt_read);
+                                    let (p, b) = pkt.split_at(pkt_read);
+                                    if let Some(v) = deferred_pkts.as_mut() {
+                                        v.ok(p)
+                                    }
                                     transferred.push_front(b);
                                     break;
                                 }
@@ -442,20 +522,34 @@ impl StreamBuf {
                 // TODO: decide on whether we want to fail just one request, or all of them
                 while let Some(packet) = self.write_ops.pop_front() {
                     match packet {
-                        WriteOp::Alloced(v) => v.error(e),
+                        WriteOp::Alloced(v) => {
+                            if let Some(ref mut d) = deferred_pkts {
+                                d.error(v, e);
+                            } else {
+                                v.error(e);
+                            }
+                        }
                         WriteOp::Unalloced {
                             mut transferred,
                             queued,
                         } => {
                             while let Some(pkt) = transferred.pop_front() {
-                                self.write_buf.release(pkt.len());
-                                pkt.error(e);
+                                self.write_buf.release(pkt.len() as usize);
+                                if let Some(ref mut d) = deferred_pkts {
+                                    d.error(pkt, e);
+                                } else {
+                                    pkt.error(e);
+                                }
                             }
 
                             self.write_ops_cache.push(transferred);
 
                             if let Some(pkt) = queued {
-                                pkt.error(e);
+                                if let Some(ref mut d) = deferred_pkts {
+                                    d.error(pkt, e);
+                                } else {
+                                    pkt.error(e);
+                                }
                             }
                         }
                     }
@@ -484,13 +578,13 @@ impl StreamBuf {
                     if spare.is_empty() {
                         self.read_ops1.push_front(Err(pkt));
                         break;
-                    } else if spare_len < pkt.len() {
-                        let (a, b) = pkt.split_at(spare_len);
+                    } else if (spare_len as u64) < pkt.len() {
+                        let (a, b) = pkt.split_at(spare_len as u64);
                         self.read_buf.reserve(spare_len);
                         self.read_ops2.push_back(Err(a));
                         pkt = b;
                     } else {
-                        self.read_buf.reserve(pkt.len());
+                        self.read_buf.reserve(pkt.len() as usize);
                         self.read_ops2.push_back(Err(pkt));
                         break;
                     }
@@ -507,12 +601,12 @@ impl StreamBuf {
                     unsafe {
                         let ptr = pkt.as_mut_ptr();
                         let len = pkt.len();
-                        core::slice::from_raw_parts_mut(ptr as *mut u8, len)
+                        core::slice::from_raw_parts_mut(ptr as *mut u8, len as usize)
                     }
                 }
                 Err(pkt) => {
-                    let range = (cur_head)..(cur_head + pkt.len());
-                    cur_head = (cur_head + pkt.len()) % self.read_buf.capacity();
+                    let range = (cur_head)..(cur_head + pkt.len() as usize);
+                    cur_head = (cur_head + pkt.len() as usize) % self.read_buf.capacity();
                     // SAFETY: we are grabbing exclusive access to the range
                     unsafe { &mut *self.read_buf.buffer_range(range) }
                 }
@@ -559,8 +653,8 @@ impl StreamBuf {
                         if spare.is_empty() {
                             *queued = Some(pkt);
                             break;
-                        } else if spare_len < pkt.len() {
-                            let (a, b) = pkt.split_at(spare_len);
+                        } else if (spare_len as u64) < pkt.len() {
+                            let (a, b) = pkt.split_at(spare_len as u64);
                             let pkt = unsafe { a.transfer_data(spare.as_mut_ptr().cast()) };
                             self.write_buf.reserve(spare_len);
                             transferred.push_back(pkt);
@@ -573,8 +667,8 @@ impl StreamBuf {
                     }
 
                     for pkt in transferred {
-                        let range = (cur_head)..(cur_head + pkt.len());
-                        cur_head = (cur_head + pkt.len()) % self.write_buf.capacity();
+                        let range = (cur_head)..(cur_head + pkt.len() as usize);
+                        cur_head = (cur_head + pkt.len() as usize) % self.write_buf.capacity();
                         // SAFETY: we are grabbing exclusive access to the range
                         let buf = unsafe { &*self.write_buf.buffer_range(range) };
                         queue.push(IoSlice::new(buf))

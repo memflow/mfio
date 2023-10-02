@@ -26,7 +26,7 @@ impl<B: ?Sized, Func: for<'a> FnOnce(&'a B) -> F, F: Future> BorrowingFn<B> for 
 /// Wrapper to convert `FnOnce(&'1 _)` to `for<'a> FnOnce(&'a _)`.
 ///
 /// This wrapper is needed to walk around issues with closures not defaulting to using
-/// higher-ranked type bounds. See: https://github.com/rust-lang/rust/issues/70263.
+/// higher-ranked type bounds. See: <https://github.com/rust-lang/rust/issues/70263>.
 ///
 /// This wrapper is used in `run_with_mut` to accept a non-hrtb closure without complex trickery.
 pub struct UnsafeHrtb<'a, B: ?Sized, Func: FnOnce(&'a B) -> F, F: Future> {

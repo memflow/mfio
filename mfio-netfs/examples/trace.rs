@@ -23,7 +23,9 @@ fn main() {
 
     let _ = std::io::stdin().read(&mut [0u8]);
 
-    let sizes = [1 /*1, 2, 4, 8, 16, 64, 256, 1024, 4096, 16384, 65536*/];
+    let sizes = [
+        1, /* 1, 2, 4, 8, 16, 64, 256, 1024, 4096, 16384, 65536 */
+    ];
     let iters = 0x1000;
 
     let mut rng = rand::thread_rng();

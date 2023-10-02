@@ -10,10 +10,14 @@ jobs:
 
   build-base:
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
     strategy:
+      fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
-        toolchain: ["1.67", "stable"]
+        toolchain: ["1.72", "stable"]
+        rustflags: ["--cfg mfio_assume_linear_types --cfg tokio_unstable", "--cfg tokio_unstable"]
     steps:
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
@@ -26,10 +30,14 @@ jobs:
 
   build-nightly:
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
     strategy:
+      fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
-        toolchain: ["1.67", "stable", "nightly-2023-02-24"]
+        toolchain: ["1.72", "stable", "nightly-2023-09-01"]
+        rustflags: ["--cfg mfio_assume_linear_types --cfg tokio_unstable", "--cfg tokio_unstable"]
     steps:
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
@@ -45,9 +53,13 @@ jobs:
 
   build-cross-aarch64:
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
     strategy:
+      fail-fast: false
       matrix:
-        toolchain: ["1.67", "stable"]
+        toolchain: ["1.72", "stable"]
+        rustflags: ["--cfg mfio_assume_linear_types --cfg tokio_unstable", "--cfg tokio_unstable"]
     steps:
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
@@ -63,10 +75,15 @@ jobs:
 
   test:
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    timeout-minutes: 20
     strategy:
+      fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
-        toolchain: ["1.67", "stable"]
+        toolchain: ["1.72", "stable"]
+        rustflags: ["--cfg mfio_assume_linear_types --cfg tokio_unstable", "--cfg tokio_unstable"]
     steps:
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
@@ -79,10 +96,15 @@ jobs:
 
   test-all-features:
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    timeout-minutes: 20
     strategy:
+      fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
-        toolchain: ["1.67", "stable", "nightly-2023-02-24"]
+        toolchain: ["1.72", "stable", "nightly-2023-09-01"]
+        rustflags: ["--cfg mfio_assume_linear_types --cfg tokio_unstable", "--cfg tokio_unstable"]
     steps:
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
@@ -95,10 +117,14 @@ jobs:
 
   lint:
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
     strategy:
+      fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
         features: ["--all-features", ""]
+        rustflags: ["--cfg mfio_assume_linear_types --cfg tokio_unstable", "--cfg tokio_unstable"]
     steps:
       - uses: actions/checkout@v2
       - run: rustup component add clippy
@@ -111,10 +137,13 @@ jobs:
 
   miri:
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
     strategy:
       matrix:
-        toolchain: ["nightly-2023-02-24"]
+        toolchain: ["nightly-2023-09-01"]
         seed: [1, 2, 3, 4, 5, 6, 7, 8]
+        rustflags: ["--cfg mfio_assume_linear_types --cfg tokio_unstable", "--cfg tokio_unstable"]
     steps:
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
@@ -124,10 +153,11 @@ jobs:
       - run: rustup component add miri
       - name: Run miri
         run: |
-          MIRIFLAGS="-Zmiri-seed=${{ matrix.seed }} -Zmiri-ignore-leaks -Zmiri-symbolic-alignment-check -Zmiri-retag-fields=all -Zmiri-symbolic-alignment-check -Zmiri-strict-provenance -Zmiri-disable-isolation" cargo miri test
+          MIRIFLAGS="-Zmiri-seed=${{ matrix.seed }} -Zmiri-ignore-leaks -Zmiri-symbolic-alignment-check -Zmiri-retag-fields=all -Zmiri-symbolic-alignment-check -Zmiri-strict-provenance -Zmiri-disable-isolation -Zmiri-tree-borrows" cargo miri test
 
   build-coverage:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v2
         with:
@@ -135,7 +165,7 @@ jobs:
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: nightly-2023-02-24
+          toolchain: nightly-2023-09-01
           override: true
       - run: cargo install grcov
       - name: Run tests with coverage

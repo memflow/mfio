@@ -9,10 +9,9 @@ use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
 use mio::{event::Source, unix::SourceFd, Interest, Registry, Token};
-use parking_lot::Mutex;
 
 use mfio::error::State;
-use mfio::packet::{FastCWaker, Read as RdPerm, Write as WrPerm, *};
+use mfio::io::{Read as RdPerm, Write as WrPerm, *};
 use mfio::tarc::BaseArc;
 
 use super::super::unix_extra::{set_nonblock, StreamBuf};
@@ -104,6 +103,13 @@ impl StreamInner {
         Ok(())
     }
 
+    pub fn cancel_all_ops(&mut self) {
+        self.stream
+            .on_read(Err(io::ErrorKind::Interrupted.into()), None);
+        self.stream
+            .on_write(Err(io::ErrorKind::Interrupted.into()), None);
+    }
+
     #[tracing::instrument(skip(self))]
     pub fn do_ops(&mut self, read: bool, write: bool) {
         log::trace!(
@@ -133,7 +139,7 @@ impl StreamInner {
                         .map(|e| e.kind() != io::ErrorKind::WouldBlock)
                         .unwrap_or(true)
                     {
-                        self.stream.on_read(res);
+                        self.stream.on_read(res, None);
                     } else {
                         tracing::event!(tracing::Level::INFO, "read blocked");
                         self.track.read_blocked = true;
@@ -162,7 +168,7 @@ impl StreamInner {
                         .map(|e| e.kind() != io::ErrorKind::WouldBlock)
                         .unwrap_or(true)
                     {
-                        self.stream.on_write(res);
+                        self.stream.on_write(res, None);
                     } else {
                         tracing::event!(tracing::Level::INFO, "write blocked");
                         self.track.write_blocked = true;
@@ -180,12 +186,12 @@ impl StreamInner {
 }
 
 trait IntoOp: PacketPerms {
-    fn push_op(stream: &mut StreamInner, pkt: BoundPacket<'static, Self>);
+    fn push_op(stream: &mut StreamInner, pkt: BoundPacketView<Self>);
 }
 
 impl IntoOp for RdPerm {
-    fn push_op(stream: &mut StreamInner, pkt: BoundPacket<'static, Self>) {
-        stream.stream.queue_write(pkt);
+    fn push_op(stream: &mut StreamInner, pkt: BoundPacketView<Self>) {
+        stream.stream.queue_write(pkt, None);
         // we would normally attempt the operation right here, but that leads to overly high
         // syscall count.
         //stream.do_ops(false, false);
@@ -193,91 +199,47 @@ impl IntoOp for RdPerm {
 }
 
 impl IntoOp for WrPerm {
-    fn push_op(stream: &mut StreamInner, pkt: BoundPacket<'static, Self>) {
-        stream.stream.queue_read(pkt);
+    fn push_op(stream: &mut StreamInner, pkt: BoundPacketView<Self>) {
+        stream.stream.queue_read(pkt, None);
         // we would normally attempt the operation right here, but that leads to overly high
         // syscall count.
         //stream.do_ops(true, false);
     }
 }
 
-struct StreamOpsHandle<Perms: IntoOp> {
-    handle: PacketIoHandle<'static, Perms, NoPos>,
-    idx: usize,
-    state: BaseArc<Mutex<MioState>>,
-}
-
-impl<Perms: IntoOp> StreamOpsHandle<Perms> {
-    fn new(idx: usize, state: BaseArc<Mutex<MioState>>) -> Self {
-        Self {
-            handle: PacketIoHandle::new::<Self>(),
-            idx,
-            state,
-        }
-    }
-}
-
-impl<Perms: IntoOp> AsRef<PacketIoHandle<'static, Perms, NoPos>> for StreamOpsHandle<Perms> {
-    fn as_ref(&self) -> &PacketIoHandle<'static, Perms, NoPos> {
-        &self.handle
-    }
-}
-
-impl<Perms: IntoOp> PacketIoHandleable<'static, Perms, NoPos> for StreamOpsHandle<Perms> {
-    extern "C" fn send_input(&self, _: NoPos, packet: BoundPacket<'static, Perms>) {
-        let state = &mut *self.state.lock();
-
-        let stream = state.streams.get_mut(self.idx).unwrap();
+impl<Perms: IntoOp> PacketIo<Perms, NoPos> for TcpStream {
+    fn send_io(&self, _: NoPos, packet: BoundPacketView<Perms>) {
+        let streams = self.state.streams.read();
+        let stream = streams.get(self.idx).unwrap();
+        let stream = &mut *stream.lock();
 
         Perms::push_op(stream, packet);
 
         // This will trigger change in interests in the mio loop
         if !stream.track.update_queued {
             stream.track.update_queued = true;
-            state.opqueue.push(Key::Stream(self.idx));
+            self.state.opqueue.lock().push(Key::Stream(self.idx));
         }
     }
 }
 
 pub struct TcpStream {
     idx: usize,
-    state: BaseArc<Mutex<MioState>>,
-    read_stream: BaseArc<PacketStream<'static, WrPerm, NoPos>>,
-    write_stream: BaseArc<PacketStream<'static, RdPerm, NoPos>>,
+    state: BaseArc<MioState>,
 }
 
 impl TcpStream {
-    pub(super) fn new(idx: usize, state: BaseArc<Mutex<MioState>>) -> Self {
-        let write_io = BaseArc::new(StreamOpsHandle::new(idx, state.clone()));
-
-        let write_stream = BaseArc::from(PacketStream {
-            ctx: PacketCtx::new(write_io).into(),
-        });
-
-        let read_io = BaseArc::new(StreamOpsHandle::new(idx, state.clone()));
-
-        let read_stream = BaseArc::from(PacketStream {
-            ctx: PacketCtx::new(read_io).into(),
-        });
-
-        Self {
-            idx,
-            state,
-            write_stream,
-            read_stream,
-        }
+    pub(super) fn new(idx: usize, state: BaseArc<MioState>) -> Self {
+        Self { idx, state }
     }
 
-    pub(super) fn register_stream(
-        state_arc: &BaseArc<Mutex<MioState>>,
-        stream: net::TcpStream,
-    ) -> Self {
+    pub(super) fn register_stream(state: &BaseArc<MioState>, stream: net::TcpStream) -> Self {
         // TODO: make this portable
         let fd = stream.as_raw_fd();
         set_nonblock(fd).unwrap();
 
-        let state = &mut *state_arc.lock();
-        let entry = state.streams.vacant_entry();
+        let streams = state.streams.read();
+        let entry = streams.vacant_entry().unwrap();
         // 2N mapping, to accomodate for streams
         let key = Key::Stream(entry.key());
         let stream = StreamInner::from(stream);
@@ -285,16 +247,16 @@ impl TcpStream {
         log::trace!(
             "Register stream={:?} state={:?}: key={key:?}",
             stream.as_raw_fd(),
-            state_arc.as_ptr()
+            state.as_ptr()
         );
 
-        entry.insert(stream);
+        entry.insert(stream.into());
 
-        TcpStream::new(key.idx(), state_arc.clone())
+        TcpStream::new(key.idx(), state.clone())
     }
 
     pub(super) fn tcp_connect<'a, A: ToSocketAddrs + Send + 'a>(
-        backend: &'a BaseArc<Mutex<MioState>>,
+        backend: &'a BaseArc<MioState>,
         addrs: A,
     ) -> TcpConnectFuture<'a, A> {
         TcpConnectFuture {
@@ -307,47 +269,39 @@ impl TcpStream {
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        let mut state = self.state.lock();
-        let mut stream = state.streams.remove(self.idx);
+        let mut stream = self.state.streams.read().take(self.idx).unwrap();
         // TODO: what to do on error?
-        let _ = state.poll.registry().deregister(&mut stream);
-    }
-}
-
-impl PacketIo<RdPerm, NoPos> for TcpStream {
-    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, RdPerm, NoPos>> {
-        Some(self.write_stream.new_packet_id())
-    }
-}
-
-impl PacketIo<WrPerm, NoPos> for TcpStream {
-    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, WrPerm, NoPos>> {
-        Some(self.read_stream.new_packet_id())
+        let _ = self
+            .state
+            .poll
+            .lock()
+            .registry()
+            .deregister(stream.get_mut());
     }
 }
 
 impl TcpStreamHandle for TcpStream {
     fn local_addr(&self) -> mfio::error::Result<SocketAddr> {
-        let state = self.state.lock();
-        let stream = state
-            .streams
+        let streams = self.state.streams.read();
+        let stream = streams
             .get(self.idx)
             .ok_or_else(|| io_err(State::NotFound))?;
+        let stream = stream.lock();
         stream.fd.local_addr().map_err(from_io_error)
     }
 
     fn peer_addr(&self) -> mfio::error::Result<SocketAddr> {
-        let state = self.state.lock();
-        let stream = state
-            .streams
+        let streams = self.state.streams.read();
+        let stream = streams
             .get(self.idx)
             .ok_or_else(|| io_err(State::NotFound))?;
+        let stream = stream.lock();
         stream.fd.peer_addr().map_err(from_io_error)
     }
 }
 
 pub struct TcpConnectFuture<'a, A: ToSocketAddrs + 'a> {
-    backend: &'a BaseArc<Mutex<MioState>>,
+    backend: &'a BaseArc<MioState>,
     addrs: Option<A::Iter>,
     idx: Option<usize>,
 }
@@ -361,8 +315,8 @@ impl<'a, A: ToSocketAddrs + 'a> Future for TcpConnectFuture<'a, A> {
 
         loop {
             if let Some(idx) = this.idx.take() {
-                let state = &mut *this.backend.lock();
-                if let Some(stream) = state.streams.get_mut(idx) {
+                if let Some(stream) = this.backend.streams.read().get(idx) {
+                    let mut stream = stream.lock();
                     if !stream.track.write_blocked {
                         let wrapper = TcpStream::new(idx, this.backend.clone());
 
@@ -378,7 +332,10 @@ impl<'a, A: ToSocketAddrs + 'a> Future for TcpConnectFuture<'a, A> {
                         }
                     } else {
                         if stream
-                            .update_interests(Key::Stream(idx).key(), state.poll.registry())
+                            .update_interests(
+                                Key::Stream(idx).key(),
+                                this.backend.poll.lock().registry(),
+                            )
                             .is_err()
                         {
                             let _ = TcpStream::new(idx, this.backend.clone());
@@ -395,9 +352,8 @@ impl<'a, A: ToSocketAddrs + 'a> Future for TcpConnectFuture<'a, A> {
                 let stream = net::TcpStream::connect(addr);
 
                 if let Ok(stream) = stream {
-                    let mut state = this.backend.lock();
-
-                    let entry = state.streams.vacant_entry();
+                    let streams = this.backend.streams.read();
+                    let entry = streams.vacant_entry().unwrap();
                     // 2N mapping, to accomodate for streams
                     let key = Key::Stream(entry.key());
                     let mut stream = StreamInner::from(stream);
@@ -411,7 +367,7 @@ impl<'a, A: ToSocketAddrs + 'a> Future for TcpConnectFuture<'a, A> {
                     // Mark as write blocked so that we can poll for the writability
                     stream.track.write_blocked = true;
 
-                    entry.insert(stream);
+                    entry.insert(stream.into());
                 }
             } else {
                 break Poll::Ready(Err(io_err(State::Exhausted)));

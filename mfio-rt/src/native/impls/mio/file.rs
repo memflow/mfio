@@ -4,11 +4,10 @@ use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, RawFd};
 
 use mio::{event::Source, unix::SourceFd, Interest, Registry, Token};
-use parking_lot::Mutex;
 
 use core::mem::MaybeUninit;
 
-use mfio::packet::{FastCWaker, Read as RdPerm, Splittable, Write as WrPerm, *};
+use mfio::io::{Read as RdPerm, Splittable, Write as WrPerm, *};
 use mfio::tarc::BaseArc;
 
 use super::{BlockTrack, Key, MioState};
@@ -16,11 +15,11 @@ use crate::util::io_err;
 use mfio::error::State;
 
 struct ReadOp {
-    pkt: MaybeAlloced<'static, WrPerm>,
+    pkt: MaybeAlloced<WrPerm>,
 }
 
 struct WriteOp {
-    pkt: AllocedOrTransferred<'static, RdPerm>,
+    pkt: AllocedOrTransferred<RdPerm>,
     transferred: Option<(usize, Vec<u8>)>,
 }
 
@@ -120,6 +119,11 @@ impl FileInner {
         Ok(())
     }
 
+    pub fn cancel_all_ops(&mut self) {
+        self.read_ops.clear();
+        self.write_ops.clear();
+    }
+
     #[tracing::instrument(skip(self))]
     pub fn do_ops(&mut self, read: bool, write: bool) {
         log::trace!(
@@ -162,15 +166,15 @@ impl FileInner {
                             let buf = pkt.as_ptr() as *mut u8;
                             // SAFETY: assume MaybeUninit<u8> is initialized,
                             // as God intended :upside_down:
-                            unsafe { core::slice::from_raw_parts_mut(buf, len) }
+                            unsafe { core::slice::from_raw_parts_mut(buf, len as usize) }
                         }
                         Err(_) => {
-                            if len > self.tmp_buf.len() {
-                                self.tmp_buf.reserve(len - self.tmp_buf.len());
+                            if len as usize > self.tmp_buf.len() {
+                                self.tmp_buf.reserve(len as usize - self.tmp_buf.len());
                             }
                             // SAFETY: assume MaybeUninit<u8> is initialized,
                             // as God intended :upside_down:
-                            unsafe { self.tmp_buf.set_len(len) }
+                            unsafe { self.tmp_buf.set_len(len as usize) }
                             &mut self.tmp_buf[..]
                         }
                     };
@@ -179,15 +183,19 @@ impl FileInner {
                         Ok(l) => {
                             log::trace!("Read {l}/{}", slice.len());
                             self.pos += l as u64;
-                            if l == len {
+                            if l == len as usize {
                                 if let Err(pkt) = pkt {
-                                    unsafe { pkt.transfer_data(self.tmp_buf.as_mut_ptr().cast()) };
+                                    let _ = unsafe {
+                                        pkt.transfer_data(self.tmp_buf.as_mut_ptr().cast())
+                                    };
                                 }
                                 break;
                             } else if l > 0 {
-                                let (a, b) = pkt.split_at(l);
+                                let (a, b) = pkt.split_at(l as _);
                                 if let Err(pkt) = a {
-                                    unsafe { pkt.transfer_data(self.tmp_buf.as_mut_ptr().cast()) };
+                                    let _ = unsafe {
+                                        pkt.transfer_data(self.tmp_buf.as_mut_ptr().cast())
+                                    };
                                 }
                                 pkt = b;
                             } else {
@@ -244,7 +252,7 @@ impl FileInner {
                     let slice = match &mut pkt {
                         Ok(pkt) => {
                             let buf = pkt.as_ptr();
-                            unsafe { core::slice::from_raw_parts(buf, len) }
+                            unsafe { core::slice::from_raw_parts(buf, len as usize) }
                         }
                         Err(_) => {
                             let (pos, buf) = transferred.as_ref().unwrap();
@@ -259,10 +267,10 @@ impl FileInner {
                             if let Some((pos, _)) = &mut transferred {
                                 *pos += l;
                             }
-                            if l == len {
+                            if l == len as usize {
                                 break;
                             } else if l > 0 {
-                                pkt = pkt.split_at(l).1;
+                                pkt = pkt.split_at(l as _).1;
                             } else {
                                 pkt.error(io_err(State::Nop));
                                 break;
@@ -293,19 +301,19 @@ impl FileInner {
 }
 
 trait IntoOp: PacketPerms {
-    fn push_op(file: &mut FileInner, pos: u64, alloced: MaybeAlloced<'static, Self>);
+    fn push_op(file: &mut FileInner, pos: u64, alloced: MaybeAlloced<Self>);
 }
 
 impl IntoOp for RdPerm {
-    fn push_op(file: &mut FileInner, pos: u64, alloced: MaybeAlloced<'static, Self>) {
+    fn push_op(file: &mut FileInner, pos: u64, alloced: MaybeAlloced<Self>) {
         let op = match alloced {
             Ok(pkt) => WriteOp {
                 pkt: Ok(pkt),
                 transferred: None,
             },
             Err(pkt) => {
-                let mut new_trans: Vec<MaybeUninit<u8>> = Vec::with_capacity(pkt.len());
-                unsafe { new_trans.set_len(pkt.len()) };
+                let mut new_trans: Vec<MaybeUninit<u8>> = Vec::with_capacity(pkt.len() as _);
+                unsafe { new_trans.set_len(pkt.len() as _) };
 
                 let transferred = unsafe { pkt.transfer_data(new_trans.as_mut_ptr() as *mut ()) };
                 // SAFETY: buffer has now been initialized, it is safe to transmute it into [u8].
@@ -327,7 +335,7 @@ impl IntoOp for RdPerm {
 }
 
 impl IntoOp for WrPerm {
-    fn push_op(file: &mut FileInner, pos: u64, pkt: MaybeAlloced<'static, Self>) {
+    fn push_op(file: &mut FileInner, pos: u64, pkt: MaybeAlloced<Self>) {
         file.read_ops.push_back((pos, ReadOp { pkt }));
         // If we haven't got any other ops enqueued, then trigger processing!
         if file.read_ops.len() < 2 {
@@ -336,33 +344,11 @@ impl IntoOp for WrPerm {
     }
 }
 
-struct FileOpsHandle<Perms: IntoOp> {
-    handle: PacketIoHandle<'static, Perms, u64>,
-    idx: usize,
-    state: BaseArc<Mutex<MioState>>,
-}
-
-impl<Perms: IntoOp> FileOpsHandle<Perms> {
-    fn new(idx: usize, state: BaseArc<Mutex<MioState>>) -> Self {
-        Self {
-            handle: PacketIoHandle::new::<Self>(),
-            idx,
-            state,
-        }
-    }
-}
-
-impl<Perms: IntoOp> AsRef<PacketIoHandle<'static, Perms, u64>> for FileOpsHandle<Perms> {
-    fn as_ref(&self) -> &PacketIoHandle<'static, Perms, u64> {
-        &self.handle
-    }
-}
-
-impl<Perms: IntoOp> PacketIoHandleable<'static, Perms, u64> for FileOpsHandle<Perms> {
-    extern "C" fn send_input(&self, pos: u64, packet: BoundPacket<'static, Perms>) {
-        let mut state = self.state.lock();
-
-        let file = state.files.get_mut(self.idx).unwrap();
+impl<Perms: IntoOp> PacketIo<Perms, u64> for FileWrapper {
+    fn send_io(&self, pos: u64, packet: BoundPacketView<Perms>) {
+        let files = self.state.files.read();
+        let file = files.get(self.idx).unwrap();
+        let file = &mut *file.lock();
 
         Perms::push_op(file, pos, packet.try_alloc());
 
@@ -370,58 +356,26 @@ impl<Perms: IntoOp> PacketIoHandleable<'static, Perms, u64> for FileOpsHandle<Pe
         if !file.track.update_queued && file.track.expected_interests() != file.track.cur_interests
         {
             file.track.update_queued = true;
-            state.opqueue.push(Key::File(self.idx));
+            self.state.opqueue.lock().push(Key::File(self.idx));
         }
     }
 }
 
 pub struct FileWrapper {
     idx: usize,
-    state: BaseArc<Mutex<MioState>>,
-    read_stream: BaseArc<PacketStream<'static, WrPerm, u64>>,
-    write_stream: BaseArc<PacketStream<'static, RdPerm, u64>>,
+    state: BaseArc<MioState>,
 }
 
 impl FileWrapper {
-    pub(super) fn new(idx: usize, state: BaseArc<Mutex<MioState>>) -> Self {
-        let write_io = BaseArc::new(FileOpsHandle::new(idx, state.clone()));
-
-        let write_stream = BaseArc::from(PacketStream {
-            ctx: PacketCtx::new(write_io).into(),
-        });
-
-        let read_io = BaseArc::new(FileOpsHandle::new(idx, state.clone()));
-
-        let read_stream = BaseArc::from(PacketStream {
-            ctx: PacketCtx::new(read_io).into(),
-        });
-
-        Self {
-            idx,
-            state,
-            write_stream,
-            read_stream,
-        }
+    pub(super) fn new(idx: usize, state: BaseArc<MioState>) -> Self {
+        Self { idx, state }
     }
 }
 
 impl Drop for FileWrapper {
     fn drop(&mut self) {
-        let mut state = self.state.lock();
-        let mut file = state.files.remove(self.idx);
+        let mut file = self.state.files.read().take(self.idx).unwrap();
         // TODO: what to do on error?
-        let _ = state.poll.registry().deregister(&mut file);
-    }
-}
-
-impl PacketIo<RdPerm, u64> for FileWrapper {
-    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, RdPerm, u64>> {
-        Some(self.write_stream.new_packet_id())
-    }
-}
-
-impl PacketIo<WrPerm, u64> for FileWrapper {
-    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, WrPerm, u64>> {
-        Some(self.read_stream.new_packet_id())
+        let _ = self.state.poll.lock().registry().deregister(file.get_mut());
     }
 }

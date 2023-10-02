@@ -4,8 +4,8 @@ use std::net::ToSocketAddrs;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use mio::{unix::SourceFd, Events, Interest, Token};
-use parking_lot::Mutex;
-use slab::Slab;
+use parking_lot::{Mutex, RwLock};
+use sharded_slab::Slab;
 
 use core::future::poll_fn;
 use core::task::Poll;
@@ -57,27 +57,27 @@ impl BlockTrack {
 }
 
 struct MioState {
-    poll: mio::Poll,
-    files: Slab<FileInner>,
-    streams: Slab<StreamInner>,
-    listeners: Slab<ListenerInner>,
-    opqueue: Vec<Key>,
+    poll: Mutex<mio::Poll>,
+    files: RwLock<Slab<Mutex<FileInner>>>,
+    streams: RwLock<Slab<Mutex<StreamInner>>>,
+    listeners: Slab<Mutex<ListenerInner>>,
+    opqueue: Mutex<Vec<Key>>,
 }
 
 impl MioState {
     fn try_new() -> std::io::Result<Self> {
         Ok(Self {
-            poll: mio::Poll::new()?,
+            poll: mio::Poll::new()?.into(),
             files: Default::default(),
             streams: Default::default(),
             listeners: Default::default(),
-            opqueue: vec![],
+            opqueue: vec![].into(),
         })
     }
 }
 
 pub struct Runtime {
-    state: BaseArc<Mutex<MioState>>,
+    state: BaseArc<MioState>,
     backend: BackendContainer<DynBackend>,
     waker: FdWakerOwner<OwnedFd>,
 }
@@ -98,13 +98,13 @@ impl Runtime {
         let waker = FdWakerOwner::from(wake_write);
 
         // Register the waker in a special manner
-        state.poll.registry().register(
+        state.poll.lock().registry().register(
             &mut SourceFd(&wake_read.as_raw_fd()),
             Token(usize::MAX),
             Interest::READABLE,
         )?;
 
-        let state = BaseArc::new(Mutex::new(state));
+        let state = BaseArc::new(state);
 
         let backend = {
             let state = state.clone();
@@ -118,9 +118,11 @@ impl Runtime {
 
                 loop {
                     let ret = async {
-                        let state = &mut *state.lock();
-
-                        if let Err(_e) = state.poll.poll(&mut events, Some(Default::default())) {
+                        if let Err(_e) = state
+                            .poll
+                            .lock()
+                            .poll(&mut events, Some(Default::default()))
+                        {
                             return false;
                         }
 
@@ -138,33 +140,37 @@ impl Runtime {
                             } else {
                                 match Key::from(key) {
                                     Key::File(v) => {
-                                        if let Some(file) = state.files.get_mut(v) {
+                                        if let Some(file) = state.files.read().get(v) {
                                             log::trace!(
                                                 "readable={} writeable={}",
                                                 event.is_readable(),
                                                 event.is_writable()
                                             );
-                                            file.do_ops(event.is_readable(), event.is_writable());
+                                            file.lock()
+                                                .do_ops(event.is_readable(), event.is_writable());
                                         }
                                     }
                                     Key::Stream(v) => {
-                                        if let Some(stream) = state.streams.get_mut(v) {
+                                        if let Some(stream) = state.streams.read().get(v) {
                                             log::trace!(
                                                 "readable={} writeable={}",
                                                 event.is_readable(),
                                                 event.is_writable()
                                             );
-                                            stream.do_ops(event.is_readable(), event.is_writable());
+                                            stream
+                                                .lock()
+                                                .do_ops(event.is_readable(), event.is_writable());
                                         }
                                     }
                                     Key::TcpListener(v) => {
-                                        if let Some(listener) = state.listeners.get_mut(v) {
+                                        if let Some(listener) = state.listeners.get(v) {
                                             log::trace!(
                                                 "readable={} writeable={}",
                                                 event.is_readable(),
                                                 event.is_writable()
                                             );
                                             listener
+                                                .lock()
                                                 .do_ops(event.is_readable(), event.is_writable());
                                         }
                                     }
@@ -173,43 +179,44 @@ impl Runtime {
                         }
 
                         // process the operation queue
-                        for key in state.opqueue.drain(..) {
+                        for key in state.opqueue.lock().drain(..) {
                             interest_update_queue.push(key);
                             match key {
                                 Key::File(v) => {
-                                    if let Some(file) = state.files.get_mut(v) {
-                                        file.on_queue();
+                                    if let Some(file) = state.files.read().get(v) {
+                                        file.lock().on_queue();
                                     }
                                 }
                                 Key::Stream(v) => {
-                                    if let Some(stream) = state.streams.get_mut(v) {
-                                        stream.on_queue();
+                                    if let Some(stream) = state.streams.read().get(v) {
+                                        stream.lock().on_queue();
                                     }
                                 }
                                 Key::TcpListener(_) => (),
                             }
                         }
 
+                        let poll = state.poll.lock();
                         // Update polling interests for any FDs that did any work.
                         for key in interest_update_queue.drain(..) {
                             let res = match key {
                                 Key::File(v) => {
-                                    if let Some(file) = state.files.get_mut(v) {
-                                        file.update_interests(key.key(), state.poll.registry())
+                                    if let Some(file) = state.files.read().get(v) {
+                                        file.lock().update_interests(key.key(), poll.registry())
                                     } else {
                                         Ok(())
                                     }
                                 }
                                 Key::Stream(v) => {
-                                    if let Some(stream) = state.streams.get_mut(v) {
-                                        stream.update_interests(key.key(), state.poll.registry())
+                                    if let Some(stream) = state.streams.read().get(v) {
+                                        stream.lock().update_interests(key.key(), poll.registry())
                                     } else {
                                         Ok(())
                                     }
                                 }
                                 Key::TcpListener(v) => {
-                                    if let Some(listener) = state.listeners.get_mut(v) {
-                                        listener.update_interests(key.key(), state.poll.registry())
+                                    if let Some(listener) = state.listeners.get(v) {
+                                        listener.lock().update_interests(key.key(), poll.registry())
                                     } else {
                                         Ok(())
                                     }
@@ -272,6 +279,19 @@ impl Runtime {
             waker,
         })
     }
+
+    pub fn cancel_all_ops(&self) {
+        self.state
+            .files
+            .write()
+            .unique_iter()
+            .for_each(|v| v.lock().cancel_all_ops());
+        self.state
+            .streams
+            .write()
+            .unique_iter()
+            .for_each(|v| v.lock().cancel_all_ops());
+    }
 }
 
 impl IoBackend for Runtime {
@@ -280,7 +300,7 @@ impl IoBackend for Runtime {
     fn polling_handle(&self) -> Option<PollingHandle> {
         static READ: PollingFlags = PollingFlags::new().read(true);
         Some(PollingHandle {
-            handle: self.state.lock().poll.as_raw_fd(),
+            handle: self.state.poll.lock().as_raw_fd(),
             cur_flags: &READ,
             max_flags: PollingFlags::new().read(true),
             waker: self.waker.clone().into_waker(),
@@ -297,8 +317,8 @@ impl Runtime {
         let fd = file.as_raw_fd();
         set_nonblock(fd).unwrap();
 
-        let state = &mut *self.state.lock();
-        let entry = state.files.vacant_entry();
+        let files = self.state.files.read();
+        let entry = files.vacant_entry().unwrap();
         // 2N mapping, to accomodate for streams
         let key = Key::File(entry.key());
         let file = FileInner::from(file);
@@ -310,7 +330,7 @@ impl Runtime {
             self.state.as_ptr()
         );
 
-        entry.insert(file);
+        entry.insert(file.into());
 
         FileWrapper::new(key.idx(), self.state.clone())
     }

@@ -4,8 +4,8 @@ use core::task::{Context, Poll};
 use futures::Stream;
 use mfio::backend::*;
 use mfio::error::{Code, Error, Location, Result as MfioResult, State, Subject};
+use mfio::io::{BoundPacketView, NoPos, PacketIo, Read, Write};
 use mfio::mferr;
-use mfio::packet::{FastCWaker, NoPos, PacketId, PacketIo, Read, Write};
 use mfio::stdeq::Seekable;
 use mfio::tarc::BaseArc;
 use std::fs;
@@ -39,6 +39,12 @@ macro_rules! fs_dispatch {
                     $($(#[cfg($meta)])* Self::$name(v) => NativeTcpStream::$name(v.register_stream(stream))),*
                 }
             }
+
+            pub fn cancel_all_ops(&self) {
+                match self {
+                    $($(#[cfg($meta)])* Self::$name(v) => v.cancel_all_ops()),*
+                }
+            }
         }
 
         impl core::fmt::Debug for NativeRtInstance {
@@ -70,7 +76,7 @@ macro_rules! fs_dispatch {
         /// This builder allows configuring the I/O backends to try to construct for the filesystem
         /// handle. Note that the order of backends is fixed, and is as follows:
         ///
-        $(#[cfg_attr(all($($meta)*), doc = concat!("- [`", stringify!($mod), "`](impls::", stringify!($mod), ")"))])*
+        $(#[cfg_attr(all($($meta)*), doc = concat!("- ", stringify!($mod)))])*
         ///
         /// The full order (including unsupported/disabled backends) is as follows:
         ///
@@ -116,7 +122,7 @@ macro_rules! fs_dispatch {
             }
 
             $($(#[cfg($meta)])*
-            #[doc = concat!("Enables the [`", stringify!($mod), "`](impls::", stringify!($mod), ") backend.")]
+            #[doc = concat!("Enables the ", stringify!($mod), " backend.")]
             pub fn $mod(self, $mod: bool) -> Self {
                 Self {
                     $mod,
@@ -160,17 +166,17 @@ macro_rules! fs_dispatch {
         }
 
         impl PacketIo<Write, u64> for NativeFile {
-            fn try_new_id<'a>(&'a self, context: &mut FastCWaker) -> Option<PacketId<'a, Write, u64>> {
+            fn send_io(&self, param: u64, view: BoundPacketView<Write>) {
                 match self {
-                    $($(#[cfg($meta)])* Self::$name(v) => v.try_new_id(context)),*
+                    $($(#[cfg($meta)])* Self::$name(v) => v.send_io(param, view)),*
                 }
             }
         }
 
         impl PacketIo<Read, u64> for NativeFile {
-            fn try_new_id<'a>(&'a self, context: &mut FastCWaker) -> Option<PacketId<'a, Read, u64>> {
+            fn send_io(&self, param: u64, view: BoundPacketView<Read>) {
                 match self {
-                    $($(#[cfg($meta)])* Self::$name(v) => v.try_new_id(context)),*
+                    $($(#[cfg($meta)])* Self::$name(v) => v.send_io(param, view)),*
                 }
             }
         }
@@ -180,17 +186,17 @@ macro_rules! fs_dispatch {
         }
 
         impl PacketIo<Write, NoPos> for NativeTcpStream {
-            fn try_new_id<'a>(&'a self, context: &mut FastCWaker) -> Option<PacketId<'a, Write, NoPos>> {
+            fn send_io(&self, param: NoPos, view: BoundPacketView<Write>) {
                 match self {
-                    $($(#[cfg($meta)])* Self::$name(v) => v.try_new_id(context)),*
+                    $($(#[cfg($meta)])* Self::$name(v) => v.send_io(param, view)),*
                 }
             }
         }
 
         impl PacketIo<Read, NoPos> for NativeTcpStream {
-            fn try_new_id<'a>(&'a self, context: &mut FastCWaker) -> Option<PacketId<'a, Read, NoPos>> {
+            fn send_io(&self, param: NoPos, view: BoundPacketView<Read>) {
                 match self {
-                    $($(#[cfg($meta)])* Self::$name(v) => v.try_new_id(context)),*
+                    $($(#[cfg($meta)])* Self::$name(v) => v.send_io(param, view)),*
                 }
             }
         }
@@ -297,6 +303,16 @@ fs_dispatch! {
     Default => thread,
 }
 
+const _: () = {
+    const fn verify_send<T: Send>() {}
+    const fn verify_sync<T: Sync>() {}
+
+    verify_send::<NativeRtInstance>();
+    verify_send::<NativeFile>();
+    verify_send::<NativeTcpStream>();
+    verify_send::<NativeTcpListener>();
+};
+
 /// Native OS backed runtime
 ///
 /// # Examples
@@ -304,7 +320,7 @@ fs_dispatch! {
 /// Read a file:
 /// ```
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// use mfio::packet::*;
+/// use mfio::io::*;
 /// use mfio::stdeq::*;
 /// use mfio_rt::*;
 /// use std::fs::write;
@@ -339,7 +355,7 @@ fs_dispatch! {
 /// ```
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// # pollster::block_on(async move {
-/// use mfio::packet::*;
+/// use mfio::io::*;
 /// use mfio::stdeq::*;
 /// use mfio_rt::*;
 /// use std::io::Seek;
@@ -460,6 +476,10 @@ impl NativeRt {
     /// Registers a non-seekable I/O stream
     pub fn register_stream(&self, stream: TcpStream) -> NativeTcpStream {
         self.cwd.instance.register_stream(stream)
+    }
+
+    pub fn cancel_all_ops(&self) {
+        self.cwd.instance.cancel_all_ops()
     }
 }
 
@@ -590,7 +610,7 @@ impl DirHandle for NativeRtDir {
 
     /// Do an operation.
     ///
-    /// This function performs an operation from the [`DirOp`](DirOp) enum.
+    /// This function performs an operation from the [`DirOp`] enum.
     fn do_op<P: AsRef<Path>>(&self, operation: DirOp<P>) -> Self::OpFuture<'_> {
         let (tx, rx) = oneshot::channel();
 
@@ -763,7 +783,6 @@ mod tests {
     use core::future::poll_fn;
     use core::mem::MaybeUninit;
     use core::task::Poll;
-    use futures::stream::StreamExt;
     use mfio::stdeq::*;
     use mfio::traits::*;
     use std::fs::write;
@@ -789,8 +808,7 @@ mod tests {
 
                 let mut d = [MaybeUninit::uninit(); 8];
 
-                let stream = fh.read_raw(0, &mut d[..]);
-                stream.count().await;
+                fh.read_all(0, &mut d[..]).await.unwrap();
             });
         }
     }

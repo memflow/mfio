@@ -1,6 +1,7 @@
 [package]
 name = "mfio-derive"
 version = "0.1.0"
+rust-version = "1.72"
 edition = "2021"
 
 [lib]

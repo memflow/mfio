@@ -1,13 +1,14 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use core::future::poll_fn;
+use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::task::{Context, Poll, Waker};
 
 use mfio::backend::*;
 use mfio::error::Result;
+use mfio::io::*;
 use mfio::mferr;
-use mfio::packet::*;
 
 use mfio::tarc::{Arc, BaseArc};
 use mfio::traits::*;
@@ -26,7 +27,7 @@ use core::pin::Pin;
 use mfio::stdeq::Seekable;
 use std::path::Path;
 
-use std::io::{self /*, Read as _, Write as _*/};
+use std::io::{self /* , Read as _, Write as _ */};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 
@@ -42,38 +43,37 @@ struct FileOperation {
 }
 
 impl FileOperation {
-    fn write_msg<'a>(
+    fn write_msg<Io: PacketIo<Read, NoPos>>(
         self,
-        router: &HeaderRouter<'a, Request, Read>,
-        id: Pin<&PacketId<'a, Read, NoPos>>,
+        router: &HeaderRouter<'_, Request, Read, Io>,
         packet_id: u32,
     ) -> Result<InFlightOpType> {
         let Self { file_id, pos, ty } = self;
-        ty.write_msg(router, id, file_id, pos, packet_id)
+        ty.write_msg(router, file_id, pos, packet_id)
     }
 }
 
 trait IntoOp: PacketPerms {
-    fn into_op(pkt: BoundPacket<'static, Self>) -> OpType;
+    fn into_op(pkt: BoundPacketView<Self>) -> OpType;
 }
 
 impl IntoOp for Read {
-    fn into_op(pkt: BoundPacket<'static, Self>) -> OpType {
+    fn into_op(pkt: BoundPacketView<Self>) -> OpType {
         OpType::Write(pkt)
     }
 }
 
 impl IntoOp for Write {
-    fn into_op(pkt: BoundPacket<'static, Self>) -> OpType {
+    fn into_op(pkt: BoundPacketView<Self>) -> OpType {
         OpType::Read(pkt)
     }
 }
 
-struct ShardedPacket<T: Splittable> {
-    shards: BTreeMap<usize, T>,
+struct ShardedPacket<T: Splittable<u64>> {
+    shards: BTreeMap<u64, T>,
 }
 
-impl<T: Splittable> From<T> for ShardedPacket<T> {
+impl<T: Splittable<u64>> From<T> for ShardedPacket<T> {
     fn from(pkt: T) -> Self {
         Self {
             shards: std::iter::once((0, pkt)).collect(),
@@ -81,13 +81,13 @@ impl<T: Splittable> From<T> for ShardedPacket<T> {
     }
 }
 
-impl<T: Splittable> ShardedPacket<T> {
+impl<T: Splittable<u64>> ShardedPacket<T> {
     fn is_empty(&self) -> bool {
         // TODO: do this or self.len() == 0?
         self.shards.is_empty()
     }
 
-    fn extract(&mut self, idx: usize, len: usize) -> Option<T> {
+    fn extract(&mut self, idx: u64, len: u64) -> Option<T> {
         let (&shard_idx, _) = self.shards.range(..=idx).next_back()?;
         let mut shard = self.shards.remove(&shard_idx)?;
 
@@ -109,27 +109,26 @@ impl<T: Splittable> ShardedPacket<T> {
 
 enum InFlightOpType {
     Reserved,
-    Read(ShardedPacket<BoundPacket<'static, Write>>),
+    Read(ShardedPacket<BoundPacketView<Write>>),
     Write(usize),
 }
 
 enum OpType {
-    Read(BoundPacket<'static, Write>),
-    Write(BoundPacket<'static, Read>),
+    Read(BoundPacketView<Write>),
+    Write(BoundPacketView<Read>),
 }
 
 impl OpType {
-    fn write_msg<'a>(
+    fn write_msg<Io: PacketIo<Read, NoPos>>(
         self,
-        router: &HeaderRouter<'a, Request, Read>,
-        id: Pin<&PacketId<'a, Read, NoPos>>,
+        router: &HeaderRouter<'_, Request, Read, Io>,
         file_id: u32,
         pos: u64,
         packet_id: u32,
     ) -> Result<InFlightOpType> {
         match self {
             Self::Read(v) => {
-                router.send_hdr(id, |_| Request::Read {
+                router.send_hdr(|_| Request::Read {
                     file_id,
                     pos,
                     packet_id: packet_id as _,
@@ -140,7 +139,6 @@ impl OpType {
             Self::Write(v) => {
                 let len = v.len();
                 let key = router.send_pkt(
-                    id,
                     |_| Request::Write {
                         file_id,
                         pos,
@@ -187,6 +185,15 @@ pub struct NetworkFs {
     backend: BackendContainer<DynBackend>,
     cwd: NetworkFsDir,
     fs: Arc<mfio_rt::NativeRt>,
+    cancel_ops_on_drop: bool,
+}
+
+impl Drop for NetworkFs {
+    fn drop(&mut self) {
+        if self.cancel_ops_on_drop {
+            self.fs.cancel_all_ops();
+        }
+    }
 }
 
 impl NetworkFs {
@@ -198,10 +205,23 @@ impl NetworkFs {
                 .build()
                 .unwrap(),
         );
-        Self::with_fs(addr, fs)
+        Self::with_fs(addr, fs, true)
     }
 
-    pub fn with_fs(addr: SocketAddr, fs: Arc<mfio_rt::NativeRt>) -> Result<Self> {
+    /// Create a new network FS to the provided target.
+    ///
+    /// # Arguments
+    ///
+    /// - `addr` address to connect to.
+    /// - `fs` filesystem instance to use.
+    /// - `cancel_ops_on_drop` whether to issue global cancellation to all outstanding operations
+    ///   when drop is called. This is required when using `cfg(mfio_assume_linear_types)` in order
+    ///   to prevent panic upon dropping the network filesystem.
+    pub fn with_fs(
+        addr: SocketAddr,
+        fs: Arc<mfio_rt::NativeRt>,
+        cancel_ops_on_drop: bool,
+    ) -> Result<Self> {
         let stream = TcpStream::connect(addr)?;
 
         let stream = fs.register_stream(stream);
@@ -231,11 +251,7 @@ impl NetworkFs {
                 let state = &state;
                 let stream = &stream;
 
-                let router = HeaderRouter::new();
-                let write_id = stream.new_id().await;
-                // SAFETY: we are pinning immediately after creation - this ID is not moving
-                // anywhere.
-                let write_id = unsafe { Pin::new_unchecked(&write_id) };
+                let router = HeaderRouter::new(stream);
 
                 let results_loop = async {
                     // Parse responses
@@ -267,7 +283,7 @@ impl NetworkFs {
                                 len,
                                 err,
                             } => {
-                                async {
+                                async move {
                                     let pkt = {
                                         let mut state = state.lock();
                                         if let Some(InFlightOpType::Read(shards)) =
@@ -294,32 +310,9 @@ impl NetworkFs {
                                     };
 
                                     if let Some(pkt) = pkt {
-                                        match pkt.try_alloc() {
-                                            Ok(v) => {
-                                                // SAFETY: assume MaybeUninit<u8> is initialized,
-                                                // as God intended :upside_down:
-                                                let buf = unsafe {
-                                                    let buf = v.as_ptr() as *mut u8;
-                                                    core::slice::from_raw_parts_mut(buf, len)
-                                                };
-                                                read_end.read_all(NoPos::new(), buf).await.unwrap();
-                                            }
-                                            Err(v) => {
-                                                // TODO: limit allocation size
-                                                if tmp_buf.capacity() < v.len() {
-                                                    tmp_buf.reserve(v.len() - tmp_buf.len());
-                                                }
-                                                // SAFETY: the data here is unininitialized
-                                                unsafe { tmp_buf.set_len(v.len()) };
-                                                let buf = unsafe {
-                                                    let buf = tmp_buf.as_ptr() as *mut u8;
-                                                    core::slice::from_raw_parts_mut(buf, len)
-                                                };
-                                                read_end.read_all(NoPos::new(), buf).await.unwrap();
-                                                // SAFETY: tmp_buf has enough capacity for the packet
-                                                unsafe { v.transfer_data(tmp_buf.as_ptr().cast()) };
-                                            }
-                                        }
+                                        trace!("Send read {}", pkt.len());
+                                        // FIXME we should wait for this to finish perhaps?
+                                        read_end.send_io(NoPos::new(), pkt);
                                     }
                                 }
                                 .instrument(tracing::span!(
@@ -369,7 +362,7 @@ impl NetworkFs {
                                     req_id,
                                     resp_len
                                 );
-                                async {
+                                tmp_buf = async move {
                                     // TODO: make a wrapper for this...
                                     let resp_len = resp_len as usize;
                                     if tmp_buf.capacity() < resp_len {
@@ -377,16 +370,20 @@ impl NetworkFs {
                                     }
                                     // SAFETY: the data here is unininitialized
                                     unsafe { tmp_buf.set_len(resp_len) };
-                                    let buf = unsafe {
-                                        let buf = tmp_buf.as_ptr() as *mut u8;
-                                        core::slice::from_raw_parts_mut(buf, resp_len)
+
+                                    let tmp_buf = if resp_len > 0 {
+                                        let buf = VecPacket::from(tmp_buf);
+                                        let buf =
+                                            read_end.read_all(NoPos::new(), buf).await.unwrap();
+                                        buf.take()
+                                    } else {
+                                        tmp_buf
                                     };
 
-                                    if resp_len > 0 {
-                                        read_end.read_all(NoPos::new(), &mut *buf).await.unwrap();
-                                    }
-
-                                    let resp: Option<FsResponse> = postcard::from_bytes(buf).ok();
+                                    let resp: Option<FsResponse> = postcard::from_bytes(unsafe {
+                                        &*(&tmp_buf[..] as *const [MaybeUninit<_>] as *const [u8])
+                                    })
+                                    .ok();
 
                                     log::trace!("Fs Response {req_id}: {resp:?}");
 
@@ -403,6 +400,8 @@ impl NetworkFs {
                                             }
                                         }
                                     }
+
+                                    tmp_buf
                                 }
                                 .instrument(fs_span)
                                 .await
@@ -414,7 +413,7 @@ impl NetworkFs {
                                     stream_id,
                                     len,
                                 );
-                                async {
+                                tmp_buf = async move {
                                     let closed = (len & (1 << 31)) != 0;
                                     let len = len & !(1 << 31);
                                     log::trace!("ReadDir resp: {closed} {len}");
@@ -423,16 +422,19 @@ impl NetworkFs {
                                     if tmp_buf.capacity() < len {
                                         tmp_buf.reserve(len - tmp_buf.len());
                                     }
+
                                     // SAFETY: the data here is unininitialized
                                     unsafe { tmp_buf.set_len(len) };
-                                    let buf = unsafe {
-                                        let buf = tmp_buf.as_ptr() as *mut u8;
-                                        core::slice::from_raw_parts_mut(buf, len)
-                                    };
-                                    read_end.read_all(NoPos::new(), &mut *buf).await.unwrap();
 
-                                    let resp: Vec<ReadDirResponse> =
-                                        postcard::from_bytes(buf).unwrap();
+                                    let buf = VecPacket::from(tmp_buf);
+                                    let buf = read_end.read_all(NoPos::new(), buf).await.unwrap();
+                                    let tmp_buf = buf.take();
+
+                                    let resp: Vec<ReadDirResponse> = postcard::from_bytes(unsafe {
+                                        &*(&tmp_buf[..] as *const [MaybeUninit<u8>]
+                                            as *const [u8])
+                                    })
+                                    .unwrap();
 
                                     log::trace!("Resulting: {}", resp.len());
 
@@ -456,6 +458,8 @@ impl NetworkFs {
                                             waker.wake();
                                         }
                                     }
+
+                                    tmp_buf
                                 }
                                 .instrument(fs_span)
                                 .await
@@ -472,7 +476,7 @@ impl NetworkFs {
                         assert!(key <= u32::MAX as usize);
 
                         async {
-                            let op = op.write_msg(&router, write_id, key as u32).unwrap();
+                            let op = op.write_msg(&router, key as u32).unwrap();
 
                             *state.lock().in_flight_ops.get_mut(key).unwrap() = op;
                         }
@@ -493,10 +497,7 @@ impl NetworkFs {
                                 if !req.closed {
                                     let count = req.compute_count();
                                     core::mem::drop(state);
-                                    router.send_hdr(write_id, |_| Request::ReadDir {
-                                        stream_id,
-                                        count,
-                                    });
+                                    router.send_hdr(|_| Request::ReadDir { stream_id, count });
                                 }
                             }
                         }
@@ -528,7 +529,7 @@ impl NetworkFs {
                                                 dir_id: *dir_id,
                                                 req_len: buf.len() as u16,
                                             },
-                                            buf,
+                                            OwnedPacket::from(buf.into_boxed_slice()),
                                         ));
 
                                         *fs_req = FsRequestState::Processing {
@@ -545,7 +546,7 @@ impl NetworkFs {
                             };
 
                             if let Some((header, buf)) = msg {
-                                router.send_bytes(write_id, |_| header, buf.into_boxed_slice());
+                                router.send_bytes(|_| header, buf);
                             }
                         }
                         .instrument(tracing::span!(tracing::Level::TRACE, "open send", req_id))
@@ -558,7 +559,7 @@ impl NetworkFs {
                 let close_loop = async {
                     while let Ok(file_id) = close_reqs_rx.recv_async().await {
                         async {
-                            router.send_hdr(write_id, |_| Request::FileClose { file_id });
+                            router.send_hdr(|_| Request::FileClose { file_id });
                         }
                         .instrument(tracing::span!(tracing::Level::TRACE, "close send", file_id))
                         .await
@@ -567,18 +568,12 @@ impl NetworkFs {
                 .instrument(tracing::span!(tracing::Level::TRACE, "close_loop"))
                 .fuse();
 
-                let process_loop = router
-                    .process_loop(write_id)
-                    .instrument(tracing::span!(tracing::Level::TRACE, "process_loop"))
-                    .fuse();
-
                 let combined = async move {
                     pin_mut!(fs_loop);
                     pin_mut!(read_dir_loop);
                     pin_mut!(close_loop);
                     pin_mut!(ops_loop);
                     pin_mut!(results_loop);
-                    pin_mut!(process_loop);
 
                     futures::select! {
                         _ = fs_loop => log::error!("Fs done"),
@@ -586,7 +581,6 @@ impl NetworkFs {
                         _ = close_loop => log::error!("Close done"),
                         _ = ops_loop => log::error!("Ops done"),
                         _ = results_loop => log::error!("Results done"),
-                        _ = process_loop => log::error!("Process done"),
                     }
                 };
 
@@ -609,6 +603,7 @@ impl NetworkFs {
                 senders: senders.into(),
             },
             backend: BackendContainer::new_dyn(backend),
+            cancel_ops_on_drop,
         })
     }
 }
@@ -824,7 +819,6 @@ impl<'a> Stream for ReadDir<'a> {
 
 macro_rules! fs_op {
     ($fut:ident, $op:ident, $block:expr => $rettype:ty) => {
-
         pub struct $op;
 
         impl FsRequestProc for $op {
@@ -845,11 +839,7 @@ macro_rules! fs_op {
                 req_id: usize,
                 send: Option<SendFut<'a, u32>>,
             ) -> Self::Future<'a> {
-                $fut {
-                    fs,
-                    req_id,
-                    send,
-                }
+                $fut { fs, req_id, send }
             }
         }
 
@@ -888,7 +878,9 @@ macro_rules! fs_op {
                                 // Remove the entry
                                 let resp = state.fs_reqs.remove(this.req_id);
 
-                                let FsRequestState::Complete { resp } = resp else { unreachable!() };
+                                let FsRequestState::Complete { resp } = resp else {
+                                    unreachable!()
+                                };
 
                                 if let Some(resp) = resp {
                                     $op::finish(resp, state, this.fs)
@@ -919,22 +911,10 @@ fs_op!(
         if let FsResponse::OpenFile { file_id } = resp {
             file_id
                 .map(|file_id| {
-                    let write_io = BaseArc::new(IoOpsHandle::new(file_id, dir.senders.clone()));
-                    let read_io = BaseArc::new(IoOpsHandle::new(file_id, dir.senders.clone()));
-
-                    let write_stream = BaseArc::from(PacketStream {
-                        ctx: PacketCtx::new(write_io).into(),
-                    });
-
-                    let read_stream = BaseArc::from(PacketStream {
-                        ctx: PacketCtx::new(read_io).into(),
-                    });
-
                     FileWrapper(IoWrapper {
                         file_id,
                         senders: dir.senders.clone(),
-                        read_stream,
-                        write_stream,
+                        _phantom: PhantomData,
                     })
                     .into()
                 })
@@ -1032,30 +1012,8 @@ fs_op!(
     } => Result<()>
 );
 
-struct IoOpsHandle<Perms: IntoOp> {
-    handle: PacketIoHandle<'static, Perms, u64>,
-    file_id: u32,
-    senders: BaseArc<Senders>,
-}
-
-impl<Perms: IntoOp> IoOpsHandle<Perms> {
-    fn new(file_id: u32, senders: BaseArc<Senders>) -> Self {
-        Self {
-            handle: PacketIoHandle::new::<Self>(),
-            file_id,
-            senders,
-        }
-    }
-}
-
-impl<Perms: IntoOp> AsRef<PacketIoHandle<'static, Perms, u64>> for IoOpsHandle<Perms> {
-    fn as_ref(&self) -> &PacketIoHandle<'static, Perms, u64> {
-        &self.handle
-    }
-}
-
-impl<Perms: IntoOp> PacketIoHandleable<'static, Perms, u64> for IoOpsHandle<Perms> {
-    extern "C" fn send_input(&self, pos: u64, packet: BoundPacket<'static, Perms>) {
+impl<Perms: IntoOp, Param: IoAt> PacketIo<Perms, u64> for IoWrapper<Param> {
+    fn send_io(&self, pos: u64, packet: BoundPacketView<Perms>) {
         let operation = FileOperation {
             file_id: self.file_id,
             pos,
@@ -1070,8 +1028,7 @@ impl<Perms: IntoOp> PacketIoHandleable<'static, Perms, u64> for IoOpsHandle<Perm
 pub struct IoWrapper<Param: IoAt> {
     file_id: u32,
     senders: BaseArc<Senders>,
-    read_stream: BaseArc<PacketStream<'static, Write, Param>>,
-    write_stream: BaseArc<PacketStream<'static, Read, Param>>,
+    _phantom: PhantomData<Param>,
 }
 
 impl<Param: IoAt> Drop for IoWrapper<Param> {
@@ -1080,27 +1037,15 @@ impl<Param: IoAt> Drop for IoWrapper<Param> {
     }
 }
 
-impl<Param: IoAt> PacketIo<Write, Param> for IoWrapper<Param> {
-    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, Write, Param>> {
-        Some(self.read_stream.new_packet_id())
-    }
-}
-
-impl<Param: IoAt> PacketIo<Read, Param> for IoWrapper<Param> {
-    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, Read, Param>> {
-        Some(self.write_stream.new_packet_id())
-    }
-}
-
 impl PacketIo<Read, u64> for FileWrapper {
-    fn try_new_id<'a>(&'a self, w: &mut FastCWaker) -> Option<PacketId<'a, Read, u64>> {
-        self.0.try_new_id(w)
+    fn send_io(&self, param: u64, view: BoundPacketView<Read>) {
+        self.0.send_io(param, view)
     }
 }
 
 impl PacketIo<Write, u64> for FileWrapper {
-    fn try_new_id<'a>(&'a self, cx: &mut FastCWaker) -> Option<PacketId<'a, Write, u64>> {
-        self.0.try_new_id(cx)
+    fn send_io(&self, param: u64, view: BoundPacketView<Write>) {
+        self.0.send_io(param, view)
     }
 }
 

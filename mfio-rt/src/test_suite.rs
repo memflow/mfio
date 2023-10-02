@@ -190,7 +190,18 @@ impl<'a, T: Fs> TestRun<'a, T> {
                 .unwrap();
             let mut buf = vec![];
             fh.read_to_end(0, &mut buf).await.unwrap();
-            assert!(&buf == data, "File {p} does not match!");
+            if &buf != data && buf.len() == data.len() {
+                for (i, (a, b)) in buf.iter().zip(data.iter()).enumerate() {
+                    if a != b {
+                        panic!(
+                            "File {p} does not match at {i}\n{:?}\n{:?}",
+                            &buf[i..(i + 20)],
+                            &data[i..(i + 20)]
+                        );
+                    }
+                }
+            }
+            //assert!(&buf == data, "File {p} does not match! ({:x} vs {:x}) ({:?} {:?})", buf.len(), data.len(), &buf[..128], &data[..128]);
         })
     }
 
@@ -208,7 +219,7 @@ impl<'a, T: Fs> TestRun<'a, T> {
                 .await
                 .unwrap();
 
-            fh.write_all(0, data).await.unwrap();
+            fh.write_all(0, &data[..]).await.unwrap();
             let buf = fs::read(path).unwrap();
             assert!(&buf == data, "File {p} does not match!");
         })
@@ -237,7 +248,7 @@ impl<'a, T: Fs> TestRun<'a, T> {
                 .await
                 .unwrap();
 
-            fh.write_all(0, data).await.unwrap();
+            fh.write_all(0, &data[..]).await.unwrap();
             let buf = fs::read(path).unwrap();
             assert!(&buf == data, "File {p} does not match!");
         })
@@ -299,6 +310,7 @@ impl<'a, T: Fs> TestRun<'a, T> {
 macro_rules! test_suite {
     ($test_ident:ident, $fs_builder:expr) => {
         #[cfg(test)]
+        #[allow(clippy::redundant_closure_call)]
         mod $test_ident {
             use $crate::test_suite::*;
 

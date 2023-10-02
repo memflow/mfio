@@ -41,7 +41,7 @@ fn file_read(c: &mut Criterion) {
     temp_path.push("mfio-bench");
     let temp_path = &temp_path;
 
-    let sizes = [/*16,*/ 64, 256, 1024, 4096, 16384, 65536];
+    let sizes = [/* 16, */ 64, 256, 1024, 4096, 16384, 65536];
 
     let mut rng = rand::thread_rng();
     let mut order = (0..MB).step_by(sizes[0]).collect::<Vec<_>>();

@@ -1,4 +1,4 @@
-use crate::packet::NoPos;
+use crate::io::NoPos;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Waker;
@@ -94,7 +94,8 @@ impl UsizeMath for NoPos {
     }
 }
 
-pub(crate) trait CopyPos: Sized {
+// FIXME: this trait shouldn't be public
+pub trait CopyPos: Sized {
     fn copy_pos(&self) -> Self;
 }
 
@@ -107,17 +108,6 @@ pub(crate) trait PosShift<Io>: CopyPos + UsizeMath {
 impl<Param: Copy> CopyPos for Param {
     fn copy_pos(&self) -> Self {
         *self
-    }
-}
-
-impl<Param: Copy + UsizeMath, Io: crate::stdeq::StreamPos<Param>> PosShift<Io> for Param {
-    fn add_pos(&mut self, out: usize, io: &Io) {
-        self.add_assign(out);
-        io.set_pos(*self);
-    }
-
-    fn add_io_pos(io: &Io, out: usize) {
-        io.update_pos(|pos| pos.add(out))
     }
 }
 

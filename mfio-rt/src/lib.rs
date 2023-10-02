@@ -3,7 +3,7 @@ use core::future::Future;
 use futures::Stream;
 use mfio::backend::*;
 use mfio::error::Result as MfioResult;
-use mfio::packet::NoPos;
+use mfio::io::NoPos;
 use mfio::stdeq::{AsyncRead, AsyncWrite};
 use serde::{Deserialize, Serialize};
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -178,8 +178,8 @@ pub trait DirHandle: Sized {
     ///
     /// ```
     /// # mfio_rt::__doctest::run_each(|fs| async {
-    /// use mfio_rt::{DirHandle, Fs, OpenOptions};
     /// use mfio::traits::IoRead;
+    /// use mfio_rt::{DirHandle, Fs, OpenOptions};
     ///
     /// let dir = fs.current_dir();
     ///
@@ -208,16 +208,13 @@ pub trait DirHandle: Sized {
     ///
     /// ```
     /// # mfio_rt::__doctest::run_each(|fs| async {
-    /// use mfio_rt::{DirHandle, Fs, OpenOptions};
-    /// use mfio::traits::IoRead;
     /// use futures::StreamExt;
+    /// use mfio::traits::IoRead;
+    /// use mfio_rt::{DirHandle, Fs, OpenOptions};
     ///
     /// let dir = fs.current_dir();
     ///
-    /// let subdir = dir
-    ///     .open_dir("src")
-    ///     .await
-    ///     .unwrap();
+    /// let subdir = dir.open_dir("src").await.unwrap();
     ///
     /// assert_ne!(dir.path().await.unwrap(), subdir.path().await.unwrap());
     ///
@@ -250,7 +247,7 @@ pub trait DirHandle: Sized {
 
     /// Do an operation.
     ///
-    /// This function performs an operation from the [`DirOp`](DirOp) enum.
+    /// This function performs an operation from the [`DirOp`] enum.
     ///
     /// # Examples
     ///

@@ -11,7 +11,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use futures::Stream;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
+use slab::Slab;
 
 use std::io;
 #[cfg(all(unix, not(miri)))]
@@ -20,7 +21,7 @@ use std::os::unix::fs::FileExt;
 use std::os::windows::fs::FileExt;
 
 use mfio::backend::*;
-use mfio::packet::*;
+use mfio::io::*;
 use mfio::tarc::BaseArc;
 
 use crate::util::{from_io_error, io_err};
@@ -69,21 +70,65 @@ impl IoHandle for File {
             return file.seek_write(buf, offset);
         }
     }
+
+    #[cfg(all(windows, not(miri)))]
+    fn close(&self) {
+        use std::os::windows::io::AsRawHandle;
+        unsafe {
+            let _ = ::windows::Win32::System::IO::CancelIoEx(
+                ::windows::Win32::Foundation::HANDLE(self.as_raw_handle() as usize as isize),
+                None,
+            );
+        };
+    }
 }
 impl IoHandle for net::TcpStream {
     type Param = NoPos;
 
-    fn read_at(mut stream: &net::TcpStream, buf: &mut [u8], _: NoPos) -> io::Result<usize> {
+    fn read_at(mut stream: &net::TcpStream, mut buf: &mut [u8], _: NoPos) -> io::Result<usize> {
         use std::io::Read;
-        stream.read(buf)
+        let mut total = 0;
+
+        while !buf.is_empty() {
+            let read = stream.read(buf);
+            if let Ok(read) = read {
+                // Special case for eof
+                if read == 0 {
+                    break;
+                }
+                total += read;
+                buf = buf.split_at_mut(read).1;
+            } else if total != 0 {
+                break;
+            } else {
+                return read;
+            }
+        }
+
+        Ok(total)
     }
 
-    fn write_at(mut stream: &net::TcpStream, buf: &[u8], _: NoPos) -> io::Result<usize> {
+    fn write_at(mut stream: &net::TcpStream, mut buf: &[u8], _: NoPos) -> io::Result<usize> {
         use std::io::Write;
-        log::debug!("Write {}", buf.len());
-        let ret = stream.write(buf);
-        log::debug!("Written");
-        ret
+        let mut total = 0;
+
+        while !buf.is_empty() {
+            let written = stream.write(buf);
+            if let Ok(written) = written {
+                // Special case for eof
+                if written == 0 {
+                    break;
+                }
+                total += written;
+                buf = buf.split_at(written).1;
+            } else if total != 0 {
+                break;
+            } else {
+                return written;
+            }
+        }
+
+        Ok(total)
     }
 
     fn close(&self) {
@@ -94,8 +139,6 @@ impl IoHandle for net::TcpStream {
 struct IoInner<Handle: IoHandle> {
     handle: Handle,
     closed: AtomicBool,
-    //read_at: fn(&Handle, &mut [u8], Param) -> io::Result<usize>,
-    //write_at: fn(&Handle, &[u8], Param) -> io::Result<usize>,
 }
 
 impl<Handle: IoHandle> IoInner<Handle> {
@@ -138,39 +181,25 @@ impl From<net::TcpStream> for IoInner<net::TcpStream> {
 }
 
 struct IoThreadHandle<Perms: PacketPerms, Param> {
-    handle: PacketIoHandle<'static, Perms, Param>,
-    tx: Sender<(Param, BoundPacket<'static, Perms>)>,
+    tx: Sender<(Param, BoundPacketView<Perms>)>,
 }
 
 impl<Perms: PacketPerms, Param> IoThreadHandle<Perms, Param> {
-    fn new(tx: Sender<(Param, BoundPacket<'static, Perms>)>) -> Self {
-        Self {
-            handle: PacketIoHandle::new::<Self>(),
-            tx,
-        }
+    fn new(tx: Sender<(Param, BoundPacketView<Perms>)>) -> Self {
+        Self { tx }
     }
 }
 
-impl<Perms: PacketPerms, Param> AsRef<PacketIoHandle<'static, Perms, Param>>
-    for IoThreadHandle<Perms, Param>
-{
-    fn as_ref(&self) -> &PacketIoHandle<'static, Perms, Param> {
-        &self.handle
-    }
-}
-
-impl<Perms: PacketPerms, Param> PacketIoHandleable<'static, Perms, Param>
-    for IoThreadHandle<Perms, Param>
-{
-    extern "C" fn send_input(&self, pos: Param, packet: BoundPacket<'static, Perms>) {
+impl<Perms: PacketPerms, Param> PacketIo<Perms, Param> for IoThreadHandle<Perms, Param> {
+    fn send_io(&self, pos: Param, packet: BoundPacketView<Perms>) {
         self.tx.send((pos, packet)).unwrap();
     }
 }
 
 struct IoWrapper<Handle: IoHandle> {
     file: ManuallyDrop<BaseArc<IoInner<Handle>>>,
-    read_stream: ManuallyDrop<BaseArc<PacketStream<'static, Write, Handle::Param>>>,
-    write_stream: ManuallyDrop<BaseArc<PacketStream<'static, Read, Handle::Param>>>,
+    read_io: ManuallyDrop<BaseArc<IoThreadHandle<Write, Handle::Param>>>,
+    write_io: ManuallyDrop<BaseArc<IoThreadHandle<Read, Handle::Param>>>,
     read_thread: Option<(Receiver<()>, JoinHandle<()>)>,
     write_thread: Option<JoinHandle<()>>,
 }
@@ -182,8 +211,8 @@ impl<Handle: IoHandle> Drop for IoWrapper<Handle> {
     fn drop(&mut self) {
         // SAFETY: we are dropping only here and not accessing the value anywhere else.
         unsafe {
-            ManuallyDrop::drop(&mut self.read_stream);
-            ManuallyDrop::drop(&mut self.write_stream);
+            ManuallyDrop::drop(&mut self.read_io);
+            ManuallyDrop::drop(&mut self.write_io);
         }
 
         self.write_thread.take().unwrap().join().unwrap();
@@ -195,7 +224,7 @@ impl<Handle: IoHandle> Drop for IoWrapper<Handle> {
         }
 
         let (rrx, rjoin) = self.read_thread.take().unwrap();
-        if rrx.recv_timeout(Duration::from_millis(500)).is_ok() {
+        if rrx.recv_timeout(Duration::from_millis(5000000000)).is_ok() {
             rjoin.join().unwrap();
         } else {
             log::error!(
@@ -210,7 +239,9 @@ impl<Handle: IoHandle + Send + Sync + 'static> From<BaseArc<IoInner<Handle>>>
 {
     fn from(file: BaseArc<IoInner<Handle>>) -> Self {
         let (read_tx, read_rx) = mpsc::channel();
-        let read_io = BaseArc::new(IoThreadHandle::<Write, Handle::Param>::new(read_tx));
+        let read_io = ManuallyDrop::new(BaseArc::new(IoThreadHandle::<Write, Handle::Param>::new(
+            read_tx,
+        )));
 
         let (rtx, rrx) = mpsc::channel();
         let read_thread = Some((
@@ -235,8 +266,8 @@ impl<Handle: IoHandle + Send + Sync + 'static> From<BaseArc<IoInner<Handle>>>
                         if !buf.is_empty() {
                             match buf.try_alloc() {
                                 Ok(mut alloced) => match copy_buf(&mut alloced[..]) {
-                                    Ok(read) if read < alloced.len() => {
-                                        let (_, right) = alloced.split_at(read);
+                                    Ok(read) if (read as u64) < alloced.len() => {
+                                        let (_, right) = alloced.split_at(read as _);
                                         right.error(io_err(State::Nop));
                                     }
                                     Err(e) => alloced.error(io_err(e.kind().into())),
@@ -244,21 +275,25 @@ impl<Handle: IoHandle + Send + Sync + 'static> From<BaseArc<IoInner<Handle>>>
                                 },
                                 Err(buf) => {
                                     // TODO: size limit the temp buffer.
-                                    if tmp_buf.len() < buf.len() {
-                                        tmp_buf.reserve(buf.len() - tmp_buf.len());
+                                    if (tmp_buf.len() as u64) < buf.len() {
+                                        tmp_buf.reserve(buf.len() as usize - tmp_buf.len());
                                         // SAFETY: assume MaybeUninit<u8> is initialized,
                                         // as God intended :upside_down:
                                         unsafe { tmp_buf.set_len(tmp_buf.capacity()) }
                                     }
-                                    match copy_buf(&mut tmp_buf[..buf.len()]) {
-                                        Ok(read) if read < buf.len() => {
-                                            let (left, right) = buf.split_at(read);
-                                            unsafe { left.transfer_data(tmp_buf.as_ptr().cast()) };
+                                    match copy_buf(&mut tmp_buf[..(buf.len() as usize)]) {
+                                        Ok(read) if (read as u64) < buf.len() => {
+                                            let (left, right) = buf.split_at(read as u64);
+                                            let _ = unsafe {
+                                                left.transfer_data(tmp_buf.as_ptr().cast())
+                                            };
                                             right.error(io_err(State::Nop));
                                         }
                                         Err(e) => buf.error(io_err(e.kind().into())),
                                         _ => {
-                                            unsafe { buf.transfer_data(tmp_buf.as_ptr().cast()) };
+                                            let _ = unsafe {
+                                                buf.transfer_data(tmp_buf.as_ptr().cast())
+                                            };
                                         }
                                     }
                                 }
@@ -272,7 +307,7 @@ impl<Handle: IoHandle + Send + Sync + 'static> From<BaseArc<IoInner<Handle>>>
         ));
 
         let (write_tx, write_rx) = mpsc::channel();
-        let write_io = BaseArc::new(IoThreadHandle::new(write_tx));
+        let write_io = ManuallyDrop::new(BaseArc::new(IoThreadHandle::new(write_tx)));
 
         let write_thread = Some(thread::spawn({
             let file = file.clone();
@@ -284,8 +319,8 @@ impl<Handle: IoHandle + Send + Sync + 'static> From<BaseArc<IoInner<Handle>>>
                             // For some reason type inference loses itself
                             let alloced: ReadPacketObj = alloced;
                             match file.write_at(&alloced[..], pos) {
-                                Ok(written) if written < alloced.len() => {
-                                    let (_, right) = alloced.split_at(written);
+                                Ok(written) if (written as u64) < alloced.len() => {
+                                    let (_, right) = alloced.split_at(written as u64);
                                     right.error(io_err(State::Nop));
                                 }
                                 Err(e) => alloced.error(io_err(e.kind().into())),
@@ -294,19 +329,19 @@ impl<Handle: IoHandle + Send + Sync + 'static> From<BaseArc<IoInner<Handle>>>
                         }
                         Err(buf) => {
                             // TODO: size limit the temp buffer.
-                            if tmp_buf.len() < buf.len() {
-                                tmp_buf.reserve(tmp_buf.len() - buf.len());
+                            if (tmp_buf.len() as u64) < buf.len() {
+                                tmp_buf.reserve(tmp_buf.len() - buf.len() as usize);
                                 // SAFETY: assume MaybeUninit<u8> is initialized,
                                 // as God intended :upside_down:
-                                unsafe { tmp_buf.set_len(buf.len()) }
+                                unsafe { tmp_buf.set_len(buf.len() as usize) }
                             }
                             let buf = unsafe { buf.transfer_data(tmp_buf.as_mut_ptr().cast()) };
                             let tmp_buf = unsafe {
                                 &*(&tmp_buf[..] as *const [MaybeUninit<u8>] as *const [u8])
                             };
                             match file.write_at(tmp_buf, pos) {
-                                Ok(written) if written < buf.len() => {
-                                    let (_, right) = buf.split_at(written);
+                                Ok(written) if (written as u64) < buf.len() => {
+                                    let (_, right) = buf.split_at(written as u64);
                                     right.error(io_err(State::Nop));
                                 }
                                 Err(e) => buf.error(io_err(e.kind().into())),
@@ -318,69 +353,106 @@ impl<Handle: IoHandle + Send + Sync + 'static> From<BaseArc<IoInner<Handle>>>
             }
         }));
 
-        let write_stream = ManuallyDrop::new(BaseArc::from(PacketStream {
-            ctx: PacketCtx::new(write_io).into(),
-        }));
-
-        let read_stream = ManuallyDrop::new(BaseArc::from(PacketStream {
-            ctx: PacketCtx::new(read_io).into(),
-        }));
-
         Self {
             file: ManuallyDrop::new(file),
             read_thread,
             write_thread,
-            read_stream,
-            write_stream,
+            read_io,
+            write_io,
         }
     }
 }
 
 impl<Handle: IoHandle> PacketIo<Read, Handle::Param> for IoWrapper<Handle> {
-    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, Read, Handle::Param>> {
-        Some(self.write_stream.new_packet_id())
+    fn send_io(&self, param: Handle::Param, view: BoundPacketView<Read>) {
+        self.write_io.send_io(param, view);
     }
 }
 
 impl<Handle: IoHandle> PacketIo<Write, Handle::Param> for IoWrapper<Handle> {
-    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, Write, Handle::Param>> {
-        Some(self.read_stream.new_packet_id())
+    fn send_io(&self, param: Handle::Param, view: BoundPacketView<Write>) {
+        self.read_io.send_io(param, view);
     }
 }
 
 impl PacketIo<Read, u64> for FileWrapper {
-    fn try_new_id<'a>(&'a self, w: &mut FastCWaker) -> Option<PacketId<'a, Read, u64>> {
-        self.0.try_new_id(w)
+    fn send_io(&self, param: u64, view: BoundPacketView<Read>) {
+        let store_guard = self.1.read();
+        if !store_guard.cleared {
+            store_guard.slab.get(self.0).unwrap().send_io(param, view)
+        }
     }
 }
 
 impl PacketIo<Write, u64> for FileWrapper {
-    fn try_new_id<'a>(&'a self, cx: &mut FastCWaker) -> Option<PacketId<'a, Write, u64>> {
-        self.0.try_new_id(cx)
+    fn send_io(&self, param: u64, view: BoundPacketView<Write>) {
+        let store_guard = self.1.read();
+        if !store_guard.cleared {
+            store_guard.slab.get(self.0).unwrap().send_io(param, view)
+        }
     }
 }
 
 impl PacketIo<Read, NoPos> for TcpStream {
-    fn try_new_id<'a>(&'a self, w: &mut FastCWaker) -> Option<PacketId<'a, Read, NoPos>> {
-        self.0.try_new_id(w)
+    fn send_io(&self, param: NoPos, view: BoundPacketView<Read>) {
+        let store_guard = self.1.read();
+        if !store_guard.cleared {
+            store_guard.slab.get(self.0).unwrap().send_io(param, view)
+        }
     }
 }
 
 impl PacketIo<Write, NoPos> for TcpStream {
-    fn try_new_id<'a>(&'a self, cx: &mut FastCWaker) -> Option<PacketId<'a, Write, NoPos>> {
-        self.0.try_new_id(cx)
+    fn send_io(&self, param: NoPos, view: BoundPacketView<Write>) {
+        let store_guard = self.1.read();
+        if !store_guard.cleared {
+            store_guard.slab.get(self.0).unwrap().send_io(param, view)
+        }
     }
 }
 
+struct StoreInner<Handle: IoHandle> {
+    slab: Slab<IoWrapper<Handle>>,
+    cleared: bool,
+}
+
+impl<Handle: IoHandle> StoreInner<Handle> {
+    fn clear(&mut self) {
+        self.slab.clear();
+        self.cleared = true;
+    }
+}
+
+impl<Handle: IoHandle> Default for StoreInner<Handle> {
+    fn default() -> Self {
+        Self {
+            slab: Default::default(),
+            cleared: false,
+        }
+    }
+}
+
+type Store<Handle> = BaseArc<RwLock<StoreInner<Handle>>>;
+
 pub struct Runtime {
     backend: BackendContainer<DynBackend>,
+    file_store: Store<File>,
+    tcp_store: Store<net::TcpStream>,
 }
 
 impl Runtime {
     pub fn try_new() -> Result<Self, std::convert::Infallible> {
         Ok(Self {
             backend: BackendContainer::new_dyn(pending()),
+            file_store: Default::default(),
+            tcp_store: Default::default(),
         })
+    }
+
+    pub fn cancel_all_ops(&self) {
+        // TODO: implement proper cancelling that does not involve invalidating all handles.
+        self.file_store.write().clear();
+        self.tcp_store.write().clear();
     }
 }
 
@@ -396,24 +468,42 @@ impl IoBackend for Runtime {
     }
 }
 
-pub struct FileWrapper(IoWrapper<File>);
-pub struct TcpStream(IoWrapper<net::TcpStream>);
+pub struct FileWrapper(usize, Store<File>);
+pub struct TcpStream(usize, Store<net::TcpStream>);
 
-impl From<net::TcpStream> for TcpStream {
-    fn from(stream: net::TcpStream) -> Self {
-        Self(IoWrapper::from(BaseArc::from(<net::TcpStream as Into<
-            IoInner<_>,
-        >>::into(stream))))
+impl TcpStream {
+    fn new(stream: net::TcpStream, store: Store<net::TcpStream>) -> Self {
+        let mut store_guard = store.write();
+        let key = store_guard
+            .slab
+            .insert(IoWrapper::from(BaseArc::new(IoInner::from(stream))));
+        TcpStream(key, store.clone())
     }
 }
 
 impl TcpStreamHandle for TcpStream {
     fn local_addr(&self) -> mfio::error::Result<SocketAddr> {
-        self.0.file.handle.local_addr().map_err(from_io_error)
+        let store = self.1.read();
+        store
+            .slab
+            .get(self.0)
+            .unwrap()
+            .file
+            .handle
+            .local_addr()
+            .map_err(from_io_error)
     }
 
     fn peer_addr(&self) -> mfio::error::Result<SocketAddr> {
-        self.0.file.handle.local_addr().map_err(from_io_error)
+        let store = self.1.read();
+        store
+            .slab
+            .get(self.0)
+            .unwrap()
+            .file
+            .handle
+            .peer_addr()
+            .map_err(from_io_error)
     }
 }
 
@@ -448,10 +538,11 @@ impl<'a, A> Future for TcpConnectFuture<'a, A> {
 pub struct TcpListener {
     listener: BaseArc<net::TcpListener>,
     rx: flume::r#async::RecvStream<'static, (net::TcpStream, SocketAddr)>,
+    store: Store<net::TcpStream>,
 }
 
-impl From<net::TcpListener> for TcpListener {
-    fn from(listener: net::TcpListener) -> Self {
+impl TcpListener {
+    fn new(listener: net::TcpListener, store: Store<net::TcpStream>) -> Self {
         let (tx, rx) = flume::bounded(16);
         let listener = BaseArc::from(listener);
         let rx = rx.into_stream();
@@ -471,7 +562,11 @@ impl From<net::TcpListener> for TcpListener {
             }
         });
 
-        Self { listener, rx }
+        Self {
+            listener,
+            rx,
+            store,
+        }
     }
 }
 
@@ -487,10 +582,13 @@ impl Stream for TcpListener {
     type Item = (TcpStream, SocketAddr);
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let this = unsafe { self.map_unchecked_mut(|v| &mut v.rx) };
+        let this = unsafe { self.get_unchecked_mut() };
+        let rx = unsafe { Pin::new_unchecked(&mut this.rx) };
 
-        match this.poll_next(cx) {
-            Poll::Ready(v) => Poll::Ready(v.map(|(v, a)| (TcpStream::from(v), a))),
+        match rx.poll_next(cx) {
+            Poll::Ready(v) => {
+                Poll::Ready(v.map(|(v, a)| (TcpStream::new(v, this.store.clone()), a)))
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -498,15 +596,19 @@ impl Stream for TcpListener {
 
 impl Runtime {
     pub fn register_file(&self, file: File) -> FileWrapper {
-        FileWrapper(IoWrapper::from(BaseArc::from(IoInner::from(file))))
+        let mut store_guard = self.file_store.write();
+        let key = store_guard
+            .slab
+            .insert(IoWrapper::from(BaseArc::new(IoInner::from(file))));
+        FileWrapper(key, self.file_store.clone())
     }
 
     pub fn register_stream(&self, stream: net::TcpStream) -> TcpStream {
-        stream.into()
+        TcpStream::new(stream, self.tcp_store.clone())
     }
 
     pub fn register_listener(&self, listener: net::TcpListener) -> TcpListener {
-        TcpListener::from(listener)
+        TcpListener::new(listener, self.tcp_store.clone())
     }
 
     pub fn tcp_connect<'a, A: ToSocketAddrs + Send + 'a>(

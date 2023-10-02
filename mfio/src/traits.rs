@@ -1,39 +1,40 @@
-use crate::packet::*;
+use crate::io::*;
 
 use crate::backend::IoBackend;
 use crate::error::Error;
 use crate::util::{CopyPos, UsizeMath};
 use bytemuck::Pod;
-use cglue::prelude::v1::*;
 use core::future::Future;
-use core::mem::ManuallyDrop;
 use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use futures::Stream;
 
 pub trait IoRead<Pos: 'static>: PacketIo<Write, Pos> {
-    fn read_raw<'a>(
+    fn read_raw<'a, T: PacketStore<'a, Write>>(
         &'a self,
         pos: Pos,
-        packet: impl Into<Packet<'a, Write>>,
-    ) -> IoFut<'a, Self, Write, Pos> {
+        packet: T,
+    ) -> IoFut<'a, Self, Write, Pos, T> {
         self.io(pos, packet)
     }
 
-    fn read_all<'a>(
+    fn read_all<'a, T: IntoPacket<'a, Write>>(
         &'a self,
         pos: Pos,
-        packet: impl Into<Packet<'a, Write>>,
-    ) -> IoFullFut<'a, Self, Write, Pos> {
-        IoFullFut::NewId(pos, packet.into(), self.new_id())
+        packet: T,
+    ) -> IoFullFut<'a, Self, Write, Pos, T> {
+        let (packet, sync) = packet.into_packet();
+        IoFullFut {
+            fut: self.io(pos, packet),
+            sync: Some(sync),
+        }
     }
 
     fn read_into<'a, T: Pod>(
         &'a self,
         pos: Pos,
         data: &'a mut MaybeUninit<T>,
-    ) -> IoFullFut<'a, Self, Write, Pos> {
+    ) -> IoFullFut<'a, Self, Write, Pos, &'a mut [MaybeUninit<u8>]> {
         let buf = unsafe {
             core::slice::from_raw_parts_mut(
                 data as *mut MaybeUninit<T> as *mut MaybeUninit<u8>,
@@ -43,21 +44,40 @@ pub trait IoRead<Pos: 'static>: PacketIo<Write, Pos> {
         self.read_all(pos, buf)
     }
 
-    /// # Notes
-    ///
-    /// This function may break rust stacked borrows rules. If you wish to not do that, please use
-    /// [`read_into`](Self::read_into) function.
-    ///
-    /// This may be fixed once const generics are able to instantiate `[u8; mem::size_of::<T>()]`.
     fn read<T: Pod>(&self, pos: Pos) -> IoReadFut<Self, Pos, T> {
-        IoReadFut::NewId(pos, self.new_id())
+        let pkt = FullPacket::<_, Write>::new_uninit();
+        IoReadFut(self.io(pos, pkt))
     }
 
-    fn read_to_end<'a>(&'a self, pos: Pos, buf: &'a mut Vec<u8>) -> ReadToEndFut<'a, Self, Pos> {
+    fn read_to_end<'a>(&'a self, pos: Pos, buf: &'a mut Vec<u8>) -> ReadToEndFut<'a, Self, Pos>
+    where
+        Pos: CopyPos,
+    {
+        let start_len = buf.len();
+        let start_cap = buf.capacity();
+
+        // Reserve enough for 32 bytes of data initially
+        if start_cap - start_len < 32 {
+            buf.reserve(32 - (start_cap - start_len));
+        }
+
+        // Issue a read
+        let data = buf.as_mut_ptr() as *mut MaybeUninit<u8>;
+        // SAFETY: the data here is uninitialized, and we are getting exclusive access
+        // to it.
+        let data = unsafe {
+            core::slice::from_raw_parts_mut(data.add(start_len), buf.capacity() - start_len)
+        };
+
+        let fut = Some(data.into_packet()).map(|(pkt, sync)| (self.io(pos.copy_pos(), pkt), sync));
+
         ReadToEndFut {
+            io: self,
             pos,
             buf,
-            state: ReadToEndFutState::NewId(self.new_id()),
+            fut,
+            start_len,
+            start_cap,
         }
     }
 }
@@ -65,23 +85,27 @@ pub trait IoRead<Pos: 'static>: PacketIo<Write, Pos> {
 impl<Pos: 'static, T> IoRead<Pos> for T where T: PacketIo<Write, Pos> {}
 
 pub trait IoWrite<Pos>: PacketIo<Read, Pos> {
-    fn write_raw<'a>(
+    fn write_raw<'a, T: PacketStore<'a, Read>>(
         &'a self,
         pos: Pos,
-        packet: impl Into<Packet<'a, Read>>,
-    ) -> IoFut<'a, Self, Read, Pos> {
+        packet: T,
+    ) -> IoFut<'a, Self, Read, Pos, T> {
         self.io(pos, packet)
     }
 
-    fn write_all<'a>(
+    fn write_all<'a, T: IntoPacket<'a, Read>>(
         &'a self,
         pos: Pos,
-        packet: impl Into<Packet<'a, Read>>,
-    ) -> IoFullFut<'a, Self, Read, Pos> {
-        IoFullFut::NewId(pos, packet.into(), self.new_id())
+        packet: T,
+    ) -> IoFullFut<'a, Self, Read, Pos, T> {
+        let (packet, sync) = packet.into_packet();
+        IoFullFut {
+            fut: self.io(pos, packet),
+            sync: Some(sync),
+        }
     }
 
-    fn write<'a, T>(&'a self, pos: Pos, data: &'a T) -> IoFullFut<'a, Self, Read, Pos> {
+    fn write<'a, T>(&'a self, pos: Pos, data: &'a T) -> IoFullFut<'a, Self, Read, Pos, &'a [u8]> {
         let buf = unsafe {
             core::slice::from_raw_parts(data as *const T as *const u8, core::mem::size_of::<T>())
         };
@@ -91,106 +115,90 @@ pub trait IoWrite<Pos>: PacketIo<Read, Pos> {
 
 impl<Pos: 'static, T> IoWrite<Pos> for T where T: PacketIo<Read, Pos> {}
 
-pub enum IoFullFut<'a, Io: PacketIo<Perms, Param>, Perms: PacketPerms, Param: 'a> {
-    NewId(Param, Packet<'a, Perms>, NewIdFut<'a, Io, Perms, Param>),
-    Read(
-        Option<Error>,
-        ManuallyDrop<<NewIdFut<'a, Io, Perms, Param> as Future>::Output>,
-    ),
-    Finished,
+pub struct IoFullFut<
+    'a,
+    Io: PacketIo<Perms, Param>,
+    Perms: PacketPerms,
+    Param: 'a,
+    Obj: IntoPacket<'a, Perms>,
+> {
+    fut: IoFut<'a, Io, Perms, Param, Obj::Target>,
+    sync: Option<Obj::SyncHandle>,
 }
 
-impl<'a, Io: PacketIo<Perms, Param>, Perms: PacketPerms, Param> Future
-    for IoFullFut<'a, Io, Perms, Param>
+impl<'a, Io: PacketIo<Perms, Param>, Perms: PacketPerms, Param, Obj: IntoPacket<'a, Perms>> Future
+    for IoFullFut<'a, Io, Perms, Param, Obj>
 {
-    type Output = Result<(), Error>;
+    type Output = Result<<Obj::Target as OpaqueStore>::StackReq<'a>, Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        loop {
-            match this {
-                Self::NewId(_, _, alloc) => {
-                    let alloc = unsafe { Pin::new_unchecked(alloc) };
+        let fut = unsafe { Pin::new_unchecked(&mut this.fut) };
 
-                    if let Poll::Ready(id) = alloc.poll(cx) {
-                        let prev =
-                            core::mem::replace(this, Self::Read(None, ManuallyDrop::new(id)));
-                        match (prev, &mut *this) {
-                            (Self::NewId(param, packet, _), Self::Read(_, id)) => {
-                                unsafe { Pin::new_unchecked(&**id) }.send_io(param, packet)
-                            }
-                            _ => unreachable!(),
-                        }
-                        // Poll again to force processing of the stream
-                        continue;
-                    } else {
-                        break Poll::Pending;
-                    }
-                }
-                Self::Read(err, id) => match unsafe { Pin::new_unchecked(&mut **id) }.poll_next(cx)
-                {
-                    Poll::Ready(None) => {
-                        let err = err.take();
-                        unsafe { ManuallyDrop::drop(id) };
-                        *this = Self::Finished;
-                        break Poll::Ready(err.map(Err).unwrap_or(Ok(())));
-                    }
-                    Poll::Ready(Some((_, nerr))) => {
-                        if let Some(nerr) = nerr {
-                            *err = Some(nerr);
-                        }
-                        continue;
-                    }
-                    _ => break Poll::Pending,
-                },
-                Self::Finished => unreachable!(),
-            }
-        }
+        fut.poll(cx).map(|pkt| {
+            let hdr = <<Obj as IntoPacket<'a, Perms>>::Target as OpaqueStore>::stack_hdr(&pkt);
+            // TODO: put this after error checking
+            Obj::sync_back(hdr, this.sync.take().unwrap());
+            hdr.err_on_zero().map(|_| pkt)
+        })
     }
 }
 
+type UninitSlice<'a> = &'a mut [MaybeUninit<u8>];
+
+#[allow(clippy::type_complexity)]
 pub struct ReadToEndFut<'a, Io: PacketIo<Write, Param>, Param> {
+    io: &'a Io,
     pos: Param,
     buf: &'a mut Vec<u8>,
-    state: ReadToEndFutState<'a, Io, Param>,
-}
-
-pub enum ReadToEndFutState<'a, Io: PacketIo<Write, Param>, Param: 'a> {
-    NewId(NewIdFut<'a, Io, Write, Param>),
-    // TODO: change this to a struct
-    Read(
-        usize,
-        usize,
-        Option<usize>,
-        usize,
-        Option<Error>,
-        ManuallyDrop<<NewIdFut<'a, Io, Write, Param> as Future>::Output>,
-    ),
-    Finished,
+    fut: Option<(
+        IoFut<'a, Io, Write, Param, <UninitSlice<'a> as IntoPacket<'a, Write>>::Target>,
+        <UninitSlice<'a> as IntoPacket<'a, Write>>::SyncHandle,
+    )>,
+    start_len: usize,
+    start_cap: usize,
 }
 
 impl<'a, Io: PacketIo<Write, Param>, Param: CopyPos + UsizeMath> Future
     for ReadToEndFut<'a, Io, Param>
 {
-    type Output = Option<usize>;
+    type Output = Result<usize, Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
         loop {
-            match &mut this.state {
-                ReadToEndFutState::NewId(alloc) => {
-                    let alloc = unsafe { Pin::new_unchecked(alloc) };
+            let (fut, _) = this.fut.as_mut().expect("Poll called in invalid state");
+            let fut = unsafe { Pin::new_unchecked(fut) };
 
-                    if let Poll::Ready(stream) = alloc.poll(cx) {
-                        let start_len = this.buf.len();
-                        let start_cap = this.buf.capacity();
+            match fut.poll(cx) {
+                Poll::Ready(pkt) => {
+                    // TODO: check into safety of this. We are technically unpinning a previously
+                    // pinned object.
+                    let (_, sync) = this.fut.take().unwrap();
 
-                        // Reserve enough for 32 bytes of data initially
-                        if start_cap - start_len < 32 {
-                            this.buf.reserve(32 - (start_cap - start_len));
-                        }
+                    let hdr = <<UninitSlice<'a> as IntoPacket<'a, Write>>::Target as OpaqueStore>::stack_hdr(&pkt);
+                    let len = Write::len(hdr);
+                    let clamp = hdr.error_clamp();
+
+                    <UninitSlice<'a> as IntoPacket<'a, Write>>::sync_back(hdr, sync);
+                    // SAFETY: all these bytes have been successfully read
+                    unsafe {
+                        this.buf
+                            .set_len(this.buf.len() + core::cmp::min(clamp, len) as usize)
+                    };
+
+                    // We reached the end
+                    if clamp < len || clamp == 0 {
+                        let total_len = this.buf.len() - this.start_len;
+                        // TODO: figure out how to extract error on 0 read
+                        break Poll::Ready(Ok(total_len));
+                    } else {
+                        // Double read size, but cap it to 2MB
+                        let reserve_len =
+                            core::cmp::min(this.buf.capacity() - this.start_cap, 0x20000);
+                        this.buf.reserve(reserve_len);
 
                         // Issue a read
                         let data = this.buf.as_mut_ptr() as *mut MaybeUninit<u8>;
@@ -198,202 +206,60 @@ impl<'a, Io: PacketIo<Write, Param>, Param: CopyPos + UsizeMath> Future
                         // to it.
                         let data = unsafe {
                             core::slice::from_raw_parts_mut(
-                                data.add(start_len),
-                                this.buf.capacity() - start_len,
+                                data.add(this.buf.len()),
+                                this.buf.capacity() - this.buf.len(),
                             )
                         };
-                        this.state = ReadToEndFutState::Read(
-                            start_len,
-                            start_cap,
-                            None,
-                            0,
-                            None,
-                            ManuallyDrop::new(stream),
-                        );
 
-                        match &mut this.state {
-                            ReadToEndFutState::Read(_, _, _, _, _, stream) => {
-                                unsafe { Pin::new_unchecked(&**stream) }
-                                    .send_io(this.pos.copy_pos(), data);
-                            }
-                            _ => unreachable!(),
-                        }
-                    } else {
-                        break Poll::Pending;
+                        this.fut = Some(data.into_packet()).map(|(pkt, sync)| {
+                            (
+                                this.io.io(
+                                    this.pos.copy_pos().add(this.buf.len() - this.start_len),
+                                    pkt,
+                                ),
+                                sync,
+                            )
+                        });
                     }
                 }
-                ReadToEndFutState::Read(
-                    start_len,
-                    start_cap,
-                    final_cap,
-                    max_cap,
-                    error,
-                    stream,
-                ) => {
-                    match unsafe { Pin::new_unchecked(&mut **stream) }.poll_next(cx) {
-                        Poll::Ready(Some((pkt, err))) => {
-                            // We failed, thus cap the buffer length, complete queued I/O, but do not
-                            // perform any further reads.
-                            if err.is_some() {
-                                let new_end = pkt.start() + (this.buf.len() - *start_len);
-                                let end = final_cap.get_or_insert(new_end);
-                                *error = err;
-                                *end = core::cmp::min(*end, new_end);
-                            } else {
-                                let new_end = pkt.end() + (this.buf.len() - *start_len);
-                                *max_cap = core::cmp::max(*max_cap, new_end);
-                            }
-                        }
-                        Poll::Ready(None) => {
-                            // If we got no successful output, cap the capacity to 0
-                            // so that we don't end up in a deadlock if the backend does no I/O
-                            // processing.
-                            if *max_cap == 0 {
-                                *final_cap = Some(0);
-                            }
-                            // If we read all bytes successfully, grow the buffer and keep going.
-                            // Otherwise, return finished state.
-                            match final_cap {
-                                Some(cap) => {
-                                    let cap = core::cmp::min(cap, max_cap);
-                                    unsafe { ManuallyDrop::drop(stream) };
-                                    // SAFETY: these bytes have been successfully read
-                                    unsafe { this.buf.set_len(*start_len + *cap) };
-                                    this.pos.add_assign(this.buf.len() - *start_len);
-                                    if error.is_some() && *cap == 0 {
-                                        break Poll::Ready(None);
-                                    } else {
-                                        break Poll::Ready(Some(*cap));
-                                    }
-                                }
-                                _ => {
-                                    // SAFETY: all these bytes have been successfully read
-                                    unsafe { this.buf.set_len(this.buf.capacity()) };
-
-                                    // Double read size, but cap it to 2MB
-                                    let reserve_len =
-                                        core::cmp::min(this.buf.capacity() - *start_cap, 0x20000);
-                                    this.buf.reserve(reserve_len);
-
-                                    // Issue a read
-                                    let data = this.buf.as_mut_ptr() as *mut MaybeUninit<u8>;
-                                    // SAFETY: the data here is uninitialized, and we are getting exclusive access
-                                    // to it.
-                                    let data = unsafe {
-                                        core::slice::from_raw_parts_mut(
-                                            data.add(this.buf.len()),
-                                            this.buf.capacity() - this.buf.len(),
-                                        )
-                                    };
-
-                                    unsafe { Pin::new_unchecked(&**stream) }
-                                        .send_io(this.pos.copy_pos().add(this.buf.len()), data);
-                                }
-                            }
-                        }
-                        _ => break Poll::Pending,
-                    }
-                }
-                ReadToEndFutState::Finished => unreachable!(),
+                Poll::Pending => break Poll::Pending,
             }
         }
     }
 }
 
-pub enum IoReadFut<'a, Io: PacketIo<Write, Param>, Param: 'a, T> {
-    NewId(Param, NewIdFut<'a, Io, Write, Param>),
-    Read(
-        MaybeUninit<T>,
-        Option<Error>,
-        ManuallyDrop<<NewIdFut<'a, Io, Write, Param> as Future>::Output>,
-    ),
-    Finished,
-}
+pub struct IoReadFut<'a, Io: PacketIo<Write, Param>, Param: 'a, T: 'static>(
+    IoFut<'a, Io, Write, Param, FullPacket<MaybeUninit<T>, Write>>,
+);
 
-impl<'a, Io: PacketIo<Write, Param>, Param, T> Future for IoReadFut<'a, Io, Param, T> {
+impl<'a, Io: PacketIo<Write, Param>, Param, T: 'a> Future for IoReadFut<'a, Io, Param, T> {
     type Output = Result<T, Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        let f = move || {
-            let this = unsafe { self.get_unchecked_mut() };
+        let this = unsafe { self.get_unchecked_mut() };
 
-            loop {
-                match this {
-                    Self::NewId(_, alloc) => {
-                        let alloc = unsafe { Pin::new_unchecked(alloc) };
+        let fut = unsafe { Pin::new_unchecked(&mut this.0) };
 
-                        if let Poll::Ready(stream) = alloc.poll(cx) {
-                            let prev = core::mem::replace(
-                                this,
-                                Self::Read(MaybeUninit::uninit(), None, ManuallyDrop::new(stream)),
-                            );
-                            match (prev, &mut *this) {
-                                (Self::NewId(param, _), Self::Read(data, _, stream)) => {
-                                    //let data = data.get_mut();
-                                    let buf = unsafe {
-                                        core::slice::from_raw_parts_mut(
-                                            data as *mut MaybeUninit<_> as *mut MaybeUninit<u8>,
-                                            core::mem::size_of::<T>(),
-                                        )
-                                    };
-                                    unsafe { Pin::new_unchecked(&**stream) }.send_io(param, buf)
-                                }
-                                _ => unreachable!(),
-                            }
-                            // Poll again to force processing of the stream
-                            continue;
-                        } else {
-                            break Poll::Pending;
-                        }
-                    }
-                    Self::Read(_, err, stream) => {
-                        match unsafe { Pin::new_unchecked(&mut **stream) }.poll_next(cx) {
-                            Poll::Ready(None) => {
-                                unsafe { ManuallyDrop::drop(stream) };
-                                let prev = core::mem::replace(this, Self::Finished);
-
-                                match prev {
-                                    Self::Read(data, err, _) => {
-                                        break Poll::Ready(err.map(Err).unwrap_or_else(|| {
-                                            Ok(unsafe {
-                                                data /*.into_inner()*/
-                                                    .assume_init()
-                                            })
-                                        }));
-                                    }
-                                    _ => unreachable!(),
-                                }
-                            }
-                            Poll::Ready(Some((_, Some(e)))) => {
-                                // TODO: what do we do here
-                                *err = Some(e);
-                                continue;
-                            }
-                            Poll::Ready(_) => {
-                                continue;
-                            }
-                            _ => break Poll::Pending,
-                        }
-                    }
-                    Self::Finished => unreachable!(),
-                }
-            }
-        };
-        f()
+        fut.poll(cx).map(|pkt| {
+            pkt.err_on_zero()
+                .map(|_| unsafe { core::ptr::read(pkt.simple_data_ptr().cast::<T>()) })
+        })
     }
 }
 
 pub mod sync {
     use super::*;
 
-    #[cglue_trait]
+    // TODO: figure out how to expose these over cglue
+
     pub trait SyncIoRead<Pos: 'static>: IoRead<Pos> + IoBackend {
         fn read_all<'a>(
             &'a self,
             pos: Pos,
-            packet: impl Into<Packet<'a, Write>>,
+            packet: impl IntoPacket<'a, Write>,
         ) -> Result<(), Error> {
             self.block_on(IoRead::read_all(self, pos, packet))
+                .map(|_| ())
         }
 
         fn read_into<'a, T: Pod>(
@@ -402,33 +268,34 @@ pub mod sync {
             data: &'a mut MaybeUninit<T>,
         ) -> Result<(), Error> {
             self.block_on(IoRead::read_into(self, pos, data))
+                .map(|_| ())
         }
 
         fn read<T: Pod>(&self, pos: Pos) -> Result<T, Error> {
             self.block_on(IoRead::read(self, pos))
         }
 
-        #[skip_func]
         fn read_to_end<'a>(&'a self, pos: Pos, buf: &'a mut Vec<u8>) -> Option<usize>
         where
             ReadToEndFut<'a, Self, Pos>: Future<Output = Option<usize>>,
+            Pos: CopyPos,
         {
             self.block_on(IoRead::read_to_end(self, pos, buf))
         }
     }
 
-    #[cglue_trait]
     pub trait SyncIoWrite<Pos: 'static>: IoWrite<Pos> + IoBackend {
         fn write_all<'a>(
             &'a self,
             pos: Pos,
-            packet: impl Into<Packet<'a, Read>>,
+            packet: impl IntoPacket<'a, Read>,
         ) -> Result<(), Error> {
             self.block_on(IoWrite::write_all(self, pos, packet))
+                .map(|_| ())
         }
 
         fn write<'a, T>(&'a self, pos: Pos, data: &'a T) -> Result<(), Error> {
-            self.block_on(IoWrite::write(self, pos, data))
+            self.block_on(IoWrite::write(self, pos, data)).map(|_| ())
         }
     }
 }

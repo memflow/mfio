@@ -1,6 +1,6 @@
 use mfio::backend::*;
 use mfio::error::{Error, Location, State, Subject, INTERNAL_ERROR};
-use mfio::packet::*;
+use mfio::io::*;
 use mfio::util::*;
 
 use mfio_derive::*;
@@ -10,32 +10,24 @@ use tarc::{Arc, BaseArc};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 
-type Address = usize;
+type Address = u64;
 
 struct IoThreadHandle<Perms: PacketPerms> {
-    handle: PacketIoHandle<'static, Perms, Address>,
-    input: Mutex<VecDeque<(usize, BoundPacket<'static, Perms>)>>,
+    input: Mutex<VecDeque<(Address, BoundPacketView<Perms>)>>,
     event: Arc<Event>,
 }
 
 impl<Perms: PacketPerms> Default for IoThreadHandle<Perms> {
     fn default() -> Self {
         Self {
-            handle: PacketIoHandle::new::<Self>(),
             input: Default::default(),
             event: Default::default(),
         }
     }
 }
 
-impl<Perms: PacketPerms> AsRef<PacketIoHandle<'static, Perms, Address>> for IoThreadHandle<Perms> {
-    fn as_ref(&self) -> &PacketIoHandle<'static, Perms, Address> {
-        &self.handle
-    }
-}
-
-impl<Perms: PacketPerms> PacketIoHandleable<'static, Perms, Address> for IoThreadHandle<Perms> {
-    extern "C" fn send_input(&self, address: usize, packet: BoundPacket<'static, Perms>) {
+impl<Perms: PacketPerms> PacketIo<Perms, Address> for IoThreadHandle<Perms> {
+    fn send_io(&self, address: Address, packet: BoundPacketView<Perms>) {
         let mut input = self.input.lock();
         input.push_back((address, packet));
         self.event.signal();
@@ -44,11 +36,11 @@ impl<Perms: PacketPerms> PacketIoHandleable<'static, Perms, Address> for IoThrea
 
 struct VolatileMem {
     buf: *mut u8,
-    len: usize,
+    len: u64,
 }
 
 impl VolatileMem {
-    fn read(&self, pos: usize, dest: BoundPacket<'static, Write>) {
+    fn read(&self, pos: u64, dest: BoundPacketView<Write>) {
         if pos >= self.len {
             dest.error(Error {
                 code: INTERNAL_ERROR,
@@ -59,7 +51,6 @@ impl VolatileMem {
             return;
         }
         let dest = if pos > self.len - dest.len() {
-            println!("{pos} {} {}", self.len, dest.len());
             let (a, b) = dest.split_at(self.len - pos);
             b.error(Error {
                 code: INTERNAL_ERROR,
@@ -72,12 +63,11 @@ impl VolatileMem {
             dest
         };
         unsafe {
-            dest.transfer_data(self.buf.add(pos).cast());
+            let _ = dest.transfer_data(self.buf.add(pos as usize).cast());
         }
     }
 
-    fn write(&self, pos: usize, src: BoundPacket<'static, Read>) {
-        println!("{pos} {} {} {:?}", src.len(), self.len, self.buf);
+    fn write(&self, pos: u64, src: BoundPacketView<Read>) {
         if pos >= self.len {
             src.error(Error {
                 code: INTERNAL_ERROR,
@@ -100,14 +90,14 @@ impl VolatileMem {
             src
         };
         unsafe {
-            src.transfer_data(self.buf.add(pos).cast());
+            let _ = src.transfer_data(self.buf.add(pos as usize).cast());
         }
     }
 }
 
 impl From<Vec<u8>> for VolatileMem {
     fn from(buf: Vec<u8>) -> Self {
-        let len = buf.len();
+        let len = buf.len() as u64;
 
         let buf = Box::leak(buf.into_boxed_slice());
 
@@ -123,14 +113,14 @@ unsafe impl Sync for VolatileMem {}
 impl Drop for VolatileMem {
     fn drop(&mut self) {
         unsafe {
-            let _ = Box::from_raw(core::slice::from_raw_parts_mut(self.buf, self.len));
+            let _ = Box::from_raw(core::slice::from_raw_parts_mut(self.buf, self.len as usize));
         }
     }
 }
 
 pub struct IoThreadState {
-    read_stream: BaseArc<PacketStream<'static, Write, Address>>,
-    write_stream: BaseArc<PacketStream<'static, Read, Address>>,
+    read_io: BaseArc<IoThreadHandle<Write>>,
+    write_io: BaseArc<IoThreadHandle<Read>>,
     backend: BackendContainer<DynBackend>,
 }
 
@@ -145,7 +135,7 @@ impl IoThreadState {
 
             async move {
                 loop {
-                    let proc_inp = |(addr, buf): (usize, BoundPacket<'static, Write>)| {
+                    let proc_inp = |(addr, buf): (Address, BoundPacketView<Write>)| {
                         mem.read(addr, buf);
                     };
 
@@ -169,7 +159,7 @@ impl IoThreadState {
 
             async move {
                 loop {
-                    let proc_inp = |(pos, buf): (usize, BoundPacket<'static, Read>)| {
+                    let proc_inp = |(pos, buf): (Address, BoundPacketView<Read>)| {
                         mem.write(pos, buf);
                     };
 
@@ -193,17 +183,9 @@ impl IoThreadState {
 
         let backend = BackendContainer::new_dyn(future);
 
-        let write_stream = BaseArc::from(PacketStream {
-            ctx: PacketCtx::new(write_io).into(),
-        });
-
-        let read_stream = BaseArc::from(PacketStream {
-            ctx: PacketCtx::new(read_io).into(),
-        });
-
         Self {
-            write_stream,
-            read_stream,
+            read_io,
+            write_io,
             backend,
         }
     }
@@ -241,14 +223,14 @@ impl SampleIo {
 }
 
 impl PacketIo<Read, Address> for SampleIo {
-    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, Read, Address>> {
-        Some(self.thread_state.write_stream.new_packet_id())
+    fn send_io(&self, param: Address, view: BoundPacketView<Read>) {
+        self.thread_state.write_io.send_io(param, view)
     }
 }
 
 impl PacketIo<Write, Address> for SampleIo {
-    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, Write, Address>> {
-        Some(self.thread_state.read_stream.new_packet_id())
+    fn send_io(&self, param: Address, view: BoundPacketView<Write>) {
+        self.thread_state.read_io.send_io(param, view)
     }
 }
 

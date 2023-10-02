@@ -1,6 +1,8 @@
 #[cfg(unix)]
 mod unix_extra;
 
+pub(crate) mod deferred;
+
 pub mod thread;
 
 #[cfg(all(not(miri), target_os = "linux", feature = "io-uring"))]

@@ -1,15 +1,12 @@
 //! `std::io` equivalent Read/Write traits.
 
 use crate as mfio;
-use crate::packet::*;
+use crate::io::*;
 use crate::traits::*;
-use crate::util::PosShift;
-use cglue::task::FastCWaker;
+use crate::util::{PosShift, UsizeMath};
 use core::future::Future;
-use core::marker::PhantomData;
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use futures::Stream;
 use mfio_derive::*;
 use parking_lot::Mutex;
 use std::io;
@@ -26,19 +23,31 @@ pub trait StreamPos<Param> {
     }
 }
 
+impl<Param: Copy + UsizeMath, Io: StreamPos<Param>> PosShift<Io> for Param {
+    fn add_pos(&mut self, out: usize, io: &Io) {
+        self.add_assign(out);
+        io.set_pos(*self);
+    }
+
+    fn add_io_pos(io: &Io, out: usize) {
+        io.update_pos(|pos| pos.add(out))
+    }
+}
+
 pub trait AsyncRead<Param: 'static>: IoRead<Param> {
-    fn read<'a>(&'a self, buf: &'a mut [u8]) -> AsyncIoFut<'a, Self, Write, Param>;
+    fn read<'a>(&'a self, buf: &'a mut [u8]) -> AsyncIoFut<'a, Self, Write, Param, &'a mut [u8]>;
     fn read_to_end<'a>(&'a self, buf: &'a mut Vec<u8>) -> StdReadToEndFut<'a, Self, Param>;
 }
 
 impl<T: IoRead<Param> + StreamPos<Param>, Param: 'static + Copy> AsyncRead<Param> for T {
-    fn read<'a>(&'a self, buf: &'a mut [u8]) -> AsyncIoFut<'a, Self, Write, Param> {
+    fn read<'a>(&'a self, buf: &'a mut [u8]) -> AsyncIoFut<'a, Self, Write, Param, &'a mut [u8]> {
+        let len = buf.len();
+        let (pkt, sync) = <&'a mut [u8] as IntoPacket<Write>>::into_packet(buf);
         AsyncIoFut {
             io: self,
-            pos: self.get_pos(),
-            len: buf.len(),
-            state: AsyncIoFutState::NewId(buf.into(), self.new_id()),
-            _phantom: PhantomData,
+            len,
+            fut: self.io(self.get_pos(), pkt),
+            sync: Some(sync),
         }
     }
 
@@ -51,13 +60,14 @@ impl<T: IoRead<Param> + StreamPos<Param>, Param: 'static + Copy> AsyncRead<Param
 }
 
 impl<T: IoRead<NoPos>> AsyncRead<NoPos> for T {
-    fn read<'a>(&'a self, buf: &'a mut [u8]) -> AsyncIoFut<'a, Self, Write, NoPos> {
+    fn read<'a>(&'a self, buf: &'a mut [u8]) -> AsyncIoFut<'a, Self, Write, NoPos, &'a mut [u8]> {
+        let len = buf.len();
+        let (pkt, sync) = <&'a mut [u8] as IntoPacket<Write>>::into_packet(buf);
         AsyncIoFut {
             io: self,
-            pos: NoPos::new(),
-            len: buf.len(),
-            state: AsyncIoFutState::NewId(buf.into(), self.new_id()),
-            _phantom: PhantomData,
+            len,
+            fut: self.io(NoPos::new(), pkt),
+            sync: Some(sync),
         }
     }
 
@@ -70,116 +80,72 @@ impl<T: IoRead<NoPos>> AsyncRead<NoPos> for T {
 }
 
 pub trait AsyncWrite<Param>: IoWrite<Param> {
-    fn write<'a>(&'a self, buf: &'a [u8]) -> AsyncIoFut<'a, Self, Read, Param>;
+    fn write<'a>(&'a self, buf: &'a [u8]) -> AsyncIoFut<'a, Self, Read, Param, &'a [u8]>;
 }
 
 impl<T: IoWrite<Param> + StreamPos<Param>, Param: Copy> AsyncWrite<Param> for T {
-    fn write<'a>(&'a self, buf: &'a [u8]) -> AsyncIoFut<'a, Self, Read, Param> {
+    fn write<'a>(&'a self, buf: &'a [u8]) -> AsyncIoFut<'a, Self, Read, Param, &'a [u8]> {
+        let len = buf.len();
+        let (pkt, sync) = buf.into_packet();
         AsyncIoFut {
             io: self,
-            pos: self.get_pos(),
-            len: buf.len(),
-            state: AsyncIoFutState::NewId(buf.into(), self.new_id()),
-            _phantom: PhantomData,
+            len,
+            fut: self.io(self.get_pos(), pkt),
+            sync: Some(sync),
         }
     }
 }
 
 impl<T: IoWrite<NoPos>> AsyncWrite<NoPos> for T {
-    fn write<'a>(&'a self, buf: &'a [u8]) -> AsyncIoFut<'a, Self, Read, NoPos> {
+    fn write<'a>(&'a self, buf: &'a [u8]) -> AsyncIoFut<'a, Self, Read, NoPos, &'a [u8]> {
+        let len = buf.len();
+        let (pkt, sync) = buf.into_packet();
         AsyncIoFut {
             io: self,
-            pos: NoPos::new(),
-            len: buf.len(),
-            state: AsyncIoFutState::NewId(buf.into(), self.new_id()),
-            _phantom: PhantomData,
+            len,
+            fut: self.io(NoPos::new(), pkt),
+            sync: Some(sync),
         }
     }
 }
 
-pub struct AsyncIoFut<'a, Io: PacketIo<Perms, Param>, Perms: PacketPerms, Param> {
-    io: *const Io,
-    pos: Param,
+pub struct AsyncIoFut<
+    'a,
+    Io: PacketIo<Perms, Param>,
+    Perms: PacketPerms,
+    Param: 'a,
+    Obj: IntoPacket<'a, Perms>,
+> {
+    io: &'a Io,
+    fut: IoFut<'a, Io, Perms, Param, Obj::Target>,
+    sync: Option<Obj::SyncHandle>,
     len: usize,
-    state: AsyncIoFutState<'a, Io, Perms, Param>,
-    _phantom: PhantomData<&'a mut [u8]>,
 }
 
-pub enum AsyncIoFutState<'a, Io: PacketIo<Perms, Param>, Perms: PacketPerms, Param: 'a> {
-    NewId(Packet<'a, Perms>, NewIdFut<'a, Io, Perms, Param>),
-    Read(
-        Option<usize>,
-        Option<io::Error>,
-        <NewIdFut<'a, Io, Perms, Param> as Future>::Output,
-    ),
-    Finished,
-}
-
-impl<'a, Io: PacketIo<Perms, Param>, Perms: PacketPerms, Param: PosShift<Io>> Future
-    for AsyncIoFut<'a, Io, Perms, Param>
+impl<
+        'a,
+        Io: PacketIo<Perms, Param>,
+        Perms: PacketPerms,
+        Param: PosShift<Io>,
+        Obj: IntoPacket<'a, Perms>,
+    > Future for AsyncIoFut<'a, Io, Perms, Param, Obj>
 {
     type Output = io::Result<usize>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        loop {
-            match &mut this.state {
-                AsyncIoFutState::NewId(_, new_id) => {
-                    let new_id = unsafe { Pin::new_unchecked(new_id) };
+        let fut = unsafe { Pin::new_unchecked(&mut this.fut) };
 
-                    if let Poll::Ready(id) = new_id.poll(cx) {
-                        let prev = core::mem::replace(
-                            &mut this.state,
-                            AsyncIoFutState::Read(None, None, id),
-                        );
-                        match (prev, &this.state) {
-                            (
-                                AsyncIoFutState::NewId(packet, _),
-                                AsyncIoFutState::Read(_, _, id),
-                            ) => {
-                                unsafe { Pin::new_unchecked(id) }
-                                    .send_io(this.pos.copy_pos(), packet);
-                            }
-                            _ => unreachable!(),
-                        }
-                    } else {
-                        break Poll::Pending;
-                    }
-                }
-                AsyncIoFutState::Read(failed_pos, err, id) => {
-                    match unsafe { Pin::new_unchecked(&mut *id) }.poll_next(cx) {
-                        Poll::Ready(Some((pkt, err))) => {
-                            // We failed, thus cap the output length,
-                            // but we still need to complete outstanding reads.
-                            if err.is_some() {
-                                let new_end = pkt.end();
-                                let end = failed_pos.get_or_insert(new_end);
-                                *end = core::cmp::min(*end, new_end);
-                            }
-                        }
-                        Poll::Ready(None) => {
-                            let out = failed_pos.unwrap_or(this.len);
-
-                            if let Some(err) = err.take() {
-                                if out == 0 {
-                                    break Poll::Ready(Err(err));
-                                }
-                            }
-
-                            // SAFETY: there are no more shared references to io.
-                            this.pos.add_pos(out, unsafe { &*this.io });
-
-                            break Poll::Ready(Ok(out));
-                        }
-                        _ => {
-                            break Poll::Pending;
-                        }
-                    }
-                }
-                AsyncIoFutState::Finished => unreachable!(),
-            }
-        }
+        fut.poll(cx).map(|pkt| {
+            let hdr = <<Obj as IntoPacket<'a, Perms>>::Target as OpaqueStore>::stack_hdr(&pkt);
+            // TODO: put this after error checking
+            Obj::sync_back(hdr, this.sync.take().unwrap());
+            let progressed = core::cmp::min(hdr.error_clamp() as usize, this.len);
+            Param::add_io_pos(this.io, progressed);
+            // TODO: actual error checking
+            Ok(progressed)
+        })
     }
 }
 
@@ -197,11 +163,11 @@ impl<'a, Io: PacketIo<Write, Param>, Param: PosShift<Io>> Future
         let this = unsafe { self.get_unchecked_mut() };
 
         match unsafe { Pin::new_unchecked(&mut this.fut) }.poll(cx) {
-            Poll::Ready(Some(r)) => {
+            Poll::Ready(Ok(r)) => {
                 Param::add_io_pos(this.io, r);
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(None) => Poll::Ready(Err(io::ErrorKind::Other.into())),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(io::ErrorKind::Other.into())),
             //Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
         }
@@ -308,8 +274,8 @@ impl<T, Param: Default> From<T> for Seekable<T, Param> {
 impl<T: PacketIo<Perms, Param>, Perms: PacketPerms, Param> PacketIo<Perms, Param>
     for Seekable<T, Param>
 {
-    fn try_new_id<'a>(&'a self, context: &mut FastCWaker) -> Option<PacketId<'a, Perms, Param>> {
-        self.handle.try_new_id(context)
+    fn send_io(&self, param: Param, view: BoundPacketView<Perms>) {
+        self.handle.send_io(param, view)
     }
 }
 
@@ -342,8 +308,8 @@ impl<T> From<T> for FakeSeek<T> {
 }
 
 impl<T: PacketIo<Perms, Param>, Perms: PacketPerms, Param> PacketIo<Perms, Param> for FakeSeek<T> {
-    fn try_new_id<'a>(&'a self, context: &mut FastCWaker) -> Option<PacketId<'a, Perms, Param>> {
-        self.handle.try_new_id(context)
+    fn send_io(&self, param: Param, view: BoundPacketView<Perms>) {
+        self.handle.send_io(param, view)
     }
 }
 

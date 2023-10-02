@@ -1,5 +1,4 @@
 use core::mem::MaybeUninit;
-use criterion::async_executor::*;
 use criterion::*;
 use futures::stream::{FuturesUnordered, StreamExt};
 #[cfg(unix)]
@@ -102,7 +101,7 @@ fn file_read(c: &mut Criterion) {
     temp_path.push("mfio-bench");
     let temp_path = &temp_path;
 
-    let sizes = [/*16,*/ 64, 256, 1024, 4096, 16384, 65536];
+    let sizes = [/* 16, */ 64, 256, 1024, 4096, 16384, 65536];
 
     let mut rng = rand::thread_rng();
     let mut order = (0..MB).step_by(sizes[0]).collect::<Vec<_>>();
@@ -170,7 +169,7 @@ fn file_read(c: &mut Criterion) {
                             for _ in 0..iters {
                                 send.write_all(&[0u8]).await.unwrap();
                             }
-                            send.flush().await;
+                            let _ = send.flush().await;
                         };
 
                         let recv = async move {

@@ -12,7 +12,7 @@ use cglue::result::IntError;
 use log::*;
 use mfio::backend::IoBackend;
 use mfio::error::Error;
-use mfio::packet::{NoPos, PacketIo};
+use mfio::io::{NoPos, OwnedPacket, PacketIoExt, PacketView, PacketVtblRef, Read};
 use mfio::stdeq::Seekable;
 use mfio::tarc::BaseArc;
 use mfio_rt::{
@@ -26,7 +26,6 @@ use tracing::instrument::Instrument;
 use debug_ignore::DebugIgnore;
 use futures::{
     future::FutureExt,
-    pin_mut,
     stream::{Fuse, FusedStream, FuturesUnordered, StreamExt},
 };
 use mfio_rt::{
@@ -40,7 +39,7 @@ enum Operation {
         file_id: u32,
         packet_id: u32,
         pos: u64,
-        len: usize,
+        len: u64,
     },
     Write {
         file_id: u32,
@@ -62,53 +61,64 @@ enum Operation {
     },
 }
 
+#[repr(C)]
 struct ReadPacket {
-    len: usize,
-    shards: Mutex<BTreeMap<usize, Box<[u8]>>>,
+    hdr: Packet<Write>,
+    len: u64,
+    shards: Mutex<BTreeMap<u64, BaseArc<Packet<Read>>>>,
 }
 
-use core::marker::PhantomData;
-use core::mem::{ManuallyDrop, MaybeUninit};
-use mfio::packet::{BoundPacketObj, Packet, PacketObj, Write, WritePacketObj};
+impl ReadPacket {
+    pub fn new(capacity: u64) -> Self {
+        unsafe extern "C" fn len(pkt: &Packet<Write>) -> u64 {
+            unsafe {
+                let this = &*(pkt as *const Packet<Write> as *const ReadPacket);
+                this.len
+            }
+        }
 
-impl<'a> From<&'a ReadPacket> for Packet<'a, Write> {
-    fn from(pkt: &'a ReadPacket) -> Self {
-        unsafe extern "C" fn get_mut<'a, 'b>(
-            _: &'a mut ManuallyDrop<BoundPacketObj<'b, Write>>,
+        unsafe extern "C" fn get_mut(
+            _: &mut ManuallyDrop<BoundPacketView<Write>>,
             _: usize,
-            _: &'a mut MaybeUninit<WritePacketObj<'b>>,
+            _: &mut MaybeUninit<WritePacketObj>,
         ) -> bool {
             false
         }
 
-        unsafe extern "C" fn transfer_data(obj: &mut BoundPacketObj<Write>, src: *const ()) {
-            let this = &*(obj.buffer().data as *mut ReadPacket);
-            let len = obj.buffer().len();
-            let idx = obj.buffer().start();
+        unsafe extern "C" fn transfer_data(obj: &mut PacketView<'_, Write>, src: *const ()) {
+            let this = &*(obj.pkt() as *const Packet<Write> as *const ReadPacket);
+            let len = obj.len();
+            let idx = obj.start();
             let buf = src as *const u8;
-            let buf = core::slice::from_raw_parts(buf, len);
-            this.shards
-                .lock()
-                .insert(idx, buf.to_vec().into_boxed_slice());
+            let buf = core::slice::from_raw_parts(buf, len as usize);
+            let pkt = Packet::<Read>::copy_from_slice(buf);
+            this.shards.lock().insert(idx, pkt);
         }
 
-        unsafe {
-            Self::new(
-                &Write {
-                    get_mut,
-                    transfer_data,
-                },
-                PacketObj {
-                    data: pkt as *const _ as *mut (),
-                    start: 0,
-                    end: pkt.len,
-                    tag: 0,
-                    _phantom: PhantomData,
-                },
-            )
+        Self {
+            hdr: unsafe {
+                Packet::new_hdr(PacketVtblRef {
+                    vtbl: &Write {
+                        len,
+                        get_mut,
+                        transfer_data,
+                    },
+                })
+            },
+            len: capacity,
+            shards: Default::default(),
         }
     }
 }
+
+impl AsRef<Packet<Write>> for ReadPacket {
+    fn as_ref(&self) -> &Packet<Write> {
+        &self.hdr
+    }
+}
+
+use core::mem::{ManuallyDrop, MaybeUninit};
+use mfio::io::{BoundPacketView, Packet, Write, WritePacketObj};
 
 async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
     let stream_raw = &stream;
@@ -119,11 +129,7 @@ async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
     let mut read_dir_streams: Slab<Pin<BaseArc<AsyncMutex<Fuse<ReadDir>>>>> = Default::default();
     let read_dir_streams = RefCell::new(&mut read_dir_streams);
 
-    let router = HeaderRouter::new();
-    let write_id = stream_raw.new_id().await;
-    // SAFETY: we are pinning immediately after creation - this ID is not moving
-    // anywhere.
-    let write_id = unsafe { Pin::new_unchecked(&write_id) };
+    let router = BaseArc::new(HeaderRouter::new(stream_raw));
 
     let mut futures = FuturesUnordered::new();
 
@@ -143,7 +149,7 @@ async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
             let op = async {
                 trace!("Receive req: {v:?}");
 
-                let op = match v {
+                match v {
                     Request::Read {
                         file_id,
                         packet_id,
@@ -161,7 +167,7 @@ async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
                         pos,
                         len,
                     } => {
-                        let mut buf = vec![0; len];
+                        let mut buf = vec![0; len as usize];
                         stream_raw
                             .read_all(NoPos::new(), &mut buf[..])
                             .await
@@ -194,9 +200,7 @@ async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
                         Operation::ReadDir { stream_id, count }
                     }
                     Request::FileClose { file_id } => Operation::FileClose { file_id },
-                };
-
-                op
+                }
             }
             .instrument(end_span)
             .await;
@@ -244,7 +248,6 @@ async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
                                 );
                                 async {
                                     /*router.send_bytes(
-                                        write_id,
                                         |_| Response::Read {
                                             packet_id,
                                             idx: 0,
@@ -253,51 +256,57 @@ async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
                                         },
                                         vec![0; len].into_boxed_slice(),
                                     );*/
-                                    let packet = ReadPacket {
-                                        len,
-                                        shards: Default::default(),
-                                    };
+                                    let packet = BaseArc::new(ReadPacket::new(len));
 
                                     let fh = file_handles.borrow().get(file_id as usize).cloned();
 
                                     if let Some(fh) = fh {
-                                        log::trace!("Read raw");
-                                        let read = {
-                                            use mfio::traits::IoRead;
-                                            fh.read_raw(pos, &packet)
-                                        };
-                                        pin_mut!(read);
-                                        while let Some((pkt, err)) = read.next().await {
-                                            if let Some(err) = err.map(Error::into_int_err) {
-                                                log::trace!("Err {err:?}");
-                                                router.send_hdr(write_id, |_| Response::Read {
-                                                    packet_id,
-                                                    idx: pkt.start(),
-                                                    len: pkt.len(),
-                                                    err: Some(err),
-                                                });
-                                            } else {
-                                                log::trace!("Resp read {}", pkt.len());
+                                        log::trace!("Read raw {len}");
 
-                                                let buf = {
-                                                    let mut shards = packet.shards.lock();
-                                                    shards.remove(&pkt.start()).expect(
-                                                        "Successful packet, but no written shard",
-                                                    )
-                                                };
+                                        fh.io_to_fn(
+                                            pos,
+                                            packet.clone().transpose().into_base().unwrap(),
+                                            {
+                                                let router = router.clone();
+                                                move |pkt, err| {
+                                                    if let Some(err) = err.map(Error::into_int_err)
+                                                    {
+                                                        log::trace!("Err {err:?}");
+                                                        router.send_hdr(|_| Response::Read {
+                                                            packet_id,
+                                                            idx: pkt.start(),
+                                                            len: pkt.len(),
+                                                            err: Some(err),
+                                                        });
+                                                    } else {
+                                                        log::trace!("Resp read {}", pkt.len());
 
-                                                router.send_bytes(
-                                                    write_id,
-                                                    |_| Response::Read {
-                                                        packet_id,
-                                                        idx: pkt.start(),
-                                                        len: pkt.len(),
-                                                        err: None,
-                                                    },
-                                                    buf,
-                                                );
-                                            }
-                                        }
+                                                        let buf = {
+                                                            let mut shards = packet.shards.lock();
+                                                            shards.remove(&pkt.start()).expect(
+                                                                "Successful packet, but no written shard",
+                                                            )
+                                                        };
+
+                                                        log::trace!(
+                                                            "Send bytes {:?}",
+                                                            buf.simple_slice().map(|v| v.len())
+                                                        );
+
+                                                        router.send_bytes(
+                                                            |_| Response::Read {
+                                                                packet_id,
+                                                                idx: pkt.start(),
+                                                                len: pkt.len(),
+                                                                err: None,
+                                                            },
+                                                            buf,
+                                                        );
+                                                    }
+                                                }
+                                            },
+                                        )
+                                        .await;
                                     }
                                 }
                                 .instrument(req_span)
@@ -321,21 +330,22 @@ async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
                                     let fh = file_handles.borrow().get(file_id as usize).cloned();
 
                                     if let Some(fh) = fh {
-                                        let read = {
-                                            // TODO: rename IoWrite::write to be unambiguous and
-                                            // move this to the root of the module.
-                                            use mfio::traits::IoWrite;
-                                            fh.write_raw(pos, &buf)
-                                        };
-                                        pin_mut!(read);
-                                        while let Some((pkt, err)) = read.next().await {
-                                            router.send_hdr(write_id, |_| Response::Write {
-                                                packet_id,
-                                                idx: pkt.start(),
-                                                len: pkt.len(),
-                                                err: err.map(Error::into_int_err),
-                                            });
-                                        }
+                                        fh.io_to_fn(
+                                            pos,
+                                            OwnedPacket::<Read>::from(buf.0.into_boxed_slice()),
+                                            {
+                                                let router = router.clone();
+                                                move |pkt, err| {
+                                                    router.send_hdr(|_| Response::Write {
+                                                        packet_id,
+                                                        idx: pkt.start(),
+                                                        len: pkt.len(),
+                                                        err: err.map(Error::into_int_err),
+                                                    })
+                                                }
+                                            },
+                                        )
+                                        .await;
                                     }
                                 }
                                 .instrument(req_span)
@@ -382,17 +392,14 @@ async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
                                         }
 
                                         router.send_bytes(
-                                            write_id,
                                             |_| Response::ReadDir { stream_id, len },
-                                            buf.into_boxed_slice(),
+                                            OwnedPacket::from(buf.into_boxed_slice()),
                                         );
 
                                         stream.is_terminated()
                                     } else {
-                                        router.send_hdr(write_id, |_| Response::ReadDir {
-                                            stream_id,
-                                            len: 0,
-                                        });
+                                        router
+                                            .send_hdr(|_| Response::ReadDir { stream_id, len: 0 });
                                         false
                                     };
 
@@ -523,14 +530,13 @@ async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
                                         let resp_len = resp.len() as u16;
 
                                         router.send_bytes(
-                                            write_id,
                                             |_| Response::Fs { req_id, resp_len },
-                                            resp.into_boxed_slice(),
+                                            OwnedPacket::from(resp.into_boxed_slice()),
                                         );
 
                                         trace!("Written response for {req_id}");
                                     } else {
-                                        router.send_hdr(write_id, |_| Response::Fs {
+                                        router.send_hdr(|_| Response::Fs {
                                             req_id,
                                             resp_len: 0,
                                         })
@@ -558,16 +564,8 @@ async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
     }
     .instrument(tracing::span!(tracing::Level::TRACE, "server process_loop"));
 
-    let router_loop = router
-        .process_loop(write_id)
-        .instrument(tracing::span!(tracing::Level::TRACE, "server router_loop"));
-
     let l1 = async move { futures::join!(process_loop, ingress_loop) }.fuse();
-    let l2 = router_loop.fuse();
-    pin_mut!(l1);
-    pin_mut!(l2);
-
-    futures::select!(_ = l1 => (), _ = l2 => ());
+    l1.await;
 }
 
 pub fn single_client_server(addr: SocketAddr) -> (std::thread::JoinHandle<()>, SocketAddr) {
@@ -581,7 +579,9 @@ pub fn single_client_server(addr: SocketAddr) -> (std::thread::JoinHandle<()>, S
             let _ = tx.send_async(listener.local_addr().unwrap()).await;
             let (stream, _) = listener.next().await.unwrap();
             run_server(stream, &fs).await
-        })
+        });
+
+        trace!("Server done polling");
     });
 
     let addr = rx.recv().unwrap();
@@ -638,8 +638,8 @@ mod tests {
 
         let (server, addr) = single_client_server(addr);
 
-        let fs = mfio_rt::NativeRt::default();
-        let fs = NetworkFs::with_fs(addr, fs.into()).unwrap();
+        let fs = mfio_rt::NativeRt::builder().thread(true).build().unwrap();
+        let fs = NetworkFs::with_fs(addr, fs.into(), true).unwrap();
 
         fs.block_on(async {
             println!("Conned");
@@ -647,8 +647,10 @@ mod tests {
                 .open(Path::new("./Cargo.toml"), OpenOptions::new().read(true))
                 .await
                 .unwrap();
+            println!("Got fh");
             let mut out = vec![];
             fh.read_to_end(0, &mut out).await.unwrap();
+            println!("Read to end");
             println!("{}", String::from_utf8(out).unwrap());
         });
 
@@ -668,7 +670,7 @@ mod tests {
         let (server, addr) = single_client_server(addr);
 
         let rt = mfio_rt::NativeRt::default();
-        let mut rt = NetworkFs::with_fs(addr, rt.into()).unwrap();
+        let mut rt = NetworkFs::with_fs(addr, rt.into(), true).unwrap();
 
         let fs = staticify(&mut rt);
 

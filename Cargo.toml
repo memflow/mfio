@@ -3,6 +3,8 @@
 debug = true
 
 [workspace]
+resolver = "2"
+
 members = [
 	"mfio",
 	"mfio-rt",

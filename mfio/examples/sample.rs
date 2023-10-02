@@ -1,7 +1,5 @@
-use core::mem::MaybeUninit;
-use futures::{pin_mut, StreamExt};
 use mfio::backend::*;
-use mfio::packet::*;
+use mfio::io::*;
 use std::time::{Duration, Instant};
 
 use sample::*;
@@ -22,19 +20,23 @@ fn bench(size: usize, iters: usize) -> Duration {
     let handle = SampleIo::default();
 
     handle.block_on(async {
-        let mut bufs = vec![[MaybeUninit::uninit()]; size];
+        let bufs = (0..size)
+            .map(|_| Packet::<Write>::new_buf(1))
+            .collect::<Vec<_>>();
 
         let start = Instant::now();
 
         for _ in 0..iters {
-            let stream = handle.new_id().await;
-            pin_mut!(stream);
-
-            for b in &mut bufs {
-                stream.as_ref().send_io(0, b);
+            for b in &bufs {
+                unsafe { b.reset_err() };
+                let pv = PacketView::from_arc_ref(b, 0);
+                let bpv = unsafe { pv.bind(None) };
+                handle.send_io(0, bpv);
             }
 
-            black_box(stream.count().await);
+            for b in &bufs {
+                black_box(&**b).await;
+            }
         }
 
         start.elapsed()

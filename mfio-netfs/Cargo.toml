@@ -1,6 +1,7 @@
 [package]
 name = "mfio-netfs"
 version = "0.1.0"
+rust-version = "1.72"
 edition = "2021"
 
 [lib]
@@ -25,7 +26,7 @@ required-features = ["bin-deps"]
 mfio = { version = "0.1", path = "../mfio" }
 mfio-rt = { version = "0.1", path = "../mfio-rt" }
 bincode = "1"
-cglue = { version = "0.2", git = "https://github.com/h33p/cglue", features = ["task_unstable"] }
+cglue = { version = "0.2", features = ["task_unstable"] }
 flume = "0.10"
 log = "0.4"
 bytemuck = { version = "1", features = ["derive"] }

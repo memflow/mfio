@@ -3,6 +3,7 @@ use std::net::{self, SocketAddr, ToSocketAddrs};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use core::future::Future;
+use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
@@ -16,14 +17,14 @@ use nix::libc::{iovec, msghdr};
 use nix::sys::socket::{self, SockaddrLike, SockaddrStorage};
 
 use mfio::error::State;
-use mfio::packet::{FastCWaker, Read as RdPerm, Write as WrPerm, *};
+use mfio::io::{Read as RdPerm, Write as WrPerm, *};
 use mfio::tarc::BaseArc;
 
 use super::super::{
     unix_extra::{new_for_addr, StreamBuf},
     Key,
 };
-use super::{IoUringPushHandle, IoUringState, Operation, TmpAddr};
+use super::{DeferredPackets, IoUringPushHandle, IoUringState, Operation, TmpAddr};
 use crate::util::{from_io_error, io_err};
 use crate::TcpStreamHandle;
 
@@ -42,8 +43,8 @@ pub struct StreamInner {
     in_read: bool,
     in_write: usize,
     recv_msg: msghdr,
-    read_queue: Vec<BoundPacket<'static, WrPerm>>,
-    write_queue: Vec<BoundPacket<'static, RdPerm>>,
+    read_queue: Vec<BoundPacketView<WrPerm>>,
+    write_queue: Vec<BoundPacketView<RdPerm>>,
 }
 
 unsafe impl Send for StreamInner {}
@@ -74,30 +75,27 @@ impl From<net::TcpStream> for StreamInner {
 }
 
 fn empty_msg() -> msghdr {
-    msghdr {
-        msg_name: core::ptr::null_mut(),
-        msg_namelen: 0,
-        msg_iov: core::ptr::null_mut(),
-        msg_iovlen: 0,
-        msg_control: core::ptr::null_mut(),
-        msg_controllen: 0,
-        msg_flags: 0,
-    }
+    unsafe { MaybeUninit::zeroed().assume_init() }
 }
 
 impl StreamInner {
-    pub fn on_read(&mut self, res: io::Result<usize>) {
+    pub fn on_read(&mut self, res: io::Result<usize>, deferred_pkts: &mut DeferredPackets) {
         self.in_read = false;
-        self.stream.on_read(res)
+        self.stream.on_read(res, Some(deferred_pkts))
     }
 
-    pub fn on_write(&mut self, res: io::Result<usize>) {
+    pub fn on_write(&mut self, res: io::Result<usize>, deferred_pkts: &mut DeferredPackets) {
         self.in_write -= 1;
-        self.stream.on_write(res)
+        self.stream.on_write(res, Some(deferred_pkts))
     }
 
-    #[tracing::instrument(skip(self, push_handle))]
-    pub(super) fn on_queue(&mut self, idx: usize, push_handle: &mut IoUringPushHandle) {
+    #[tracing::instrument(skip(self, push_handle, deferred_pkts))]
+    pub(super) fn on_queue(
+        &mut self,
+        idx: usize,
+        push_handle: &mut IoUringPushHandle,
+        deferred_pkts: &mut DeferredPackets,
+    ) {
         log::trace!(
             "Do ops file={:?} (to read={} to write={})",
             self.fd.as_raw_fd(),
@@ -110,14 +108,14 @@ impl StreamInner {
                 tracing::span!(tracing::Level::TRACE, "read", ops = self.stream.read_ops());
             let _span = rd_span.enter();
             for op in self.read_queue.drain(..) {
-                self.stream.queue_read(op);
+                self.stream.queue_read(op, Some(deferred_pkts));
             }
             let queue = self.stream.read_queue();
             if !queue.is_empty() {
                 self.in_read = true;
                 let msg = &mut self.recv_msg;
                 // Limit iov read to IOV_MAX, because we don't want to have the operation fail.
-                msg.msg_iovlen = core::cmp::min(queue.len(), *IOV_MAX);
+                msg.msg_iovlen = core::cmp::min(queue.len() as usize, *IOV_MAX as usize) as _;
                 msg.msg_iov = queue.as_mut_ptr() as *mut iovec;
                 let entry = opcode::RecvMsg::new(Fixed(Key::Stream(idx).key() as _), msg).build();
                 push_handle.try_push_op(entry, Operation::StreamRead(idx))
@@ -132,7 +130,7 @@ impl StreamInner {
             );
             let _span = wr_span.enter();
             for op in self.write_queue.drain(..) {
-                self.stream.queue_write(op);
+                self.stream.queue_write(op, Some(deferred_pkts));
             }
             let queue = self.stream.write_queue();
             if !queue.is_empty() {
@@ -150,16 +148,29 @@ impl StreamInner {
             }
         }
     }
+
+    pub fn cancel_all_ops(&mut self) {
+        self.stream
+            .on_read(Err(io::ErrorKind::Interrupted.into()), None)
+    }
 }
 
 trait IntoOp: PacketPerms {
-    fn push_op(stream: &mut StreamInner, pkt: BoundPacket<'static, Self>);
+    fn push_op(
+        stream: &mut StreamInner,
+        pkt: BoundPacketView<Self>,
+        deferred_pkts: &mut DeferredPackets,
+    );
 }
 
 impl IntoOp for RdPerm {
-    fn push_op(stream: &mut StreamInner, pkt: BoundPacket<'static, Self>) {
+    fn push_op(
+        stream: &mut StreamInner,
+        pkt: BoundPacketView<Self>,
+        deferred_pkts: &mut DeferredPackets,
+    ) {
         if stream.in_write == 0 {
-            stream.stream.queue_write(pkt);
+            stream.stream.queue_write(pkt, Some(deferred_pkts));
         } else {
             stream.write_queue.push(pkt);
         }
@@ -167,85 +178,38 @@ impl IntoOp for RdPerm {
 }
 
 impl IntoOp for WrPerm {
-    fn push_op(stream: &mut StreamInner, pkt: BoundPacket<'static, Self>) {
+    fn push_op(
+        stream: &mut StreamInner,
+        pkt: BoundPacketView<Self>,
+        deferred_pkts: &mut DeferredPackets,
+    ) {
         if !stream.in_read {
-            stream.stream.queue_read(pkt);
+            stream.stream.queue_read(pkt, Some(deferred_pkts));
         } else {
             stream.read_queue.push(pkt);
         }
     }
 }
 
-struct IoOpsHandle<Perms: IntoOp> {
-    handle: PacketIoHandle<'static, Perms, NoPos>,
-    idx: usize,
-    state: BaseArc<Mutex<IoUringState>>,
-}
-
-impl<Perms: IntoOp> Drop for IoOpsHandle<Perms> {
-    fn drop(&mut self) {
-        log::trace!(
-            "Drop handle {} {}",
-            std::any::type_name::<Perms>(),
-            self.state.strong_count()
-        );
-    }
-}
-
-impl<Perms: IntoOp> IoOpsHandle<Perms> {
-    fn new(idx: usize, state: BaseArc<Mutex<IoUringState>>) -> Self {
-        Self {
-            handle: PacketIoHandle::new::<Self>(),
-            idx,
-            state,
-        }
-    }
-}
-
-impl<Perms: IntoOp> AsRef<PacketIoHandle<'static, Perms, NoPos>> for IoOpsHandle<Perms> {
-    fn as_ref(&self) -> &PacketIoHandle<'static, Perms, NoPos> {
-        &self.handle
-    }
-}
-
-impl<Perms: IntoOp> PacketIoHandleable<'static, Perms, NoPos> for IoOpsHandle<Perms> {
-    extern "C" fn send_input(&self, _: NoPos, packet: BoundPacket<'static, Perms>) {
+impl<Perms: IntoOp> PacketIo<Perms, NoPos> for TcpStream {
+    fn send_io(&self, _: NoPos, packet: BoundPacketView<Perms>) {
         let mut state = self.state.lock();
         let state = &mut *state;
 
         let stream = state.streams.get_mut(self.idx).unwrap();
 
-        Perms::push_op(stream, packet);
+        Perms::push_op(stream, packet, &mut state.deferred_pkts);
     }
 }
 
 pub struct TcpStream {
     idx: usize,
     state: BaseArc<Mutex<IoUringState>>,
-    read_stream: PacketStream<'static, WrPerm, NoPos>,
-    write_stream: PacketStream<'static, RdPerm, NoPos>,
 }
 
 impl TcpStream {
     pub(super) fn new(idx: usize, state: BaseArc<Mutex<IoUringState>>) -> Self {
-        let write_io = BaseArc::new(IoOpsHandle::new(idx, state.clone()));
-
-        let write_stream = PacketStream {
-            ctx: PacketCtx::new(write_io).into(),
-        };
-
-        let read_io = BaseArc::new(IoOpsHandle::new(idx, state.clone()));
-
-        let read_stream = PacketStream {
-            ctx: PacketCtx::new(read_io).into(),
-        };
-
-        Self {
-            idx,
-            state,
-            write_stream,
-            read_stream,
-        }
+        Self { idx, state }
     }
 
     pub(super) fn tcp_connect<'a, A: ToSocketAddrs + Send + 'a>(
@@ -273,12 +237,7 @@ impl Drop for TcpStream {
             .register_files_update(Key::Stream(self.idx).key() as _, &[-1])
             .unwrap();
 
-        log::trace!(
-            "{r} {} | {} {}",
-            self.state.strong_count(),
-            self.read_stream.ctx.strong_count(),
-            self.write_stream.ctx.strong_count(),
-        );
+        log::trace!("{r} {}", self.state.strong_count(),);
     }
 }
 
@@ -299,18 +258,6 @@ impl TcpStreamHandle for TcpStream {
             .get(self.idx)
             .ok_or_else(|| io_err(State::NotFound))?;
         stream.fd.peer_addr().map_err(from_io_error)
-    }
-}
-
-impl PacketIo<RdPerm, NoPos> for TcpStream {
-    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, RdPerm, NoPos>> {
-        Some(self.write_stream.new_packet_id())
-    }
-}
-
-impl PacketIo<WrPerm, NoPos> for TcpStream {
-    fn try_new_id<'a>(&'a self, _: &mut FastCWaker) -> Option<PacketId<'a, WrPerm, NoPos>> {
-        Some(self.read_stream.new_packet_id())
     }
 }
 

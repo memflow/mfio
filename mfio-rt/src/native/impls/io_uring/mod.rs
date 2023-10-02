@@ -26,10 +26,10 @@ use crate::util::{from_io_error, io_err};
 use mfio::backend::fd::FdWakerOwner;
 use mfio::backend::*;
 use mfio::error::State;
-use mfio::packet::{Read as RdPerm, Write as WrPerm, *};
+use mfio::io::{Read as RdPerm, Write as WrPerm, *};
 use mfio::tarc::BaseArc;
 
-use super::Key;
+use super::{deferred::DeferredPackets, Key};
 
 mod file;
 mod tcp_listener;
@@ -63,8 +63,8 @@ impl Drop for RawBox {
 }
 
 enum Operation {
-    FileRead(MaybeAlloced<'static, WrPerm>, RawBox),
-    FileWrite(AllocedOrTransferred<'static, RdPerm>, RawBox),
+    FileRead(MaybeAlloced<WrPerm>, RawBox),
+    FileWrite(AllocedOrTransferred<RdPerm>, RawBox),
     StreamRead(usize),
     StreamWrite(usize),
     TcpGetSock(usize),
@@ -102,50 +102,57 @@ impl Operation {
         streams: &mut Slab<StreamInner>,
         connections: &mut Slab<TcpGetSock>,
         submitter: &Submitter<'_>,
+        deferred_pkts: &mut DeferredPackets,
     ) {
         match self {
             Operation::FileRead(pkt, buf) => match res {
-                Ok(read) if read < pkt.len() => {
-                    let (left, right) = pkt.split_at(read);
+                Ok(read) if (read as u64) < pkt.len() => {
+                    let (left, right) = pkt.split_at(read as u64);
                     if let Err(pkt) = left {
                         assert!(!buf.0.is_null());
                         let buf = unsafe { &*buf.0 };
-                        unsafe { pkt.transfer_data(buf.as_ptr().cast()) };
+                        deferred_pkts.ok(unsafe { pkt.transfer_data(buf.as_ptr().cast()) });
                     }
-                    right.error(io_err(State::Nop));
+                    deferred_pkts.error(right, io_err(State::Nop));
                 }
                 Ok(0) => {
-                    pkt.error(io_err(State::Nop));
+                    deferred_pkts.error(pkt, io_err(State::Nop));
                 }
-                Err(e) => pkt.error(io_err(e.kind().into())),
-                _ => {
-                    if let Err(pkt) = pkt {
+                Err(e) => deferred_pkts.error(pkt, io_err(e.kind().into())),
+                _ => match pkt {
+                    Ok(pkt) => {
+                        deferred_pkts.ok(pkt);
+                    }
+                    Err(pkt) => {
                         assert!(!buf.0.is_null());
                         let buf = unsafe { &*buf.0 };
-                        unsafe { pkt.transfer_data(buf.as_ptr().cast()) };
+                        deferred_pkts.ok(unsafe { pkt.transfer_data(buf.as_ptr().cast()) });
                     }
-                }
+                },
             },
             Operation::FileWrite(pkt, _) => match res {
-                Ok(read) if read < pkt.len() => {
-                    let (_, right) = pkt.split_at(read);
+                Ok(read) if (read as u64) < pkt.len() => {
+                    let (left, right) = pkt.split_at(read as u64);
+                    deferred_pkts.ok(left);
                     right.error(io_err(State::Nop));
                 }
                 Ok(0) => {
-                    pkt.error(io_err(State::Nop));
+                    deferred_pkts.error(pkt, io_err(State::Nop));
                 }
-                Err(e) => pkt.error(io_err(e.kind().into())),
-                _ => (),
+                Err(e) => deferred_pkts.error(pkt, io_err(e.kind().into())),
+                _ => {
+                    deferred_pkts.ok(pkt);
+                }
             },
             // TODO: we may need to protect about races when streams get replaced with same idx
             Operation::StreamRead(idx) => {
                 if let Some(stream) = streams.get_mut(idx) {
-                    stream.on_read(res);
+                    stream.on_read(res, deferred_pkts);
                 }
             }
             Operation::StreamWrite(idx) => {
                 if let Some(stream) = streams.get_mut(idx) {
-                    stream.on_write(res);
+                    stream.on_write(res, deferred_pkts);
                 }
             }
             Operation::TcpGetSock(idx) => {
@@ -186,6 +193,7 @@ struct IoUringState {
     connections: Slab<TcpGetSock>,
     ring_capacity: usize,
     pending_ops: VecDeque<(Entry, Operation)>,
+    deferred_pkts: DeferredPackets,
     all_ssub: usize,
     all_sub: usize,
     all_comp: usize,
@@ -233,6 +241,18 @@ impl IoUringState {
         submitter
             .register_files_update(key.key() as u32, &[fd])
             .unwrap();
+    }
+
+    fn sync_cancel_all(&mut self) {
+        // TODO: look into a better way to cancel the operations - it appears that synchronous
+        // cancellation may deadlock.
+        if let Err(e) = self
+            .ring
+            .submitter()
+            .register_sync_cancel(Some(Timespec::new().sec(1)), CancelBuilder::any().all())
+        {
+            log::trace!("Cannot cancel all events synchronously ({e}). Likely unsupported.");
+        }
     }
 
     fn register_file(&mut self, file: impl IntoRawFd) -> Key {
@@ -292,6 +312,35 @@ impl IoUringState {
 
         let ring = IoUring::builder().build(ring_capacity as u32)?;
 
+        let mut probe = io_uring::Probe::new();
+        ring.submitter().register_probe(&mut probe)?;
+
+        {
+            use opcode::*;
+            // TODO: separate by feature sets
+            for opcode in [
+                Read::CODE,
+                Write::CODE,
+                PollAdd::CODE,
+                Connect::CODE,
+                RecvMsg::CODE,
+                Writev::CODE,
+                Accept::CODE,
+                2,  // IORING_REGISTER_FILES
+                3,  // IORING_UNREGISTER_FILES
+                4,  // IORING_REGISTER_EVENTFD
+                6,  // IORING_REGISTER_FILES_UPDATE
+                24, // IORING_REGISTER_SYNC_CANCEL
+            ] {
+                if !probe.is_supported(opcode) {
+                    log::warn!("io_uring opcode {opcode} is not supported");
+                    return Err(std::io::ErrorKind::Unsupported.into());
+                } else {
+                    log::trace!("io_uring opcode {opcode} is supported");
+                }
+            }
+        }
+
         let event_fd = eventfd(0, EfdFlags::all())?;
         ring.submitter().register_eventfd(event_fd)?;
         let event_fd = unsafe { File::from_raw_fd(event_fd) };
@@ -308,6 +357,7 @@ impl IoUringState {
             connections: Default::default(),
             ring_capacity,
             pending_ops: Default::default(),
+            deferred_pkts: Default::default(),
             all_ssub: 0,
             all_sub: 0,
             all_comp: 0,
@@ -336,13 +386,8 @@ impl Drop for Runtime {
             log::trace!("clear {} ops", state.ops.len());
             state.ops.clear();
 
-            if let Err(e) = state
-                .ring
-                .submitter()
-                .register_sync_cancel(Some(Timespec::new().sec(1)), CancelBuilder::any().all())
-            {
-                log::trace!("Cannot cancel all events synchronously ({e}). Likely unsupported.");
-            }
+            state.sync_cancel_all();
+
             if let Err(e) = state.ring.submitter().register_files_update(0, &[-1; 1024]) {
                 log::trace!("Could not deregister files: {e}");
             }
@@ -383,6 +428,8 @@ impl Runtime {
             let state_arc = state.clone();
 
             async move {
+                let mut old_deferred_pkts = DeferredPackets::default();
+
                 loop {
                     {
                         let mut state = state_arc.lock();
@@ -408,7 +455,7 @@ impl Runtime {
                         // Submit all pending stream ops
                         // TODO: be more efficient and keep track of pending streams.
                         for (key, stream) in state.streams.iter_mut() {
-                            stream.on_queue(key, &mut push_handle);
+                            stream.on_queue(key, &mut push_handle, &mut state.deferred_pkts);
                         }
 
                         if !*push_handle.flushed {
@@ -451,6 +498,7 @@ impl Runtime {
                                     &mut state.streams,
                                     &mut state.connections,
                                     &sub,
+                                    &mut state.deferred_pkts,
                                 );
                             }
 
@@ -460,7 +508,7 @@ impl Runtime {
 
                             // Submit all pending stream ops
                             for (key, stream) in state.streams.iter_mut() {
-                                stream.on_queue(key, &mut push_handle);
+                                stream.on_queue(key, &mut push_handle, &mut state.deferred_pkts);
                             }
 
                             if !push_handle.pending_ops.is_empty() {
@@ -513,7 +561,11 @@ impl Runtime {
                             // the most results are retrieved.
                             cq.sync();
                         }
+
+                        core::mem::swap(&mut old_deferred_pkts, &mut state.deferred_pkts);
                     }
+
+                    old_deferred_pkts.flush();
 
                     let mut signaled = false;
 
@@ -535,6 +587,47 @@ impl Runtime {
             backend: BackendContainer::new_dyn(backend),
             waker,
         })
+    }
+
+    pub fn cancel_all_ops(&self) {
+        let state_arc = self.state.clone();
+        let p = {
+            let state = &mut *self.state.lock();
+
+            state.sync_cancel_all();
+
+            let sub = state.ring.submitter();
+
+            state
+                .streams
+                .iter_mut()
+                .for_each(|(_, v)| v.cancel_all_ops());
+
+            state.ops.drain().for_each(|v| {
+                v.process(
+                    &state_arc,
+                    Err(std::io::ErrorKind::Interrupted.into()),
+                    &mut state.streams,
+                    &mut state.connections,
+                    &sub,
+                    &mut state.deferred_pkts,
+                )
+            });
+
+            state.pending_ops.drain(0..).for_each(|(_, v)| {
+                v.process(
+                    &state_arc,
+                    Err(std::io::ErrorKind::Interrupted.into()),
+                    &mut state.streams,
+                    &mut state.connections,
+                    &sub,
+                    &mut state.deferred_pkts,
+                )
+            });
+
+            core::mem::take(&mut state.deferred_pkts)
+        };
+        core::mem::drop(p);
     }
 }
 

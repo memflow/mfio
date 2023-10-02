@@ -6,7 +6,6 @@ use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
 use mio::{event::Source, unix::SourceFd, Interest, Registry, Token};
-use parking_lot::Mutex;
 
 use mfio::error::State;
 use mfio::tarc::BaseArc;
@@ -104,44 +103,44 @@ impl ListenerInner {
 
 pub struct TcpListener {
     idx: usize,
-    state: BaseArc<Mutex<MioState>>,
+    state: BaseArc<MioState>,
 }
 
 impl TcpListener {
-    pub(super) fn register_listener(
-        state_arc: &BaseArc<Mutex<MioState>>,
-        listener: net::TcpListener,
-    ) -> Self {
+    pub(super) fn register_listener(state: &BaseArc<MioState>, listener: net::TcpListener) -> Self {
         // TODO: make this portable
         let fd = listener.as_raw_fd();
         super::set_nonblock(fd).unwrap();
 
-        let state = &mut *state_arc.lock();
-        let entry = state.listeners.vacant_entry();
+        let entry = state.listeners.vacant_entry().unwrap();
         let key = Key::TcpListener(entry.key());
         let listener = ListenerInner::from(listener);
 
         log::trace!(
             "Register listener={:?} state={:?}: key={key:?}",
             listener.as_raw_fd(),
-            state_arc.as_ptr()
+            state.as_ptr()
         );
 
-        entry.insert(listener);
+        entry.insert(listener.into());
 
         TcpListener {
             idx: key.idx(),
-            state: state_arc.clone(),
+            state: state.clone(),
         }
     }
 }
 
 impl Drop for TcpListener {
     fn drop(&mut self) {
-        let mut state = self.state.lock();
-        let mut listener = state.listeners.remove(self.idx);
+        let mut listener = self.state.listeners.take(self.idx).unwrap();
         // TODO: what to do on error?
-        let _ = state.poll.registry().deregister(&mut listener);
+        let _ = self
+            .state
+            .poll
+            .lock()
+            .registry()
+            .deregister(listener.get_mut());
     }
 }
 
@@ -149,11 +148,12 @@ impl TcpListenerHandle for TcpListener {
     type StreamHandle = TcpStream;
 
     fn local_addr(&self) -> mfio::error::Result<SocketAddr> {
-        let state = self.state.lock();
-        let listener = state
+        let listener = self
+            .state
             .listeners
             .get(self.idx)
             .ok_or_else(|| io_err(State::NotFound))?;
+        let listener = listener.lock();
         listener.fd.local_addr().map_err(from_io_error)
     }
 }
@@ -163,28 +163,31 @@ impl Stream for TcpListener {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         let this = unsafe { self.get_unchecked_mut() };
-        let mut state = this.state.lock();
 
-        if let Some(inner) = state.listeners.get_mut(this.idx) {
+        if let Some(inner) = this.state.listeners.get(this.idx) {
+            let mut inner = inner.lock();
             match inner.fd.accept() {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     inner.track.read_blocked = true;
                     inner.poll_waker = Some(cx.waker().clone());
-                    state.opqueue.push(Key::TcpListener(this.idx));
+                    this.state.opqueue.lock().push(Key::TcpListener(this.idx));
                     Poll::Pending
                 }
                 Ok((stream, addr)) => {
                     log::trace!("Accept {addr} {}", stream.as_raw_fd());
-                    // Avoid deadlock
-                    core::mem::drop(state);
                     let stream = TcpStream::register_stream(&this.state, stream);
                     Poll::Ready(Some((stream, addr)))
                 }
                 Err(e) => {
                     log::error!("Polling error: {e}");
-                    let mut listener = state.listeners.remove(this.idx);
+                    let mut listener = this.state.listeners.take(this.idx).unwrap();
                     // TODO: what to do on error?
-                    let _ = state.poll.registry().deregister(&mut listener);
+                    let _ = this
+                        .state
+                        .poll
+                        .lock()
+                        .registry()
+                        .deregister(listener.get_mut());
                     Poll::Ready(None)
                 }
             }

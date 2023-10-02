@@ -1,7 +1,8 @@
 [package]
 name = "mfio"
 version = "0.1.0"
-edition = "2018"
+rust-version = "1.72"
+edition = "2021"
 authors = ["Aurimas Blažulionis <0x60@pm.me>"]
 license = "MIT"
 repository = "https://github.com/memflow/mfio"
@@ -20,7 +21,7 @@ parking_lot = "0.12"
 pin-project = "1.0"
 tarc = "0.1"
 bytemuck = "1"
-cglue = { version = "0.2", git = "https://github.com/h33p/cglue", features = ["task_unstable"] }
+cglue = { version = "0.2", features = ["task_unstable"] }
 mfio-derive = { version = "0.1", path = "../mfio-derive" }
 http = { version = "0.2", optional = true }
 log = "0.4"
