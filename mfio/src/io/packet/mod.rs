@@ -579,6 +579,11 @@ impl<Perms: PacketPerms> Drop for Packet<Perms> {
             0,
             "The packet has in-flight segments."
         );
+        if loaded >> 62 == 0b11 {
+            unsafe {
+                core::ptr::drop_in_place(self.waker.get_mut().as_mut_ptr());
+            }
+        }
     }
 }
 
@@ -589,7 +594,14 @@ impl<'a, Perms: PacketPerms> Future for &'a Packet<Perms> {
         let this = Pin::into_inner(self);
 
         // Clear the flag bits, because we want the end writing bit be properly set
-        this.rc_and_flags.fetch_and(!(0b11 << 62), Ordering::AcqRel);
+        let flags = this.rc_and_flags.fetch_and(!(0b11 << 62), Ordering::AcqRel);
+
+        // Drop the old waker
+        if (flags >> 62) == 0b11 {
+            unsafe {
+                core::ptr::drop_in_place((*this.waker.get()).as_mut_ptr());
+            }
+        }
 
         // Load in the start writing bit
         let loaded = this.rc_and_flags.fetch_or(0b1 << 63, Ordering::AcqRel);
@@ -608,6 +620,7 @@ impl<'a, Perms: PacketPerms> Future for &'a Packet<Perms> {
 
         if loaded & !(0b11 << 62) == 0 {
             // no more packets left, we wrote uselessly
+            // The waker will be freed in packet drop...
             return Poll::Ready(());
         }
 
@@ -634,14 +647,18 @@ impl<Perms: PacketPerms> Packet<Perms> {
         // Do nothing, because we are either:
         //
         // - Not the last packet (any of the first 62 bits set).
-        // - The packet was not fully written yet (the last 2 bits are not 0b11). This case will be
-        //   handled by the polling thread, and will be handled appropriately.
+        // - The waker was not fully written yet (the last 2 bits are not 0b11). This case will be
+        //   handled by the polling thread appropriately.
         if loaded != (0b11 << 62) + 1 {
             return None;
         }
 
-        // FIXME: dial this atomic codepath in, because we've seen uninitialized reads.
-        Some(core::ptr::read(self.waker.get()).assume_init())
+        if self.rc_and_flags.fetch_and(!(0b11 << 62), Ordering::AcqRel) >> 62 == 0b11 {
+            // FIXME: dial this atomic codepath in, because we've seen uninitialized reads.
+            Some(core::ptr::read(self.waker.get()).assume_init())
+        } else {
+            None
+        }
     }
 
     unsafe fn on_add_to_view(&self) {
