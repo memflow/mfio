@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::net::{self, Shutdown, SocketAddr, ToSocketAddrs};
+use std::net::{self, SocketAddr, ToSocketAddrs};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
@@ -25,7 +25,7 @@ use mfio::io::*;
 use mfio::tarc::BaseArc;
 
 use crate::util::{from_io_error, io_err};
-use crate::{TcpListenerHandle, TcpStreamHandle};
+use crate::{Shutdown, TcpListenerHandle, TcpStreamHandle};
 use mfio::error::State;
 
 pub trait IoHandle {
@@ -132,7 +132,7 @@ impl IoHandle for net::TcpStream {
     }
 
     fn close(&self) {
-        let _ = self.shutdown(Shutdown::Both);
+        let _ = self.shutdown(net::Shutdown::Both);
     }
 }
 
@@ -218,6 +218,7 @@ impl<Handle: IoHandle> Drop for IoWrapper<Handle> {
         self.write_thread.take().unwrap().join().unwrap();
 
         self.file.close();
+        log::trace!("CLOSED");
 
         unsafe {
             ManuallyDrop::drop(&mut self.file);
@@ -469,7 +470,26 @@ impl IoBackend for Runtime {
 }
 
 pub struct FileWrapper(usize, Store<File>);
+
+impl Drop for FileWrapper {
+    fn drop(&mut self) {
+        let mut store = self.1.write();
+        if !store.cleared {
+            store.slab.remove(self.0);
+        }
+    }
+}
+
 pub struct TcpStream(usize, Store<net::TcpStream>);
+
+impl Drop for TcpStream {
+    fn drop(&mut self) {
+        let mut store = self.1.write();
+        if !store.cleared {
+            store.slab.remove(self.0);
+        }
+    }
+}
 
 impl TcpStream {
     fn new(stream: net::TcpStream, store: Store<net::TcpStream>) -> Self {
@@ -503,6 +523,18 @@ impl TcpStreamHandle for TcpStream {
             .file
             .handle
             .peer_addr()
+            .map_err(from_io_error)
+    }
+
+    fn shutdown(&self, how: Shutdown) -> mfio::error::Result<()> {
+        let store = self.1.read();
+        store
+            .slab
+            .get(self.0)
+            .unwrap()
+            .file
+            .handle
+            .shutdown(how.into())
             .map_err(from_io_error)
     }
 }
@@ -654,3 +686,5 @@ impl Runtime {
         }
     }
 }
+
+pub use core::convert::identity as map_options;

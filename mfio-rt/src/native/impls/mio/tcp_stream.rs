@@ -14,10 +14,10 @@ use mfio::error::State;
 use mfio::io::{Read as RdPerm, Write as WrPerm, *};
 use mfio::tarc::BaseArc;
 
-use super::super::unix_extra::{set_nonblock, StreamBuf};
+use super::super::unix_extra::set_nonblock;
 use super::{BlockTrack, Key, MioState};
-use crate::util::{from_io_error, io_err};
-use crate::TcpStreamHandle;
+use crate::util::{from_io_error, io_err, stream::StreamBuf};
+use crate::{Shutdown, TcpStreamHandle};
 
 use mio::net;
 
@@ -269,6 +269,7 @@ impl TcpStream {
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
+        log::trace!("Drop {}", self.idx);
         let mut stream = self.state.streams.read().take(self.idx).unwrap();
         // TODO: what to do on error?
         let _ = self
@@ -298,6 +299,15 @@ impl TcpStreamHandle for TcpStream {
         let stream = stream.lock();
         stream.fd.peer_addr().map_err(from_io_error)
     }
+
+    fn shutdown(&self, how: Shutdown) -> mfio::error::Result<()> {
+        let streams = self.state.streams.read();
+        let stream = streams
+            .get(self.idx)
+            .ok_or_else(|| io_err(State::NotFound))?;
+        let stream = stream.lock();
+        stream.fd.shutdown(how.into()).map_err(from_io_error)
+    }
 }
 
 pub struct TcpConnectFuture<'a, A: ToSocketAddrs + 'a> {
@@ -317,7 +327,7 @@ impl<'a, A: ToSocketAddrs + 'a> Future for TcpConnectFuture<'a, A> {
             if let Some(idx) = this.idx.take() {
                 if let Some(stream) = this.backend.streams.read().get(idx) {
                     let mut stream = stream.lock();
-                    if !stream.track.write_blocked {
+                    if stream.fd.peer_addr().is_ok() {
                         let wrapper = TcpStream::new(idx, this.backend.clone());
 
                         let ret = match stream.fd.take_error() {
@@ -331,6 +341,8 @@ impl<'a, A: ToSocketAddrs + 'a> Future for TcpConnectFuture<'a, A> {
                             break Poll::Ready(Ok(ret));
                         }
                     } else {
+                        stream.track.write_blocked = true;
+
                         if stream
                             .update_interests(
                                 Key::Stream(idx).key(),
@@ -356,7 +368,7 @@ impl<'a, A: ToSocketAddrs + 'a> Future for TcpConnectFuture<'a, A> {
                     let entry = streams.vacant_entry().unwrap();
                     // 2N mapping, to accomodate for streams
                     let key = Key::Stream(entry.key());
-                    let mut stream = StreamInner::from(stream);
+                    let stream = StreamInner::from(stream);
 
                     log::trace!(
                         "Connect stream={:?} state={:?}: key={key:?}",
@@ -364,10 +376,8 @@ impl<'a, A: ToSocketAddrs + 'a> Future for TcpConnectFuture<'a, A> {
                         this.backend.as_ptr()
                     );
 
-                    // Mark as write blocked so that we can poll for the writability
-                    stream.track.write_blocked = true;
-
                     entry.insert(stream.into());
+                    this.idx = Some(key.idx());
                 }
             } else {
                 break Poll::Ready(Err(io_err(State::Exhausted)));

@@ -12,9 +12,8 @@ use nix::sys::socket::{AddressFamily, SockaddrLike, SockaddrStorage};
 use mfio::error::State;
 use mfio::tarc::BaseArc;
 
-use super::super::{unix_extra::set_nonblock, Key};
 use super::{IoUringState, Operation, TcpStream, TmpAddr};
-use crate::util::{from_io_error, io_err};
+use crate::util::{from_io_error, io_err, Key};
 use crate::TcpListenerHandle;
 
 use std::net::{self, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -40,9 +39,7 @@ impl TcpListener {
         state_arc: &BaseArc<Mutex<IoUringState>>,
         listener: net::TcpListener,
     ) -> Self {
-        // TODO: make this portable
         let fd = listener.as_raw_fd();
-        set_nonblock(fd).unwrap();
 
         let state = &mut *state_arc.lock();
         let entry = state.listeners.vacant_entry();
@@ -52,7 +49,7 @@ impl TcpListener {
         log::trace!(
             "Register listener={:?} state={:?}: key={key:?}",
             listener.fd.as_raw_fd(),
-            state_arc.as_ptr()
+            state_arc.as_ptr(),
         );
 
         entry.insert(listener);
@@ -167,7 +164,7 @@ impl Stream for TcpListener {
                 let local_addr = {
                     let listener = backend
                         .listeners
-                        .get(idx)
+                        .get(this.idx)
                         .ok_or_else(|| io_err(State::NotFound))
                         .unwrap();
                     listener.fd.local_addr().map_err(from_io_error).unwrap()

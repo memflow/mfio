@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 
 use crate::util::from_io_error;
 use crate::{
-    DirEntry, DirHandle, DirOp, Fs, Metadata, OpenOptions, Tcp, TcpListenerHandle, TcpStreamHandle,
+    DirEntry, DirHandle, DirOp, Fs, Metadata, OpenOptions, Shutdown, Tcp, TcpListenerHandle,
+    TcpStreamHandle,
 };
 
 mod impls;
@@ -27,16 +28,26 @@ macro_rules! fs_dispatch {
         }
 
         impl NativeRtInstance {
-            pub fn register_file(&self, file: std::fs::File) -> NativeFile {
+            fn register_file(&self, file: std::fs::File) -> NativeFile {
                 match self {
                     $($(#[cfg($meta)])* Self::$name(v) => NativeFile::$name(v.register_file(file))),*
                 }
             }
 
             /// Registers a non-seekable I/O stream
+            ///
+            /// TODO: this perhaps should be private. We can't expose register_file publicly,
+            /// because on iocp, files need to be opened with appropriate (unchangeable!) flags.
+            /// Perhaps we should mirror this with streams.
             pub fn register_stream(&self, stream: TcpStream) -> NativeTcpStream {
                 match self {
                     $($(#[cfg($meta)])* Self::$name(v) => NativeTcpStream::$name(v.register_stream(stream))),*
+                }
+            }
+
+            fn get_map_options(&self) -> fn(fs::OpenOptions) -> fs::OpenOptions {
+                match self {
+                    $($(#[cfg($meta)])* Self::$name(_) => impls::$mod::map_options),*
                 }
             }
 
@@ -185,6 +196,12 @@ macro_rules! fs_dispatch {
             $($(#[cfg($meta)])* $name(impls::$mod::TcpStream)),*
         }
 
+        impl Drop for NativeTcpStream {
+            fn drop(&mut self) {
+                log::trace!("Drop stream");
+            }
+        }
+
         impl PacketIo<Write, NoPos> for NativeTcpStream {
             fn send_io(&self, param: NoPos, view: BoundPacketView<Write>) {
                 match self {
@@ -211,6 +228,12 @@ macro_rules! fs_dispatch {
             fn peer_addr(&self) -> MfioResult<SocketAddr> {
                 match self {
                     $($(#[cfg($meta)])* Self::$name(v) => v.peer_addr()),*
+                }
+            }
+
+            fn shutdown(&self, how: Shutdown) -> MfioResult<()> {
+                match self {
+                    $($(#[cfg($meta)])* Self::$name(v) => v.shutdown(how)),*
                 }
             }
         }
@@ -298,6 +321,8 @@ macro_rules! fs_dispatch {
 fs_dispatch! {
     #[cfg(all(not(miri), target_os = "linux", feature = "io-uring"))]
     IoUring => io_uring,
+    #[cfg(all(not(miri), target_os = "windows", feature = "iocp"))]
+    Iocp => iocp,
     #[cfg(all(not(miri), unix, feature = "mio"))]
     Mio => mio,
     Default => thread,
@@ -469,7 +494,7 @@ impl NativeRt {
         self.block_on(func(self))
     }
 
-    pub fn register_file(&self, file: std::fs::File) -> NativeFile {
+    fn register_file(&self, file: std::fs::File) -> NativeFile {
         self.cwd.instance.register_file(file)
     }
 
@@ -559,6 +584,7 @@ impl DirHandle for NativeRtDir {
             let _ = self.ops.send(RtBgOp::OpenFile {
                 path,
                 options,
+                map_options: self.instance.get_map_options(),
                 completion: tx,
             });
         } else {
@@ -702,6 +728,7 @@ enum RtBgOp {
     OpenFile {
         path: PathBuf,
         options: OpenOptions,
+        map_options: fn(std::fs::OpenOptions) -> std::fs::OpenOptions,
         completion: oneshot::Sender<MfioResult<std::fs::File>>,
     },
     DirOp {
@@ -720,16 +747,22 @@ impl RtBgOp {
             Self::OpenFile {
                 path,
                 options,
+                map_options,
                 completion,
             } => {
-                let file = fs::OpenOptions::new()
+                let mut fs_options = fs::OpenOptions::new();
+
+                fs_options
                     .read(options.read)
                     .write(options.write)
                     .create(options.create)
                     .create_new(options.create_new)
-                    .truncate(options.truncate)
+                    .truncate(options.truncate);
+
+                let file = map_options(fs_options)
                     .open(path)
                     .map_err(crate::util::from_io_error);
+
                 let _ = completion.send(file);
             }
             Self::DirOp { op, completion } => {

@@ -17,7 +17,6 @@ use nix::sys::eventfd::{eventfd, EfdFlags};
 use nix::sys::socket::{AddressFamily, SockaddrStorage};
 
 use core::future::poll_fn;
-use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::task::{Poll, Waker};
 
@@ -29,7 +28,7 @@ use mfio::error::State;
 use mfio::io::{Read as RdPerm, Write as WrPerm, *};
 use mfio::tarc::BaseArc;
 
-use super::{deferred::DeferredPackets, Key};
+use crate::util::{DeferredPackets, Key, RawBox};
 
 mod file;
 mod tcp_listener;
@@ -41,26 +40,6 @@ pub use tcp_stream::{TcpConnectFuture, TcpStream};
 
 use tcp_listener::ListenerInner;
 use tcp_stream::StreamInner;
-
-#[repr(transparent)]
-pub struct RawBox(*mut [MaybeUninit<u8>]);
-
-impl RawBox {
-    fn null() -> Self {
-        Self(unsafe { core::mem::MaybeUninit::zeroed().assume_init() })
-    }
-}
-
-unsafe impl Send for RawBox {}
-unsafe impl Sync for RawBox {}
-
-impl Drop for RawBox {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            let _ = unsafe { Box::from_raw(self.0) };
-        }
-    }
-}
 
 enum Operation {
     FileRead(MaybeAlloced<WrPerm>, RawBox),
@@ -380,13 +359,16 @@ impl Drop for Runtime {
             let mut state = self.state.lock();
             log::trace!("clear {} pending_ops", state.pending_ops.len());
             state.pending_ops.clear();
-            // Clearing this normally is dangerous, because any completions being polled in the
-            // backend would lead to a panic. However, here it is safe to do, because dropping
-            // `Runtime` implies drop of the backend handle.
-            log::trace!("clear {} ops", state.ops.len());
-            state.ops.clear();
 
-            state.sync_cancel_all();
+            if !state.ops.is_empty() {
+                // Clearing this normally is dangerous, because any completions being polled in the
+                // backend would lead to a panic. However, here it is safe to do, because dropping
+                // `Runtime` implies drop of the backend handle.
+                log::trace!("clear {} ops", state.ops.len());
+                state.ops.clear();
+
+                state.sync_cancel_all();
+            }
 
             if let Err(e) = state.ring.submitter().register_files_update(0, &[-1; 1024]) {
                 log::trace!("Could not deregister files: {e}");
@@ -674,3 +656,5 @@ impl Runtime {
         TcpStream::tcp_connect(&self.state, addrs)
     }
 }
+
+pub use core::convert::identity as map_options;

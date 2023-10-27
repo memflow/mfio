@@ -21,6 +21,9 @@ use std::os::windows::io::RawHandle;
 pub mod fd;
 
 #[cfg(windows)]
+pub mod handle;
+
+#[cfg(windows)]
 pub mod windows;
 
 #[cfg(unix)]

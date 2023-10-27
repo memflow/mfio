@@ -20,13 +20,10 @@ use mfio::error::State;
 use mfio::io::{Read as RdPerm, Write as WrPerm, *};
 use mfio::tarc::BaseArc;
 
-use super::super::{
-    unix_extra::{new_for_addr, StreamBuf},
-    Key,
-};
+use super::super::unix_extra::new_for_addr;
 use super::{DeferredPackets, IoUringPushHandle, IoUringState, Operation, TmpAddr};
-use crate::util::{from_io_error, io_err};
-use crate::TcpStreamHandle;
+use crate::util::{from_io_error, io_err, stream::StreamBuf, Key};
+use crate::{Shutdown, TcpStreamHandle};
 
 use once_cell::sync::Lazy;
 
@@ -259,6 +256,15 @@ impl TcpStreamHandle for TcpStream {
             .ok_or_else(|| io_err(State::NotFound))?;
         stream.fd.peer_addr().map_err(from_io_error)
     }
+
+    fn shutdown(&self, how: Shutdown) -> mfio::error::Result<()> {
+        let state = self.state.lock();
+        let stream = state
+            .streams
+            .get(self.idx)
+            .ok_or_else(|| io_err(State::NotFound))?;
+        stream.fd.shutdown(how.into()).map_err(from_io_error)
+    }
 }
 
 pub struct TcpConnectFuture<'a, A: ToSocketAddrs + 'a> {
@@ -307,7 +313,7 @@ impl<'a, A: ToSocketAddrs + 'a> Future for TcpConnectFuture<'a, A> {
                 // would have returned in the previous block.
                 let conn = backend.connections.get_mut(idx).unwrap();
 
-                let Ok((domain, fd)) = new_for_addr(addr) else {
+                let Ok((domain, fd)) = new_for_addr(addr, false) else {
                     continue;
                 };
                 let fd = unsafe { OwnedFd::from_raw_fd(fd) };

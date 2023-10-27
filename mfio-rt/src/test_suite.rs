@@ -1,4 +1,5 @@
-pub use crate::{DirHandle, Fs, OpenOptions};
+pub use crate::{DirHandle, Fs, OpenOptions, Shutdown, Tcp, TcpListenerHandle, TcpStreamHandle};
+use async_semaphore::Semaphore;
 pub use core::future::Future;
 pub use futures::StreamExt;
 pub use mfio::backend::IoBackend;
@@ -7,6 +8,7 @@ pub use once_cell::sync::Lazy;
 pub use std::collections::BTreeSet;
 pub use std::fs;
 pub use std::path::Path;
+use std::pin::pin;
 pub use tempdir::TempDir;
 
 const FILES: &[(&str, &str)] = &[
@@ -34,6 +36,9 @@ const DIRECTORIES: &[&str] = &[
     "src/native/impls/mio",
     "p1/p2/p3/p4/p5/p6",
 ];
+
+/// Maximum number of concurrent TCP tests (listener, client) pairs at a time.
+static TCP_SEM: Semaphore = Semaphore::new(16);
 
 static CTX: Lazy<TestCtx> = Lazy::new(TestCtx::new);
 
@@ -145,6 +150,290 @@ impl TestCtx {
             }
             fs::write(path.join(p), data).unwrap();
         }
+    }
+}
+
+pub struct NetTestRun<'a, T> {
+    ctx: &'static TestCtx,
+    rt: &'a T,
+}
+
+impl<'a, T: Tcp> NetTestRun<'a, T> {
+    pub fn new(rt: &'a T) -> Self {
+        Self { ctx: &*CTX, rt }
+    }
+
+    pub async fn tcp_connect(&self) {
+        use std::net::TcpListener;
+
+        let _sem = TCP_SEM.acquire().await;
+
+        let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let jh = std::thread::spawn(move || {
+            let _ = listener.accept().unwrap();
+        });
+
+        self.rt.connect(addr).await.unwrap();
+
+        jh.join().unwrap();
+    }
+
+    pub async fn tcp_listen(&self) {
+        use std::net::TcpStream;
+
+        let _sem = TCP_SEM.acquire().await;
+
+        let listener = self.rt.bind("0.0.0.0:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let jh = std::thread::spawn(move || {
+            let _ = TcpStream::connect(addr).unwrap();
+        });
+
+        let mut listener = pin!(listener);
+
+        let _ = listener.next().await.unwrap();
+
+        jh.join().unwrap();
+    }
+
+    pub fn tcp_receive(&self) -> impl Iterator<Item = impl Future<Output = ()> + '_> + '_ {
+        use mfio::io::NoPos;
+        use std::net::TcpListener;
+
+        self.ctx.files.iter().map(move |(name, data)| async move {
+            let _sem = TCP_SEM.acquire().await;
+
+            let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let (tx, rx) = flume::bounded(1);
+
+            let jh = std::thread::spawn(move || {
+                use std::io::Write;
+                let (mut sock, _) = listener.accept().unwrap();
+                sock.write_all(data).unwrap();
+                let _ = sock.shutdown(std::net::Shutdown::Both);
+                let _ = tx.send(());
+            });
+
+            let conn = self.rt.connect(addr).await.unwrap();
+
+            let mut out = vec![];
+            conn.read_to_end(NoPos::new(), &mut out).await.unwrap();
+            assert!(
+                &out[..] == data,
+                "{name} does not match ({} vs {})",
+                out.len(),
+                data.len()
+            );
+
+            let _ = rx.recv_async().await;
+            jh.join().unwrap();
+        })
+    }
+
+    pub fn tcp_send(&self) -> impl Iterator<Item = impl Future<Output = ()> + '_> + '_ {
+        use mfio::io::NoPos;
+        use std::net::TcpListener;
+
+        self.ctx.files.iter().map(move |(name, data)| async move {
+            let _sem = TCP_SEM.acquire().await;
+
+            let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let (tx, rx) = flume::bounded(1);
+
+            let jh = std::thread::spawn(move || {
+                use std::io::Read;
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut out = vec![];
+                sock.read_to_end(&mut out).unwrap();
+                let _ = tx.send(());
+                out
+            });
+
+            {
+                let conn = self.rt.connect(addr).await.unwrap();
+                conn.write_all(NoPos::new(), &data[..]).await.unwrap();
+                core::mem::drop(conn);
+            }
+
+            let _ = rx.recv_async().await;
+
+            let ret = jh.join().unwrap();
+            assert!(
+                &ret == data,
+                "{name} does not match ({} vs {})",
+                ret.len(),
+                data.len()
+            );
+        })
+    }
+
+    pub fn tcp_echo_client(&self) -> impl Iterator<Item = impl Future<Output = ()> + '_> + '_ {
+        use mfio::io::NoPos;
+        use std::net::TcpListener;
+
+        self.ctx.files.iter().map(move |(name, data)| async move {
+            let _sem = TCP_SEM.acquire().await;
+
+            let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let (tx, rx) = flume::bounded(1);
+
+            let jh = std::thread::spawn(move || {
+                let (sock, _) = listener.accept().unwrap();
+                log::trace!("Echo STD server start");
+                std::io::copy(&mut &sock, &mut &sock).unwrap();
+                log::trace!("Echo STD server end");
+                let _ = tx.send(());
+            });
+
+            let ret = {
+                let conn = self.rt.connect(addr).await.unwrap();
+
+                let write = async {
+                    conn.write_all(NoPos::new(), &data[..]).await.unwrap();
+                    log::trace!("Written");
+                    conn.shutdown(Shutdown::Write).unwrap();
+                };
+
+                let read = async {
+                    let mut ret = vec![];
+                    conn.read_to_end(NoPos::new(), &mut ret).await.unwrap();
+                    ret
+                };
+
+                futures::join!(write, read).1
+            };
+
+            let _ = rx.recv_async().await;
+            jh.join().unwrap();
+
+            assert!(
+                &ret == data,
+                "{name} does not match ({} vs {})",
+                ret.len(),
+                data.len()
+            );
+        })
+    }
+
+    pub fn tcp_echo_server(&self) -> impl Iterator<Item = impl Future<Output = ()> + '_> + '_ {
+        use core::mem::MaybeUninit;
+        use flume::SendError;
+        use mfio::io::{Read, StreamIoExt, VecPacket};
+        use std::net::TcpStream;
+
+        self.ctx.files.iter().map(move |(name, data)| async move {
+            let _sem = TCP_SEM.acquire().await;
+
+            let listener = self.rt.bind("0.0.0.0:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let (tx, rx) = flume::bounded(1);
+
+            let jh = std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let sock = TcpStream::connect(addr).unwrap();
+                let sock = std::sync::Arc::new(sock);
+
+                let jh = std::thread::spawn({
+                    let sock = sock.clone();
+                    move || {
+                        (&mut &*sock).write_all(data).unwrap();
+                        sock.shutdown(Shutdown::Write.into()).unwrap();
+                    }
+                });
+
+                let mut out = vec![];
+                let _ = (&mut &*sock).read_to_end(&mut out);
+
+                jh.join().unwrap();
+                let _ = tx.send(());
+
+                out
+            });
+
+            let mut listener = pin!(listener);
+
+            let (sock, _) = listener.next().await.unwrap();
+
+            // TODO: we need a much simpler std::io::copy equivalent...
+            let (rtx, rrx) = flume::bounded(4);
+            let (mtx, mrx) = flume::bounded(4);
+
+            for i in 0..rtx.capacity().unwrap() {
+                let _ = rtx.send_async((i, vec![MaybeUninit::uninit(); 64])).await;
+            }
+
+            let read = {
+                let sock = &sock;
+                async move {
+                    rrx.stream()
+                        .then(|(i, mut v)| async move {
+                            v.resize(v.len() * 2, MaybeUninit::uninit());
+                            let p = VecPacket::from(v);
+                            let p = sock.stream_io(p).await;
+                            let len = p.simple_contiguous_slice().unwrap().len();
+                            let mut v = p.take();
+                            let v = unsafe {
+                                v.set_len(len);
+                                core::mem::transmute::<Vec<MaybeUninit<u8>>, Vec<u8>>(v)
+                            };
+                            if v.is_empty() {
+                                log::trace!("Empty @ {i}");
+                                Err(SendError((i, v)))
+                            } else {
+                                log::trace!("Forward {i}");
+                                Ok((i, v))
+                            }
+                        })
+                        .take_while(|v| core::future::ready(v.is_ok()))
+                        .forward(mtx.sink())
+                        .await
+                }
+            };
+
+            let write = async {
+                let sock = &sock;
+                let rtx = &rtx;
+                mrx.stream()
+                    .for_each(|(i, v)| async move {
+                        let p = VecPacket::<Read>::from(v);
+                        let p = sock.stream_io(p).await;
+                        let mut v = p.take();
+                        let v = unsafe {
+                            v.set_len(v.capacity());
+                            core::mem::transmute::<Vec<u8>, Vec<MaybeUninit<u8>>>(v)
+                        };
+                        log::trace!("Forward back {i}");
+                        // We can't use stream.forward(), because that might cancel the .then() in
+                        // unfinished state.
+                        let _ = rtx.send_async((i, v)).await;
+                    })
+                    .await
+            };
+
+            let _ = futures::join!(read, write);
+            log::trace!("Echo server");
+            core::mem::drop(sock);
+
+            let _ = rx.recv_async().await;
+            let ret = jh.join().unwrap();
+
+            assert!(
+                &ret == data,
+                "{name} does not match ({} vs {})",
+                ret.len(),
+                data.len()
+            );
+        })
     }
 }
 
@@ -424,13 +713,149 @@ macro_rules! test_suite {
     };
 }
 
+#[macro_export]
+macro_rules! net_test_suite {
+    ($test_ident:ident, $fs_builder:expr) => {
+        #[cfg(test)]
+        #[allow(clippy::redundant_closure_call)]
+        mod $test_ident {
+            use $crate::test_suite::*;
+
+            async fn seq(i: impl Iterator<Item = impl Future<Output = ()> + '_> + '_) {
+                for i in i {
+                    i.await;
+                }
+            }
+
+            async fn con(i: impl Iterator<Item = impl Future<Output = ()> + '_> + '_) {
+                let unordered = i.collect::<futures::stream::FuturesUnordered<_>>();
+                unordered.count().await;
+            }
+
+            fn staticify<T>(val: &mut T) -> &'static mut T {
+                unsafe { core::mem::transmute(val) }
+            }
+
+            #[cfg(not(miri))]
+            #[test]
+            fn tcp_connect() {
+                $fs_builder(|rt| async move {
+                    let run = NetTestRun::new(rt);
+                    run.tcp_connect().await;
+                });
+            }
+
+            #[cfg(not(miri))]
+            #[test]
+            fn tcp_listen() {
+                $fs_builder(|rt| async move {
+                    let run = NetTestRun::new(rt);
+                    run.tcp_listen().await;
+                });
+            }
+
+            #[cfg(not(miri))]
+            #[test]
+            fn tcp_send_seq() {
+                $fs_builder(|rt| async move {
+                    let run = NetTestRun::new(rt);
+                    seq(run.tcp_send()).await;
+                });
+            }
+
+            #[cfg(not(miri))]
+            #[test]
+            fn tcp_send_con() {
+                $fs_builder(|rt| async move {
+                    let run = NetTestRun::new(rt);
+                    con(run.tcp_send()).await;
+                });
+            }
+
+            #[cfg(not(miri))]
+            #[test]
+            fn tcp_receive_seq() {
+                $fs_builder(|rt| async move {
+                    let run = NetTestRun::new(rt);
+                    seq(run.tcp_receive()).await;
+                });
+            }
+
+            #[cfg(not(miri))]
+            #[test]
+            fn tcp_receive_con() {
+                $fs_builder(|rt| async move {
+                    let run = NetTestRun::new(rt);
+                    con(run.tcp_receive()).await;
+                });
+            }
+
+            #[cfg(not(miri))]
+            #[test]
+            fn tcp_echo_client_seq() {
+                $fs_builder(|rt| async move {
+                    let run = NetTestRun::new(rt);
+                    seq(run.tcp_echo_client()).await;
+                });
+            }
+
+            #[cfg(not(miri))]
+            #[test]
+            fn tcp_echo_client_con() {
+                $fs_builder(|rt| async move {
+                    let run = NetTestRun::new(rt);
+                    con(run.tcp_echo_client()).await;
+                });
+            }
+
+            #[cfg(not(miri))]
+            #[test]
+            fn tcp_echo_server_seq() {
+                $fs_builder(|rt| async move {
+                    let run = NetTestRun::new(rt);
+                    seq(run.tcp_echo_server()).await;
+                });
+            }
+
+            #[cfg(not(miri))]
+            #[test]
+            fn tcp_echo_server_con() {
+                $fs_builder(|rt| async move {
+                    let run = NetTestRun::new(rt);
+                    con(run.tcp_echo_server()).await;
+                });
+            }
+        }
+    };
+}
+
 test_suite!(tests_default, |closure| {
+    let _ = ::env_logger::builder().is_test(true).try_init();
     let mut rt = crate::NativeRt::default();
     let rt = staticify(&mut rt);
     rt.run(closure);
 });
 
 test_suite!(tests_all, |closure| {
+    let _ = ::env_logger::builder().is_test(true).try_init();
+    for (name, rt) in crate::NativeRt::builder().enable_all().build_each() {
+        println!("{name}");
+        if let Ok(mut rt) = rt {
+            let rt = staticify(&mut rt);
+            rt.run(closure);
+        }
+    }
+});
+
+net_test_suite!(net_tests_default, |closure| {
+    let _ = ::env_logger::builder().is_test(true).try_init();
+    let mut rt = crate::NativeRt::default();
+    let rt = staticify(&mut rt);
+    rt.run(closure);
+});
+
+net_test_suite!(net_tests_all, |closure| {
+    let _ = ::env_logger::builder().is_test(true).try_init();
     for (name, rt) in crate::NativeRt::builder().enable_all().build_each() {
         println!("{name}");
         if let Ok(mut rt) = rt {

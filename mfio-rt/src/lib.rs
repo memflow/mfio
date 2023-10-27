@@ -36,6 +36,36 @@ pub struct OpenOptions {
     //pub append: bool,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq, PartialOrd, Ord)]
+pub enum Shutdown {
+    Read,
+    Write,
+    Both,
+}
+
+use std::net;
+
+impl From<net::Shutdown> for Shutdown {
+    fn from(o: net::Shutdown) -> Self {
+        match o {
+            net::Shutdown::Write => Self::Write,
+            net::Shutdown::Read => Self::Read,
+            net::Shutdown::Both => Self::Both,
+        }
+    }
+}
+
+impl From<Shutdown> for net::Shutdown {
+    fn from(o: Shutdown) -> Self {
+        match o {
+            Shutdown::Write => Self::Write,
+            Shutdown::Read => Self::Read,
+            Shutdown::Both => Self::Both,
+        }
+    }
+}
+
 impl OpenOptions {
     pub const fn new() -> Self {
         Self {
@@ -532,6 +562,7 @@ pub trait Tcp: IoBackend {
 pub trait TcpStreamHandle: StreamHandle {
     fn local_addr(&self) -> MfioResult<SocketAddr>;
     fn peer_addr(&self) -> MfioResult<SocketAddr>;
+    fn shutdown(&self, how: Shutdown) -> MfioResult<()>;
 
     // These interfaces may be slightly trickier to implement, so we omit them for now.
     //fn set_ttl(&self, ttl: u32) -> MfioResult<()>;

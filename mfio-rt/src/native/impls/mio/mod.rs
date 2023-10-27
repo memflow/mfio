@@ -14,7 +14,8 @@ use mfio::backend::fd::FdWakerOwner;
 use mfio::backend::*;
 use mfio::tarc::BaseArc;
 
-use super::{unix_extra::set_nonblock, Key};
+use super::unix_extra::set_nonblock;
+use crate::util::Key;
 use tracing::instrument::Instrument;
 
 use file::FileInner;
@@ -350,3 +351,5 @@ impl Runtime {
         TcpStream::tcp_connect(&self.state, addrs)
     }
 }
+
+pub use core::convert::identity as map_options;
