@@ -381,7 +381,7 @@ impl<'a, Perms: PacketPerms> PacketView<'a, Perms> {
         assert!(pos < self.len());
 
         // TODO: maybe relaxed is enough here?
-        self.pkt().rc_and_flags.fetch_add(1, Ordering::Release);
+        self.pkt().rc_and_waker.inc_rc();
 
         let Self {
             pkt,
@@ -425,7 +425,7 @@ impl<'a, Perms: PacketPerms> PacketView<'a, Perms> {
     ///
     /// Please see [`BoundPacketView::extract_packet`] documentation for details.
     pub unsafe fn extract_packet(&self, offset: u64, len: u64) -> Self {
-        self.pkt().rc_and_flags.fetch_add(1, Ordering::AcqRel);
+        self.pkt().rc_and_waker.inc_rc();
 
         let Self {
             pkt, tag, start, ..

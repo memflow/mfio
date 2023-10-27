@@ -20,6 +20,102 @@ pub use output::*;
 mod view;
 pub use view::*;
 
+const LOCK_BIT: u64 = 1 << 63;
+const HAS_WAKER_BIT: u64 = 1 << 62;
+const FINALIZED_BIT: u64 = 1 << 61;
+const ALL_BITS: u64 = LOCK_BIT | HAS_WAKER_BIT | FINALIZED_BIT;
+
+struct RcAndWaker {
+    rc_and_flags: AtomicU64,
+    waker: UnsafeCell<MaybeUninit<CWaker>>,
+}
+
+impl Default for RcAndWaker {
+    fn default() -> Self {
+        Self {
+            rc_and_flags: 0.into(),
+            waker: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+}
+
+impl core::fmt::Debug for RcAndWaker {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+        write!(
+            fmt,
+            "{}",
+            (self.rc_and_flags.load(Ordering::Relaxed) & HAS_WAKER_BIT) != 0
+        )
+    }
+}
+
+impl RcAndWaker {
+    fn acquire(&self) -> bool {
+        (loop {
+            let flags = self.rc_and_flags.fetch_or(LOCK_BIT, Ordering::AcqRel);
+            if (flags & LOCK_BIT) == 0 {
+                break flags;
+            }
+            while self.rc_and_flags.load(Ordering::Relaxed) & LOCK_BIT != 0 {
+                core::hint::spin_loop();
+            }
+        } & HAS_WAKER_BIT)
+            != 0
+    }
+
+    pub fn take(&self) -> Option<CWaker> {
+        let ret = if self.acquire() {
+            Some(unsafe { (*self.waker.get()).assume_init_read() })
+        } else {
+            None
+        };
+        self.rc_and_flags
+            .fetch_and(!(LOCK_BIT | HAS_WAKER_BIT), Ordering::Release);
+        ret
+    }
+
+    pub fn write(&self, waker: CWaker) -> u64 {
+        if self.acquire() {
+            unsafe { core::ptr::drop_in_place((*self.waker.get()).as_mut_ptr()) }
+        }
+
+        unsafe { *self.waker.get() = MaybeUninit::new(waker) };
+
+        self.rc_and_flags.fetch_or(HAS_WAKER_BIT, Ordering::Relaxed);
+        self.rc_and_flags.fetch_and(!LOCK_BIT, Ordering::AcqRel) & !ALL_BITS
+    }
+
+    pub fn acquire_rc(&self) -> u64 {
+        self.rc_and_flags.load(Ordering::Acquire) & !ALL_BITS
+    }
+
+    pub fn dec_rc(&self) -> (u64, bool) {
+        let ret = self.rc_and_flags.fetch_sub(1, Ordering::AcqRel);
+        (ret & !ALL_BITS, (ret & HAS_WAKER_BIT) != 0)
+    }
+
+    pub fn inc_rc(&self) -> u64 {
+        self.rc_and_flags.fetch_add(1, Ordering::AcqRel) & !ALL_BITS
+    }
+
+    pub fn finalize(&self) {
+        self.rc_and_flags.fetch_or(FINALIZED_BIT, Ordering::Release);
+    }
+
+    pub fn wait_finalize(&self) {
+        // FIXME: in theory, wait_finalize should only wait for the FINALIZED_BIT, but not deal
+        // with the locking and the waker. However, something is making us have to take the waker,
+        // to make these atomic ops sound (however, even then I doubt this is fully sound, but is
+        // merely moving probability of desync lower).
+        // Either way, we should be able to have this waker mechanism be way more optimized,
+        // without atomic locks.
+        self.take();
+        while (self.rc_and_flags.load(Ordering::Acquire) & FINALIZED_BIT) == 0 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
 /// Describes a full packet.
 ///
 /// This packet is considered simple.
@@ -548,9 +644,7 @@ pub struct Packet<Perms: PacketPerms> {
     ///
     /// return true
     /// ```
-    rc_and_flags: AtomicUsize,
-    /// Waker to be triggered, upon `rc` dropping down to 0.
-    waker: UnsafeCell<MaybeUninit<CWaker>>,
+    rc_and_waker: RcAndWaker,
     /// What was the smallest position that resulted in an error.
     ///
     /// This value is initialized to !0, and upon each errored packet segment, is minned
@@ -573,17 +667,8 @@ unsafe impl<Perms: PacketPerms> Sync for Packet<Perms> {}
 
 impl<Perms: PacketPerms> Drop for Packet<Perms> {
     fn drop(&mut self) {
-        let loaded = self.rc_and_flags.load(Ordering::Acquire);
-        assert_eq!(
-            loaded & !(0b11 << 62),
-            0,
-            "The packet has in-flight segments."
-        );
-        if loaded >> 62 == 0b11 {
-            unsafe {
-                core::ptr::drop_in_place(self.waker.get_mut().as_mut_ptr());
-            }
-        }
+        let loaded = self.rc_and_waker.acquire_rc();
+        assert_eq!(loaded, 0, "The packet has in-flight segments.");
     }
 }
 
@@ -593,38 +678,18 @@ impl<'a, Perms: PacketPerms> Future for &'a Packet<Perms> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = Pin::into_inner(self);
 
-        // Clear the flag bits, because we want the end writing bit be properly set
-        let flags = this.rc_and_flags.fetch_and(!(0b11 << 62), Ordering::AcqRel);
+        let rc = this.rc_and_waker.write(cx.waker().clone().into());
 
-        // Drop the old waker
-        if (flags >> 62) == 0b11 {
-            unsafe {
-                core::ptr::drop_in_place((*this.waker.get()).as_mut_ptr());
-            }
-        }
+        if rc == 0 {
+            // Synchronize the thread that last decremented the refcount.
+            // If we don't, we risk a race condition where we drop the packet, while the packet
+            // reference is still being used to take the waker.
+            this.rc_and_waker.wait_finalize();
 
-        // Load in the start writing bit
-        let loaded = this.rc_and_flags.fetch_or(0b1 << 63, Ordering::AcqRel);
-
-        if loaded & !(0b11 << 62) == 0 {
             // no more packets left, we don't need to write anything
             return Poll::Ready(());
         }
 
-        unsafe {
-            *this.waker.get() = MaybeUninit::new(cx.waker().clone().into());
-        }
-
-        // Load in the end writing bit.
-        let loaded = this.rc_and_flags.fetch_or(0b1 << 62, Ordering::AcqRel);
-
-        if loaded & !(0b11 << 62) == 0 {
-            // no more packets left, we wrote uselessly
-            // The waker will be freed in packet drop...
-            return Poll::Ready(());
-        }
-
-        // true indicates the waker was installed and we can go to sleep.
         Poll::Pending
     }
 }
@@ -632,7 +697,7 @@ impl<'a, Perms: PacketPerms> Future for &'a Packet<Perms> {
 impl<Perms: PacketPerms> Packet<Perms> {
     /// Current reference count of the packet.
     pub fn rc(&self) -> usize {
-        self.rc_and_flags.load(Ordering::Relaxed) & !(0b11 << 62)
+        (self.rc_and_waker.acquire_rc()) as usize
     }
 
     unsafe fn on_output(&self, error: Option<(u64, NonZeroI32)>) -> Option<CWaker> {
@@ -642,29 +707,28 @@ impl<Perms: PacketPerms> Packet<Perms> {
             }
         }
 
-        let loaded = self.rc_and_flags.fetch_sub(1, Ordering::AcqRel);
+        let (prev, has_waker) = self.rc_and_waker.dec_rc();
 
-        // Do nothing, because we are either:
-        //
-        // - Not the last packet (any of the first 62 bits set).
-        // - The waker was not fully written yet (the last 2 bits are not 0b11). This case will be
-        //   handled by the polling thread appropriately.
-        if loaded != (0b11 << 62) + 1 {
+        // Do nothing, because we are not the last packet (any of the first 62 bits set).
+        if prev != 1 {
             return None;
         }
 
-        if self.rc_and_flags.fetch_and(!(0b11 << 62), Ordering::AcqRel) >> 62 == 0b11 {
-            // FIXME: dial this atomic codepath in, because we've seen uninitialized reads.
-            Some(core::ptr::read(self.waker.get()).assume_init())
+        let ret = if has_waker {
+            self.rc_and_waker.take()
         } else {
             None
-        }
+        };
+
+        self.rc_and_waker.finalize();
+
+        ret
     }
 
     unsafe fn on_add_to_view(&self) {
-        let rc = self.rc_and_flags.fetch_add(1, Ordering::AcqRel) & !(0b11 << 62);
+        let rc = self.rc_and_waker.inc_rc();
         if rc != 0 {
-            self.rc_and_flags.fetch_sub(1, Ordering::AcqRel);
+            self.rc_and_waker.dec_rc();
             assert_eq!(rc, 0);
         }
     }
@@ -688,8 +752,7 @@ impl<Perms: PacketPerms> Packet<Perms> {
     pub unsafe fn new_hdr(vtbl: PacketVtblRef<Perms>) -> Self {
         Packet {
             vtbl,
-            rc_and_flags: AtomicUsize::new(0),
-            waker: UnsafeCell::new(MaybeUninit::uninit()),
+            rc_and_waker: Default::default(),
             error_clamp: (!0u64).into(),
             min_error: 0.into(),
         }

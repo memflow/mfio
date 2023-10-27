@@ -102,7 +102,7 @@ pub trait PacketIoExt<Perms: PacketPerms, Param>: PacketIo<Perms, Param> {
         //IoFut::NewId(self, param, packet.stack())
         IoFut {
             pkt: UnsafeCell::new(Some(packet.stack())),
-            initial_state: Some((self, param)),
+            initial_state: UnsafeCell::new(Some((self, param))),
             _phantom: PhantomData,
         }
     }
@@ -116,7 +116,7 @@ pub trait PacketIoExt<Perms: PacketPerms, Param>: PacketIo<Perms, Param> {
         //IoFut::NewId(self, param, packet.stack())
         IoToFut {
             pkt_out: UnsafeCell::new(Some((packet.stack(), output.stack()))),
-            initial_state: Some((self, param)),
+            initial_state: UnsafeCell::new(Some((self, param))),
             _phantom: PhantomData,
         }
     }
@@ -177,7 +177,7 @@ impl NoPos {
 
 pub struct IoFut<'a, T, Perms: PacketPerms, Param, Packet: PacketStore<'a, Perms>> {
     pkt: UnsafeCell<Option<Packet::StackReq<'a>>>,
-    initial_state: Option<(&'a T, Param)>,
+    initial_state: UnsafeCell<Option<(&'a T, Param)>>,
     _phantom: PhantomData<Perms>,
 }
 
@@ -187,10 +187,10 @@ impl<'a, T: PacketIo<Perms, Param>, Perms: PacketPerms, Param, Pkt: PacketStore<
     type Output = Pkt::StackReq<'a>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        let state = unsafe { self.get_unchecked_mut() };
+        let state: &Self = unsafe { core::mem::transmute(self) };
 
         loop {
-            match state.initial_state.take() {
+            match unsafe { (*state.initial_state.get()).take() } {
                 Some((io, param)) => {
                     // SAFETY: this packet's existence is tied to 'a lifetime, meaning it will be valid
                     // throughout 'a.
@@ -230,7 +230,7 @@ pub struct IoToFut<
     Output: OutputStore<'a, Perms>,
 > {
     pkt_out: UnsafeCell<Option<(Packet::StackReq<'a>, Output::StackReq<'a>)>>,
-    initial_state: Option<(&'a T, Param)>,
+    initial_state: UnsafeCell<Option<(&'a T, Param)>>,
     _phantom: PhantomData<Perms>,
 }
 
@@ -244,9 +244,9 @@ impl<
     > IoToFut<'a, T, Perms, Param, Pkt, Out>
 {
     pub fn submit(self: Pin<&mut Self>) -> &Out::StackReq<'a> {
-        let state = unsafe { self.get_unchecked_mut() };
+        let state: &Self = unsafe { core::mem::transmute(self) };
 
-        if let Some((io, param)) = state.initial_state.take() {
+        if let Some((io, param)) = unsafe { (*state.initial_state.get()).take() } {
             // SAFETY: this packet's existence is tied to 'a lifetime, meaning it will be valid
             // throughout 'a.
             let (pkt, out): &'a mut (Pkt::StackReq<'a>, Out::StackReq<'a>) =

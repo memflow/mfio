@@ -115,6 +115,38 @@ jobs:
       - name: Run all tests
         run: cargo test --workspace --all-features --verbose
 
+  test-asan:
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: -Zsanitizer=address -C debuginfo=2 ${{ matrix.rustflags }}
+      RUSTDOCFLAGS: -Zsanitizer=address -C debuginfo=2 ${{ matrix.rustflags }}
+      CARGO_BUILD_RUSTFLAGS: -C debuginfo=2
+      ASAN_OPTIONS: symbolize=1 detect_leaks=0
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # TODO: enable windows, macos
+        os: [ubuntu-latest]
+        toolchain: ["nightly-2023-09-01"]
+        rustflags: ["--cfg mfio_assume_linear_types --cfg tokio_unstable", "--cfg tokio_unstable"]
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          override: true
+
+      - name: Get rustc target
+        run: |
+          echo "RUSTC_TARGET=$(rustc -vV | sed -n 's|host: ||p')" >> $GITHUB_OUTPUT
+        id: target
+      - name: Install llvm
+        run: sudo apt update && sudo apt install llvm-13
+      - run: rustup component add rust-src
+      - name: Run all tests
+        run: cargo -Zbuild-std test --verbose --target ${{ steps.target.outputs.RUSTC_TARGET }}
+
   lint:
     runs-on: ${{ matrix.os }}
     env:
