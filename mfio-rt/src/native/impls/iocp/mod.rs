@@ -558,7 +558,31 @@ impl IocpState {
         true
     }
 
+    fn submit_pending_ops(&mut self) {
+        // Submit all pending ops, without changing order if the queue gets
+        // full again.
+        while let Some(op) = self.pending_ops.pop_front() {
+            let idx = match op {
+                Ok(idx) => idx,
+                Err(op) => {
+                    if self.ops.len() < self.ops.capacity() {
+                        self.ops.insert(op)
+                    } else {
+                        self.pending_ops.push_front(Err(op));
+                        break;
+                    }
+                }
+            };
+
+            if !unsafe { self.submit_op(idx, false) } {
+                break;
+            }
+        }
+    }
+
     unsafe fn try_submit_op(&mut self, operation: Operation) -> Result<(), Option<usize>> {
+        self.submit_pending_ops();
+
         if self.ops.len() < self.ops.capacity() {
             let idx = self.ops.insert(operation);
             match self.submit_op(idx, true) {
@@ -652,25 +676,7 @@ impl Runtime {
                                 break;
                             }
 
-                            // Submit all pending ops, without changing order if the queue gets
-                            // full again.
-                            while let Some(op) = state.pending_ops.pop_front() {
-                                let idx = match op {
-                                    Ok(idx) => idx,
-                                    Err(op) => {
-                                        if state.ops.len() < state.ops.capacity() {
-                                            state.ops.insert(op)
-                                        } else {
-                                            state.pending_ops.push_front(Err(op));
-                                            break;
-                                        }
-                                    }
-                                };
-
-                                if !unsafe { state.submit_op(idx, false) } {
-                                    break;
-                                }
-                            }
+                            state.submit_pending_ops();
                         }
 
                         core::mem::swap(&mut old_deferred_pkts, &mut state.deferred_pkts);

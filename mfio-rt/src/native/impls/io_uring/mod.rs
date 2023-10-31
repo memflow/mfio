@@ -207,6 +207,15 @@ impl<'a> IoUringPushHandle<'a> {
     }
 
     pub fn try_push_op(&mut self, ring_entry: Entry, ops_entry: Operation) {
+        // Clear out any pending ops to maintain order
+        while self.ops.len() + 1 < self.ring_capacity {
+            if let Some((ring_entry, ops_entry)) = self.pending_ops.pop_front() {
+                self.push_op(ring_entry, ops_entry);
+            } else {
+                break;
+            }
+        }
+
         if self.ops.len() + 1 < self.ring_capacity {
             self.push_op(ring_entry, ops_entry);
         } else {
