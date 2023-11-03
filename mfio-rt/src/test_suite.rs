@@ -168,7 +168,7 @@ impl<'a, T: Tcp> NetTestRun<'a, T> {
 
         let _sem = TCP_SEM.acquire().await;
 
-        let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
         let jh = std::thread::spawn(move || {
@@ -185,7 +185,7 @@ impl<'a, T: Tcp> NetTestRun<'a, T> {
 
         let _sem = TCP_SEM.acquire().await;
 
-        let listener = self.rt.bind("0.0.0.0:0").await.unwrap();
+        let listener = self.rt.bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let jh = std::thread::spawn(move || {
@@ -194,7 +194,7 @@ impl<'a, T: Tcp> NetTestRun<'a, T> {
 
         let mut listener = pin!(listener);
 
-        let _ = listener.next().await.unwrap();
+        let v = listener.next().await.unwrap();
 
         jh.join().unwrap();
     }
@@ -206,7 +206,7 @@ impl<'a, T: Tcp> NetTestRun<'a, T> {
         self.ctx.files.iter().map(move |(name, data)| async move {
             let _sem = TCP_SEM.acquire().await;
 
-            let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
 
             let (tx, rx) = flume::bounded(1);
@@ -242,7 +242,7 @@ impl<'a, T: Tcp> NetTestRun<'a, T> {
         self.ctx.files.iter().map(move |(name, data)| async move {
             let _sem = TCP_SEM.acquire().await;
 
-            let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
 
             let (tx, rx) = flume::bounded(1);
@@ -281,7 +281,7 @@ impl<'a, T: Tcp> NetTestRun<'a, T> {
         self.ctx.files.iter().map(move |(name, data)| async move {
             let _sem = TCP_SEM.acquire().await;
 
-            let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
 
             let (tx, rx) = flume::bounded(1);
@@ -333,7 +333,7 @@ impl<'a, T: Tcp> NetTestRun<'a, T> {
         self.ctx.files.iter().map(move |(name, data)| async move {
             let _sem = TCP_SEM.acquire().await;
 
-            let listener = self.rt.bind("0.0.0.0:0").await.unwrap();
+            let listener = self.rt.bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
 
             let (tx, rx) = flume::bounded(1);

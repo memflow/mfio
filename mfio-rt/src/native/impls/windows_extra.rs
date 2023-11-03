@@ -34,13 +34,13 @@ impl CSockAddr {
     pub fn to_socket_addr(self) -> SocketAddr {
         match unsafe { self.generic.sa_family } {
             AF_INET => SocketAddr::V4(SocketAddrV4::new(
-                unsafe { self.ipv4.sin_addr.S_un.S_addr }.into(),
-                unsafe { self.ipv4.sin_port },
+                u32::from_be(unsafe { self.ipv4.sin_addr.S_un.S_addr }).into(),
+                u16::from_be(unsafe { self.ipv4.sin_port }),
             )),
             AF_INET6 => SocketAddr::V6(SocketAddrV6::new(
                 unsafe { self.ipv6.sin6_addr.u.Word }.into(),
-                unsafe { self.ipv6.sin6_port },
-                unsafe { self.ipv6.sin6_flowinfo },
+                u16::from_be(unsafe { self.ipv6.sin6_port }),
+                u32::from_be(unsafe { self.ipv6.sin6_flowinfo }),
                 unsafe { self.ipv6.Anonymous.sin6_scope_id },
             )),
             _ => unreachable!(),

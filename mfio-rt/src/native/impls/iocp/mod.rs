@@ -9,6 +9,7 @@ use mfio::backend::handle::{EventWaker, EventWakerOwner};
 use mfio::backend::*;
 use mfio::error::State;
 use mfio::io::{Read as RdPerm, Write as WrPerm, *};
+use mfio::mferr;
 use mfio::tarc::BaseArc;
 use parking_lot::Mutex;
 use slab::Slab;
@@ -30,7 +31,8 @@ use ::windows::Win32::Foundation::{
     WIN32_ERROR,
 };
 use ::windows::Win32::Networking::WinSock::{
-    AcceptEx, WSAGetLastError, WSARecv, WSASend, SOCKADDR, SOCKET, SOCK_STREAM, WSABUF,
+    setsockopt, AcceptEx, WSAGetLastError, WSARecv, WSASend, SOCKADDR, SOCKET, SOCK_STREAM,
+    SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, WSABUF,
 };
 use ::windows::Win32::Storage::FileSystem::{
     ReadFile, SetFileCompletionNotificationModes, WriteFile,
@@ -54,8 +56,53 @@ pub use file::FileWrapper;
 pub use tcp_listener::TcpListener;
 pub use tcp_stream::{TcpConnectFuture, TcpStream};
 
-fn win32_error() -> WIN32_ERROR {
-    WIN32_ERROR((Error::from_win32().code().0 & 0xFFFF) as _)
+fn expand_error(e: Error) -> WIN32_ERROR {
+    let code = if e.code().0 == 0 {
+        Error::from_win32().code().0
+    } else {
+        e.code().0
+    };
+
+    WIN32_ERROR((code & 0xFFFF) as _)
+}
+
+fn socket_accepted(
+    s: usize,
+    l: SOCKET,
+    streams: &mut Slab<StreamInner>,
+) -> Result<usize, mfio::error::Error> {
+    if unsafe {
+        setsockopt(
+            SOCKET(streams.get_mut(s).unwrap().socket.as_raw_socket() as _),
+            SOL_SOCKET,
+            SO_UPDATE_ACCEPT_CONTEXT,
+            Some(&l.0.to_ne_bytes()),
+        )
+    } != 0
+    {
+        Err(mferr!(500, Io, Other, Network))
+    } else {
+        Ok(s)
+    }
+}
+
+fn socket_connected(
+    s: usize,
+    streams: &mut Slab<StreamInner>,
+) -> Result<usize, mfio::error::Error> {
+    if unsafe {
+        setsockopt(
+            SOCKET(streams.get_mut(s).unwrap().socket.as_raw_socket() as _),
+            SOL_SOCKET,
+            SO_UPDATE_CONNECT_CONTEXT,
+            None,
+        )
+    } != 0
+    {
+        Err(mferr!(500, Io, Other, Network))
+    } else {
+        Ok(s)
+    }
 }
 
 #[repr(C)]
@@ -217,6 +264,7 @@ impl OperationMode {
 
     pub fn on_processed(
         self,
+        handle: HANDLE,
         res: std::io::Result<usize>,
         connections: &mut Slab<TcpGetSock>,
         streams: &mut Slab<StreamInner>,
@@ -275,7 +323,12 @@ impl OperationMode {
                 let conn = connections.get_mut(conn_id).unwrap();
 
                 match res {
-                    Ok(_) => conn.res = Some(Ok(conn.socket_idx.take().unwrap())),
+                    Ok(_) => {
+                        conn.res = Some(
+                            Ok(conn.socket_idx.take().unwrap())
+                                .and_then(|v| socket_connected(v, streams)),
+                        )
+                    }
                     Err(e) => {
                         conn.res = {
                             streams.remove(conn.socket_idx.take().unwrap());
@@ -295,7 +348,12 @@ impl OperationMode {
                 conn.tmp_addr = Some(tmp_addr);
 
                 match res {
-                    Ok(_) => conn.res = Some(Ok(conn.socket_idx.take().unwrap())),
+                    Ok(_) => {
+                        conn.res = Some(
+                            Ok(conn.socket_idx.take().unwrap())
+                                .and_then(|v| socket_accepted(v, SOCKET(handle.0 as _), streams)),
+                        )
+                    }
                     Err(e) => {
                         conn.res = {
                             streams.remove(conn.socket_idx.take().unwrap());
@@ -348,24 +406,25 @@ impl Operation {
         let res = if res.is_ok() {
             Ok(transferred as usize)
         } else {
-            match win32_error() {
+            match expand_error(Error::OK) {
                 ERROR_IO_INCOMPLETE | ERROR_HANDLE_EOF | ERROR_NO_DATA => Ok(transferred as usize),
                 _ => Err(std::io::Error::from(std::io::ErrorKind::Other)),
             }
         };
 
         self.mode
-            .on_processed(res, connections, streams, deferred_pkts)
+            .on_processed(header.handle, res, connections, streams, deferred_pkts)
     }
 
     pub fn on_error(
-        self,
+        mut self,
         connections: &mut Slab<TcpGetSock>,
         streams: &mut Slab<StreamInner>,
         deferred_pkts: &mut DeferredPackets,
     ) {
         log::trace!("On error");
         self.mode.on_processed(
+            self.header.get_mut().handle,
             Err(std::io::ErrorKind::Other.into()),
             connections,
             streams,
@@ -520,8 +579,8 @@ impl IocpState {
         header.overlapped.InternalHigh = 0;
         header.idx = idx;
         match entry.mode.submit_op(header) {
-            Err(_) => {
-                match win32_error() {
+            Err(e) => {
+                match expand_error(e) {
                     ERROR_INVALID_USER_BUFFER | ERROR_NOT_ENOUGH_MEMORY => {
                         if queue_back {
                             self.pending_ops.push_back(Ok(idx))

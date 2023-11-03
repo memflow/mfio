@@ -17,7 +17,8 @@ use crate::{Shutdown, TcpStreamHandle};
 
 use ::windows::Win32::Foundation::HANDLE;
 use ::windows::Win32::Networking::WinSock::{
-    shutdown, WSAGetLastError, SD_BOTH, SD_RECEIVE, SD_SEND, SOCKET, WSABUF,
+    shutdown, WSAGetLastError, SD_BOTH, SD_RECEIVE, SD_SEND, SOCKET, WSABUF, WSAECONNRESET,
+    WSAENOTCONN,
 };
 use ::windows::Win32::System::IO::CancelIoEx;
 use ::windows::Win32::System::IO::OVERLAPPED;
@@ -65,10 +66,32 @@ pub struct StreamInner {
 
 impl Drop for StreamInner {
     fn drop(&mut self) {
-        if unsafe { shutdown(SOCKET(self.socket.as_raw_socket() as _), SD_BOTH) } != 0 {
-            log::warn!("Could not shutdown stream: {:?}", unsafe {
-                WSAGetLastError()
-            });
+        let _ = self.shutdown(Shutdown::Both);
+    }
+}
+
+impl StreamInner {
+    fn shutdown(&self, how: Shutdown) -> Result<(), Error> {
+        let ret = unsafe {
+            shutdown(
+                SOCKET(self.socket.as_raw_socket() as _),
+                match how {
+                    Shutdown::Read => SD_RECEIVE,
+                    Shutdown::Write => SD_SEND,
+                    Shutdown::Both => SD_BOTH,
+                },
+            )
+        };
+        if ret != 0 {
+            match unsafe { WSAGetLastError() } {
+                WSAECONNRESET => Ok(()),
+                v => {
+                    log::error!("Unable to shutdown stream: {ret} {v:?}");
+                    Err(mferr!(500, Io, Other, Network))
+                }
+            }
+        } else {
+            Ok(())
         }
     }
 }
@@ -115,21 +138,7 @@ impl TcpStreamHandle for TcpStream {
             .streams
             .get(self.idx)
             .ok_or_else(|| io_err(State::NotFound))?;
-        if unsafe {
-            shutdown(
-                SOCKET(stream.socket.as_raw_socket() as _),
-                match how {
-                    Shutdown::Read => SD_RECEIVE,
-                    Shutdown::Write => SD_SEND,
-                    Shutdown::Both => SD_BOTH,
-                },
-            )
-        } != 0
-        {
-            Err(mferr!(500, Io, Other, Network))
-        } else {
-            Ok(())
-        }
+        stream.shutdown(how)
     }
 }
 
