@@ -39,7 +39,7 @@ pub struct StreamInner {
     stream: StreamBuf,
     in_read: bool,
     in_write: usize,
-    recv_msg: msghdr,
+    recv_msg: Box<msghdr>,
     read_queue: Vec<BoundPacketView<WrPerm>>,
     write_queue: Vec<BoundPacketView<RdPerm>>,
 }
@@ -64,7 +64,7 @@ impl From<net::TcpStream> for StreamInner {
             stream: StreamBuf::default(),
             in_read: false,
             in_write: 0,
-            recv_msg: empty_msg(),
+            recv_msg: empty_msg().into(),
             read_queue: Default::default(),
             write_queue: Default::default(),
         }
@@ -110,7 +110,7 @@ impl StreamInner {
             let queue = self.stream.read_queue();
             if !queue.is_empty() {
                 self.in_read = true;
-                let msg = &mut self.recv_msg;
+                let msg = &mut *self.recv_msg;
                 // Limit iov read to IOV_MAX, because we don't want to have the operation fail.
                 msg.msg_iovlen = core::cmp::min(queue.len() as usize, *IOV_MAX as usize) as _;
                 msg.msg_iov = queue.as_mut_ptr() as *mut iovec;
