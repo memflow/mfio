@@ -1,7 +1,7 @@
 use core::sync::atomic::{AtomicU8, Ordering};
 use core::task::{RawWaker, RawWakerVTable, Waker};
 use std::fs::File;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use tarc::{Arc, BaseArc};
 
@@ -75,8 +75,11 @@ impl<F: AsRawFd> FdWaker<F> {
         log::trace!("Flags {flags:b}");
         if flags & 0b111 == 0 {
             let mut f = unsafe { File::from_raw_fd(inner.fd.as_raw_fd()) };
-            f.write_all(&1u64.to_ne_bytes())
-                .expect("Could not wake the waker up");
+            match f.write_all(&1u64.to_ne_bytes()) {
+                Ok(()) => (),
+                Err(e) if e.kind() == ErrorKind::BrokenPipe => (),
+                Err(e) => panic!("Could not wake the waker up ({e:?})"),
+            }
             let _ = f.into_raw_fd();
         }
     }

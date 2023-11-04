@@ -967,6 +967,38 @@ mod tests {
     }
 
     #[test]
+    fn wake_test_dropped() {
+        for (backend, fs) in NativeRtBuilder::all_backends().build_each() {
+            println!("{backend}");
+            let (tx1, rx1) = std::sync::mpsc::channel();
+            let rx1 = BaseArc::new(parking_lot::Mutex::new(rx1));
+            let (tx2, rx2) = std::sync::mpsc::channel();
+
+            {
+                fs.unwrap().run(|_| async move {
+                    poll_fn(|cx| {
+                        let tx2 = tx2.clone();
+                        let rx1 = rx1.clone();
+                        let waker = cx.waker().clone();
+                        std::thread::spawn(move || {
+                            rx1.lock().recv().unwrap();
+                            println!("WAKE");
+                            waker.wake();
+                            println!("Woke");
+                            tx2.send(()).unwrap();
+                        });
+                        Poll::Ready(())
+                    })
+                    .await;
+                });
+            }
+
+            tx1.send(()).unwrap();
+            rx2.recv().unwrap();
+        }
+    }
+
+    #[test]
     fn wake_test_lot() {
         for (backend, fs) in NativeRtBuilder::all_backends().build_each() {
             println!("{backend}");
