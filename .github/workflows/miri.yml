@@ -5,17 +5,18 @@ on: [push, pull_request]
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: true
+  DEFAULT_MIRI_FLAGS: -Zmiri-ignore-leaks -Zmiri-symbolic-alignment-check -Zmiri-retag-fields=all -Zmiri-symbolic-alignment-check -Zmiri-strict-provenance -Zmiri-disable-isolation -Zmiri-tree-borrows -Zmiri-track-raw-pointers
 
 jobs:
   miri:
     runs-on: ubuntu-latest
     env:
-      RUSTFLAGS: ${{ matrix.rustflags }}
+      RUSTFLAGS: --cfg tokio_unstable ${{matrix.rustflags}}
     strategy:
       matrix:
         toolchain: ["nightly-2023-09-01"]
         seed: [1, 2, 3, 4, 5, 6, 7, 8]
-        rustflags: ["--cfg mfio_assume_linear_types --cfg tokio_unstable", "--cfg tokio_unstable"]
+        rustflags: ["", "--cfg mfio_assume_linear_types"]
     steps:
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
@@ -25,4 +26,4 @@ jobs:
       - run: rustup component add miri
       - name: Run miri
         run: |
-          MIRIFLAGS="-Zmiri-seed=${{ matrix.seed }} -Zmiri-ignore-leaks -Zmiri-symbolic-alignment-check -Zmiri-retag-fields=all -Zmiri-symbolic-alignment-check -Zmiri-strict-provenance -Zmiri-disable-isolation -Zmiri-tree-borrows" cargo miri test
+          MIRIFLAGS="-Zmiri-seed=${{matrix.seed}} ${{env.DEFAULT_MIRI_FLAGS}}" cargo miri test

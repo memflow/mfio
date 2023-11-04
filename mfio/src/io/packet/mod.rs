@@ -103,13 +103,11 @@ impl RcAndWaker {
     }
 
     pub fn wait_finalize(&self) {
-        // FIXME: in theory, wait_finalize should only wait for the FINALIZED_BIT, but not deal
-        // with the locking and the waker. However, something is making us have to take the waker,
-        // to make these atomic ops sound (however, even then I doubt this is fully sound, but is
-        // merely moving probability of desync lower).
-        // Either way, we should be able to have this waker mechanism be way more optimized,
-        // without atomic locks.
-        self.take();
+        // When we are holding data on the stack, this synchronization is somehow needed to avoid
+        // data races. To be fair, it is unlikely that this is eliminating them completely, but it
+        // probably pushes the statistical probability enough to not trigger it.
+        #[cfg(mfio_assume_linear_types)]
+        let _ = self.take();
         while (self.rc_and_flags.load(Ordering::Acquire) & FINALIZED_BIT) == 0 {
             core::hint::spin_loop();
         }

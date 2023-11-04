@@ -187,7 +187,7 @@ impl<'a, T: PacketIo<Perms, Param>, Perms: PacketPerms, Param, Pkt: PacketStore<
     type Output = Pkt::StackReq<'a>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        let state: &Self = unsafe { core::mem::transmute(self) };
+        let state = self.into_ref().get_ref();
 
         loop {
             match unsafe { (*state.initial_state.get()).take() } {
@@ -244,7 +244,7 @@ impl<
     > IoToFut<'a, T, Perms, Param, Pkt, Out>
 {
     pub fn submit(self: Pin<&mut Self>) -> &Out::StackReq<'a> {
-        let state: &Self = unsafe { core::mem::transmute(self) };
+        let state = unsafe { self.get_unchecked_mut() };
 
         if let Some((io, param)) = unsafe { (*state.initial_state.get()).take() } {
             // SAFETY: this packet's existence is tied to 'a lifetime, meaning it will be valid

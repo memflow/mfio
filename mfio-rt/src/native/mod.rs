@@ -494,10 +494,6 @@ impl NativeRt {
         self.block_on(func(self))
     }
 
-    fn register_file(&self, file: std::fs::File) -> NativeFile {
-        self.cwd.instance.register_file(file)
-    }
-
     /// Registers a non-seekable I/O stream
     pub fn register_stream(&self, stream: TcpStream) -> NativeTcpStream {
         self.cwd.instance.register_stream(stream)
