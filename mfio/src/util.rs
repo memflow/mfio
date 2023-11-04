@@ -1,8 +1,8 @@
 use crate::io::NoPos;
+use crate::locks::Mutex;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Waker;
-use parking_lot::Mutex;
 
 #[derive(Default)]
 pub struct Event {

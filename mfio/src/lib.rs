@@ -159,6 +159,23 @@
 //!
 //! TODO: write new safety examples for assume_linear_types
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+pub(crate) mod std_prelude {
+    #[cfg(not(feature = "std"))]
+    pub use ::alloc::{boxed::Box, vec, vec::Vec};
+    #[cfg(feature = "std")]
+    pub use std::prelude::v1::*;
+    #[cfg(not(feature = "std"))]
+    pub mod std {
+        pub use ::alloc::*;
+    }
+    #[cfg(feature = "std")]
+    pub use ::std;
+}
+
 pub mod backend;
 pub mod error;
 pub mod heap;
@@ -194,16 +211,23 @@ macro_rules! linear_types_switch {
     }
 }
 
+#[cfg(feature = "std")]
+pub use parking_lot as locks;
+#[cfg(not(feature = "std"))]
+pub use spin as locks;
 pub use tarc;
 
 #[cfg(test)]
 mod sample {
     use crate as mfio;
+    use crate::std_prelude::*;
     include!("sample.rs");
 }
 
 #[cfg(test)]
 mod tests {
+
+    use crate::std_prelude::*;
 
     use io::{IntoPacket, Packet, PacketIo, PacketIoExt, PacketView, Write};
 
@@ -213,44 +237,41 @@ mod tests {
     use crate::error::*;
     use crate::sample::SampleIo;
     use bytemuck::{Pod, Zeroable};
-    use core::mem::MaybeUninit;
     use core::pin::pin;
     use futures::StreamExt;
 
-    #[tokio::test]
-    async fn oobe() {
-        let mut handle = SampleIo::new((0..200).collect::<Vec<_>>());
+    #[test]
+    fn oobe() {
+        let handle = SampleIo::new((0..200).collect::<Vec<_>>());
 
-        Null::run_with_mut(&mut handle, |handle| async move {
+        handle.with_backend(async {
             let pkt = handle.io(200, Packet::<Write>::new_buf(200)).await;
 
             assert_eq!(pkt.as_ref().error_clamp(), 0);
-        })
-        .await;
+        });
 
         core::mem::drop(handle);
     }
 
-    #[tokio::test]
-    async fn split_oobe() {
-        let mut handle = SampleIo::new((0..200).collect::<Vec<_>>());
+    #[test]
+    fn split_oobe() {
+        let handle = SampleIo::new((0..200).collect::<Vec<_>>());
 
-        Null::run_with_mut(&mut handle, |handle| async move {
+        handle.with_backend(async {
             let pkt = handle.io(199, Packet::<Write>::new_buf(200)).await;
 
             assert_eq!(pkt.as_ref().error_clamp(), 1);
             assert_eq!(pkt.as_ref().min_error().unwrap().state, State::Outside);
-        })
-        .await;
+        });
 
         core::mem::drop(handle);
     }
 
-    #[tokio::test]
-    async fn split_oobe_stream() {
-        let mut handle = SampleIo::new((0..200).collect::<Vec<_>>());
+    #[test]
+    fn split_oobe_stream() {
+        let handle = SampleIo::new((0..200).collect::<Vec<_>>());
 
-        Null::run_with_mut(&mut handle, |handle| async move {
+        handle.with_backend(async {
             let fut = handle.io_to_stream(199, Packet::<Write>::new_buf(200), vec![]);
             let mut fut = pin!(fut);
 
@@ -261,89 +282,81 @@ mod tests {
             fut.await;
 
             assert_eq!(pkts.len(), 2);
-        })
-        .await;
+        });
 
         core::mem::drop(handle);
     }
 
-    #[tokio::test]
-    async fn split_oobe_func() {
-        let mut handle = SampleIo::new((0..200).collect::<Vec<_>>());
+    #[test]
+    fn split_oobe_func() {
+        let handle = SampleIo::new((0..200).collect::<Vec<_>>());
 
-        Null::run_with_mut(&mut handle, |handle| async move {
-            let out = tarc::BaseArc::new(parking_lot::Mutex::new(vec![]));
+        handle.with_backend(async {
+            let out = tarc::BaseArc::new(crate::locks::Mutex::new(vec![]));
 
-            handle
-                .io_to_fn(199, Packet::<Write>::new_buf(200), {
-                    let out = out.clone();
-                    move |view, err| out.lock().push((view, err))
-                })
-                .await;
+            handle.io_to_fn(199, Packet::<Write>::new_buf(200), {
+                let out = out.clone();
+                move |view, err| out.lock().push((view, err))
+            });
 
             let pkts = out.lock();
 
             assert_eq!(pkts.len(), 2);
-        })
-        .await;
+        });
 
         core::mem::drop(handle);
     }
 
-    #[tokio::test]
-    async fn single_elem_read() {
-        let mut handle = SampleIo::new((0..200).collect::<Vec<_>>());
+    #[test]
+    fn single_elem_read() {
+        let handle = SampleIo::new((0..200).collect::<Vec<_>>());
 
-        Null::run_with_mut(&mut handle, |handle| async move {
+        handle.with_backend(async {
             let pkt = handle.io(100, Packet::<Write>::new_buf(1)).await;
             assert_eq!(pkt.simple_contiguous_slice().unwrap(), &[100]);
-        })
-        .await;
+        });
 
         core::mem::drop(handle);
     }
 
-    #[tokio::test]
-    async fn two_read_scopes() {
-        let mut handle = SampleIo::new((0..200).collect::<Vec<_>>());
+    #[test]
+    fn two_read_scopes() {
+        let handle = SampleIo::new((0..200).collect::<Vec<_>>());
 
-        Null::run_with_mut(&mut handle, |scope| async move {
-            let pkt = scope.io(100, Packet::<Write>::new_buf(1)).await;
+        handle.block_on(async {
+            let pkt = handle.io(100, Packet::<Write>::new_buf(1)).await;
             assert_eq!(pkt.simple_contiguous_slice().unwrap(), &[100]);
-        })
-        .await;
+        });
 
-        Null::run_with_mut(&mut handle, |scope| async move {
-            let pkt = scope.io(100, Packet::<Write>::new_buf(1)).await;
+        handle.block_on(async {
+            let pkt = handle.io(100, Packet::<Write>::new_buf(1)).await;
             assert_eq!(pkt.simple_contiguous_slice().unwrap(), &[100]);
-        })
-        .await;
+        });
     }
 
-    #[tokio::test]
-    async fn single_elem_write() {
-        let mut handle = SampleIo::default();
+    #[test]
+    fn single_elem_write() {
+        let handle = SampleIo::default();
         let value = [42u8];
 
-        Null::run_with_mut(&mut handle, |handle| async move {
+        handle.with_backend(async {
             let (pkt, _) = value.into_packet();
             let pkt = handle.io(100, pkt).await;
             assert_eq!(pkt.min_error(), None);
 
             let pkt = handle.io(100, Packet::<Write>::new_buf(value.len())).await;
             assert_eq!(pkt.simple_contiguous_slice().unwrap(), &value);
-        })
-        .await;
+        });
 
         core::mem::drop(handle);
     }
 
-    #[tokio::test]
-    async fn single_elem_write_and_read() {
-        let mut handle = SampleIo::default();
+    #[test]
+    fn single_elem_write_and_read() {
+        let handle = SampleIo::default();
         let write = [42u8];
 
-        Null::run_with_mut(&mut handle, |handle| async move {
+        handle.with_backend(async {
             let (pkt, _) = write.into_packet();
             let pkt = handle.io(100, pkt).await;
             assert_eq!(pkt.min_error(), None);
@@ -351,13 +364,12 @@ mod tests {
             let pkt = handle.io(100, Packet::<Write>::new_buf(write.len())).await;
             let read = pkt.simple_contiguous_slice().unwrap();
             assert_eq!(&write, read);
-        })
-        .await;
+        });
     }
 
-    #[tokio::test]
-    async fn simple_struct_write_and_read() {
-        let mut handle = SampleIo::default();
+    #[test]
+    fn simple_struct_write_and_read() {
+        let handle = SampleIo::default();
         #[repr(C)]
         #[derive(Clone, Copy, Eq, PartialEq, Debug, Pod, Zeroable)]
         struct TestStruct {
@@ -372,18 +384,17 @@ mod tests {
             c: 8,
         };
 
-        Null::run_with_mut(&mut handle, |handle| async move {
+        handle.with_backend(async {
             handle.write(100, &write).await.unwrap();
 
             let read = handle.read::<TestStruct>(100).await.unwrap();
 
             assert_eq!(write, read);
-        })
-        .await;
+        });
     }
 
-    /*#[tokio::test]
-    async fn padded_struct_write_and_read() {
+    /*#[test]
+    fn padded_struct_write_and_read() {
         let handle = SampleIo::default();
 
         #[repr(C)]
@@ -407,29 +418,28 @@ mod tests {
         assert_eq!(write, read);
     }*/
 
-    #[tokio::test]
-    async fn two_elems() {
-        let mut handle = SampleIo::new((0..200).collect::<Vec<_>>());
-        Null::run_with_mut(&mut handle, |handle| async move {
+    #[test]
+    fn two_elems() {
+        let handle = SampleIo::new((0..200).collect::<Vec<_>>());
+        handle.with_backend(async {
             for _ in 0..2 {
                 let pkt = handle.io(100, Packet::<Write>::new_buf(1)).await;
                 assert_eq!(pkt.simple_contiguous_slice().unwrap(), &[100]);
             }
-        })
-        .await;
+        });
 
         core::mem::drop(handle);
     }
 
-    #[tokio::test]
-    async fn drop_bare_stream() {
+    #[test]
+    fn drop_bare_stream() {
         let handle = SampleIo::default();
         let fut = handle.io(100, Packet::<Write>::new_buf(0));
         core::mem::drop(fut);
     }
 
-    #[tokio::test]
-    async fn drop_bound_stream() {
+    #[test]
+    fn drop_bound_stream() {
         let handle = SampleIo::default();
         let pkt = Packet::<Write>::new_buf(1);
         let pv = PacketView::from_arc_ref(&pkt, 0);
@@ -440,9 +450,9 @@ mod tests {
         core::mem::drop(pkt);
     }
 
-    #[tokio::test]
+    #[test]
     #[should_panic]
-    async fn fully_drop_bound_stream() {
+    fn fully_drop_bound_stream() {
         let handle = SampleIo::default();
         let pkt = Packet::<Write>::new_buf(1);
         let pv = PacketView::from_arc_ref(&pkt, 0);
@@ -457,10 +467,12 @@ mod tests {
         core::mem::drop(pkt);
     }
 
-    use std::time::{Duration, Instant};
-
+    #[cfg(feature = "std")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn bench() {
+        use core::mem::MaybeUninit;
+        use std::time::{Duration, Instant};
+
         let mut io = SampleIo::default();
 
         const MILLIS: u64 = 10;

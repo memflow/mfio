@@ -149,7 +149,7 @@ pub fn block_on_t<T: ParkHandle, F: Future>(mut fut: F) -> F::Output {
     // SAFETY: We shadow `fut` so that it cannot be used again. The future is now pinned to the stack and will not be
     // moved until the end of this scope. This is, incidentally, exactly what the `pin_mut!` macro from `pin_utils`
     // does.
-    let mut fut = unsafe { std::pin::Pin::new_unchecked(&mut fut) };
+    let mut fut = unsafe { core::pin::Pin::new_unchecked(&mut fut) };
 
     let handle = T::current();
 

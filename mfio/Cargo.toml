@@ -16,16 +16,18 @@ name = "main"
 harness = false
 
 [dependencies]
-futures = "0.3"
-parking_lot = "0.12"
+futures = { version = "0.3", default-features = false }
+parking_lot = { version = "0.12", optional = true }
 pin-project = "1.0"
-tarc = "0.1"
+tarc = { version = "0.1", default-features = false }
 bytemuck = "1"
-cglue = { version = "0.2", features = ["task_unstable"] }
+cglue = { version = "0.2", features = ["task_unstable"], default-features = false }
 mfio-derive = { version = "0.1", path = "../mfio-derive" }
 http = { version = "0.2", optional = true }
 log = "0.4"
 rangemap = "1"
+# This is only needed when std feature is disabled, but we can't do negative bounds
+spin = "0.9"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.26", features = ["poll"] }
@@ -43,5 +45,5 @@ pollster = "0.2"
 bytemuck = { version = "1", features = ["derive"] }
 
 [features]
-default = ["std", "http"]
-std = []
+default = []#["std", "http"]
+std = ["parking_lot"]

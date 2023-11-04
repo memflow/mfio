@@ -2,12 +2,12 @@ use mfio::backend::*;
 use mfio::error::{Error, Location, State, Subject, INTERNAL_ERROR};
 use mfio::io::*;
 use mfio::util::*;
+use mfio::locks::Mutex;
 
 use mfio_derive::*;
 
 use tarc::{Arc, BaseArc};
 
-use parking_lot::Mutex;
 use std::collections::VecDeque;
 
 type Address = u64;

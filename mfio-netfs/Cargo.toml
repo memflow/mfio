@@ -23,22 +23,22 @@ bench = false
 required-features = ["bin-deps"]
 
 [dependencies]
-mfio = { version = "0.1", path = "../mfio" }
-mfio-rt = { version = "0.1", path = "../mfio-rt" }
-bincode = "1"
-cglue = { version = "0.2", features = ["task_unstable"] }
-flume = "0.10"
+mfio = { version = "0.1", path = "../mfio", default-features = false }
+mfio-rt = { version = "0.1", path = "../mfio-rt", default-features = false }
+cglue = { version = "0.2", features = ["task_unstable"], default-features = false }
+
 log = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
-async-mutex = "1"
-serde = { version = "1", features = ["derive"] }
-parking_lot = "0.12"
-futures = "0.3.28"
-futures-io = "0.3"
-slab = "0.4"
-tracing = "0.1"
-postcard = { version = "1", features = ["alloc"] }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+futures = { version = "0.3", default-features = false, features = ["async-await"] }
 debug-ignore = "1"
+postcard = { version = "1", features = ["alloc"], default-features = false }
+slab = { version = "0.4", default-features = false }
+
+flume = { version = "0.10", optional = true }
+async-mutex = { version = "1", optional = true }
+parking_lot = { version = "0.12", optional = true }
+tracing = { version = "0.1", optional = true }
 
 clap = { version = "4", features = ["cargo", "derive"], optional = true }
 anyhow = { version = "1", optional = true }
@@ -47,7 +47,7 @@ env_logger = { version = "0.10", optional = true }
 tokio = { version = "1.24", features = ["rt", "net", "macros"], optional = true }
 
 [dev-dependencies]
-mfio-rt = { version = "0.1", path = "../mfio-rt", features = ["test_suite"] }
+mfio-rt = { version = "0.1", path = "../mfio-rt", features = ["test_suite"], default-features = false }
 env_logger = "0.10"
 criterion = { version = "0.5", git = "https://github.com/h33p/criterion.rs", branch = "tput2", features = ["async_tokio", "async_smol", "async_futures"] }
 rand = "0.8"
@@ -58,5 +58,6 @@ tracing-subscriber = "0.3"
 tokio = { version = "1", features = ["rt", "macros"] }
 
 [features]
-default = []
+default = ["std"]
+std = ["mfio/std", "mfio-rt/std", "mfio-rt/native", "flume", "async-mutex", "parking_lot", "tracing", "futures/std"]
 bin-deps = ["clap", "tokio", "anyhow", "env_logger", "mfio/tokio"]

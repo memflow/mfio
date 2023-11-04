@@ -779,14 +779,18 @@ impl RtBgOp {
                 let _ = completion.send(ret.map_err(from_io_error));
             }
             Self::Metadata { path, completion } => {
+                let to_epoch_duration = |v: std::time::SystemTime| {
+                    v.duration_since(std::time::SystemTime::UNIX_EPOCH).ok()
+                };
+
                 let res = path
                     .metadata()
                     .map(|m| Metadata {
                         permissions: m.permissions().into(),
                         len: m.len(),
-                        modified: m.modified().ok(),
-                        accessed: m.accessed().ok(),
-                        created: m.created().ok(),
+                        modified: m.modified().ok().and_then(to_epoch_duration),
+                        accessed: m.accessed().ok().and_then(to_epoch_duration),
+                        created: m.created().ok().and_then(to_epoch_duration),
                     })
                     .map_err(from_io_error);
                 let _ = completion.send(res);

@@ -1,9 +1,11 @@
+use crate::std_prelude::*;
+
+use crate::locks::Mutex;
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::pin::Pin;
-use parking_lot::Mutex;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tarc::Arc;
 
 #[allow(clippy::type_complexity)]

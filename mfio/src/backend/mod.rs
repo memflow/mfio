@@ -1,3 +1,6 @@
+#[cfg(not(feature = "std"))]
+use crate::std_prelude::*;
+
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::pin::Pin;
@@ -10,26 +13,28 @@ pub mod integrations;
 pub use integrations::null::{Null, NullImpl};
 pub use integrations::Integration;
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "std"))]
 use nix::poll::*;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "std"))]
 use std::os::fd::RawFd;
-#[cfg(windows)]
+#[cfg(all(windows, feature = "std"))]
 use std::os::windows::io::RawHandle;
 
-#[cfg(any(unix, target_os = "wasi"))]
+#[cfg(all(any(unix, target_os = "wasi"), feature = "std"))]
 pub mod fd;
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "std"))]
 pub mod handle;
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "std"))]
 pub mod windows;
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "std"))]
 pub type DefaultHandle = RawFd;
-#[cfg(windows)]
+#[cfg(all(windows, feature = "std"))]
 pub type DefaultHandle = RawHandle;
+#[cfg(not(feature = "std"))]
+pub type DefaultHandle = core::convert::Infallible;
 
 pub type DynBackend = dyn Future<Output = ()> + Send;
 
@@ -286,7 +291,7 @@ impl PollingFlags {
         (bits & READ_POLL != 0, bits & WRITE_POLL != 0)
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "std"))]
     pub fn into_posix(&self) -> PollFlags {
         let mut flags = PollFlags::empty();
         // Relaxed is okay, because flags are meant to be set only by the owner of these flags, who
@@ -394,12 +399,18 @@ pub fn block_on<F: Future, B: IoBackend + ?Sized>(
     }
 }
 
-#[cfg(miri)]
+#[cfg(all(miri, feature = "std"))]
 fn block_on_handle<F: Future>(_: F, _: PollingHandle) -> F::Output {
     unimplemented!("Polling on miri is unsupported")
 }
 
-#[cfg(all(unix, not(miri)))]
+#[cfg(not(feature = "std"))]
+fn block_on_handle<F: Future>(_: F, _: PollingHandle) -> F::Output {
+    // TODO: allow implementors to create their own poll function, through traits and custom types.
+    unimplemented!("Polling on no_std is unsupported")
+}
+
+#[cfg(all(unix, not(miri), feature = "std"))]
 fn block_on_handle<F: Future>(mut fut: F, handle: PollingHandle) -> F::Output {
     let PollingHandle {
         handle,
@@ -425,7 +436,7 @@ fn block_on_handle<F: Future>(mut fut: F, handle: PollingHandle) -> F::Output {
     }
 }
 
-#[cfg(all(windows, not(miri)))]
+#[cfg(all(windows, not(miri), feature = "std"))]
 fn block_on_handle<F: Future>(mut fut: F, handle: PollingHandle) -> F::Output {
     let PollingHandle { handle, waker, .. } = handle;
 

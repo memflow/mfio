@@ -1,15 +1,16 @@
 //! `std::io` equivalent Read/Write traits.
 
 use crate as mfio;
+use crate::error::Result;
 use crate::io::*;
+use crate::locks::Mutex;
+use crate::std_prelude::*;
 use crate::traits::*;
 use crate::util::{PosShift, UsizeMath};
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use mfio_derive::*;
-use parking_lot::Mutex;
-use std::io;
 
 pub trait StreamPos<Param> {
     fn set_pos(&self, pos: Param);
@@ -130,7 +131,7 @@ impl<
         Obj: IntoPacket<'a, Perms>,
     > Future for AsyncIoFut<'a, Io, Perms, Param, Obj>
 {
-    type Output = io::Result<usize>;
+    type Output = Result<usize>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
@@ -157,7 +158,7 @@ pub struct StdReadToEndFut<'a, Io: PacketIo<Write, Param>, Param> {
 impl<'a, Io: PacketIo<Write, Param>, Param: PosShift<Io>> Future
     for StdReadToEndFut<'a, Io, Param>
 {
-    type Output = io::Result<()>;
+    type Output = Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
@@ -167,8 +168,7 @@ impl<'a, Io: PacketIo<Write, Param>, Param: PosShift<Io>> Future
                 Param::add_io_pos(this.io, r);
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(Err(_)) => Poll::Ready(Err(io::ErrorKind::Other.into())),
-            //Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -229,24 +229,24 @@ macro_rules! stdio_impl {
         impl<$($ty2),*> std::io::Read for $t<$($ty),*> where $t<$($ty),*>: $crate::stdeq::AsyncRead<u64> + $crate::backend::IoBackend, $($tt)* {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
                 use $crate::backend::IoBackend;
-                self.block_on($crate::stdeq::AsyncRead::read(self, buf))
+                self.block_on($crate::stdeq::AsyncRead::read(self, buf)).map_err(|_| std::io::ErrorKind::Other.into())
             }
 
-            fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+            fn read_to_end(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
                 use $crate::backend::IoBackend;
                 let len = buf.len();
-                self.block_on($crate::stdeq::AsyncRead::read_to_end(self, buf))?;
+                self.block_on($crate::stdeq::AsyncRead::read_to_end(self, buf)).map_err(|_| std::io::ErrorKind::Other)?;
                 Ok(buf.len() - len)
             }
         }
 
         impl<$($ty2),*> std::io::Write for $t<$($ty),*> where $t<$($ty),*>: $crate::stdeq::AsyncWrite<u64> + $crate::backend::IoBackend, $($tt)* {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
                 use $crate::backend::IoBackend;
-                self.block_on(AsyncWrite::write(self, buf))
+                self.block_on(AsyncWrite::write(self, buf)).map_err(|_| std::io::ErrorKind::Other.into())
             }
 
-            fn flush(&mut self) -> io::Result<()> {
+            fn flush(&mut self) -> std::io::Result<()> {
                 Ok(())
             }
         }
@@ -294,6 +294,7 @@ impl<T, Param: Copy> StreamPos<Param> for Seekable<T, Param> {
     }
 }
 
+#[cfg(feature = "std")]
 stdio_impl!(<T> Seekable<T, u64> @);
 
 #[derive(SyncIoWrite, SyncIoRead)]
@@ -323,4 +324,5 @@ impl<T, Param: Default + core::ops::Not<Output = Param>> StreamPos<Param> for Fa
     fn update_pos<F: FnOnce(Param) -> Param>(&self, _: F) {}
 }
 
+#[cfg(feature = "std")]
 stdio_impl!(<T> FakeSeek<T> @);

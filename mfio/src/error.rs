@@ -20,7 +20,7 @@ pub struct Code(NonZeroU8);
 #[cfg(not(feature = "http"))]
 impl core::fmt::Display for Code {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-        write!(f, "{}", self.code.0)
+        write!(f, "{}", self.0)
     }
 }
 
@@ -331,6 +331,7 @@ impl<const N: u8> From<ErrorConstLocation<N>> for Error {
     }
 }
 
+#[cfg(feature = "std")]
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
         Self {
@@ -342,6 +343,7 @@ impl From<std::io::Error> for Error {
     }
 }
 
+#[cfg(feature = "std")]
 impl From<std::io::ErrorKind> for State {
     fn from(kind: std::io::ErrorKind) -> Self {
         use std::io::ErrorKind::*;
@@ -371,12 +373,14 @@ impl From<std::io::ErrorKind> for State {
     }
 }
 
+#[cfg(feature = "std")]
 impl<const N: u8> From<std::io::ErrorKind> for ErrorConstLocation<N> {
     fn from(kind: std::io::ErrorKind) -> Self {
         ErrorConstLocation(INTERNAL_ERROR, Subject::Io, State::from(kind))
     }
 }
 
+#[cfg(feature = "std")]
 impl From<std::io::ErrorKind> for Error {
     fn from(kind: std::io::ErrorKind) -> Self {
         ErrorConstLocation::<{ Location::Other as u8 }>::from(kind).into()

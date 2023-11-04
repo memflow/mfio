@@ -1,7 +1,9 @@
+use alloc::{boxed::Box, vec::Vec};
 use core::mem::MaybeUninit;
 use mfio::error::{Error, Location, State, Subject, INTERNAL_ERROR};
 use mfio::io::*;
 
+#[cfg(feature = "std")]
 pub mod stream;
 
 pub fn io_err(state: State) -> Error {
@@ -13,6 +15,7 @@ pub fn io_err(state: State) -> Error {
     }
 }
 
+#[cfg(feature = "std")]
 pub fn from_io_error(err: std::io::Error) -> Error {
     io_err(err.kind().into())
 }

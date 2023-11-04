@@ -829,6 +829,7 @@ macro_rules! net_test_suite {
     };
 }
 
+#[cfg(feature = "native")]
 test_suite!(tests_default, |closure| {
     let _ = ::env_logger::builder().is_test(true).try_init();
     let mut rt = crate::NativeRt::default();
@@ -836,6 +837,7 @@ test_suite!(tests_default, |closure| {
     rt.run(closure);
 });
 
+#[cfg(feature = "native")]
 test_suite!(tests_all, |closure| {
     let _ = ::env_logger::builder().is_test(true).try_init();
     for (name, rt) in crate::NativeRt::builder().enable_all().build_each() {
@@ -847,6 +849,7 @@ test_suite!(tests_all, |closure| {
     }
 });
 
+#[cfg(feature = "native")]
 net_test_suite!(net_tests_default, |closure| {
     let _ = ::env_logger::builder().is_test(true).try_init();
     let mut rt = crate::NativeRt::default();
@@ -854,6 +857,7 @@ net_test_suite!(net_tests_default, |closure| {
     rt.run(closure);
 });
 
+#[cfg(feature = "native")]
 net_test_suite!(net_tests_all, |closure| {
     let _ = ::env_logger::builder().is_test(true).try_init();
     for (name, rt) in crate::NativeRt::builder().enable_all().build_each() {

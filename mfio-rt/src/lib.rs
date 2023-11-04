@@ -1,14 +1,28 @@
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+use alloc::string::String;
+
 use core::future::Future;
 
+use core::time::Duration;
 use futures::Stream;
 use mfio::backend::*;
 use mfio::error::Result as MfioResult;
 use mfio::io::NoPos;
 use mfio::stdeq::{AsyncRead, AsyncWrite};
 use serde::{Deserialize, Serialize};
+
+#[cfg(feature = "std")]
 use std::net::{SocketAddr, ToSocketAddrs};
+
+#[cfg(feature = "std")]
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+#[cfg(not(feature = "std"))]
+pub type Path = str;
+#[cfg(not(feature = "std"))]
+pub type PathBuf = String;
 
 #[cfg(feature = "native")]
 pub mod native;
@@ -17,7 +31,7 @@ mod util;
 #[doc(hidden)]
 pub mod __doctest;
 
-#[cfg(any(feature = "test_suite", test))]
+#[cfg(all(any(feature = "test_suite", test), feature = "std"))]
 pub mod test_suite;
 
 #[cfg(feature = "native")]
@@ -44,8 +58,10 @@ pub enum Shutdown {
     Both,
 }
 
+#[cfg(feature = "std")]
 use std::net;
 
+#[cfg(feature = "std")]
 impl From<net::Shutdown> for Shutdown {
     fn from(o: net::Shutdown) -> Self {
         match o {
@@ -56,6 +72,7 @@ impl From<net::Shutdown> for Shutdown {
     }
 }
 
+#[cfg(feature = "std")]
 impl From<Shutdown> for net::Shutdown {
     fn from(o: Shutdown) -> Self {
         match o {
@@ -149,6 +166,7 @@ pub trait DirHandle: Sized {
     /// # Examples
     ///
     /// ```
+    /// # #[cfg(feature = "std")]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// use mfio_rt::{DirHandle, Fs};
     /// use std::path::Path;
@@ -170,6 +188,7 @@ pub trait DirHandle: Sized {
     /// # Examples
     ///
     /// ```
+    /// # #[cfg(feature = "std")]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// use futures::StreamExt;
     /// use mfio::error::Error;
@@ -207,6 +226,7 @@ pub trait DirHandle: Sized {
     /// # Examples
     ///
     /// ```
+    /// # #[cfg(feature = "std")]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// use mfio::traits::IoRead;
     /// use mfio_rt::{DirHandle, Fs, OpenOptions};
@@ -237,6 +257,7 @@ pub trait DirHandle: Sized {
     /// # Examples
     ///
     /// ```
+    /// # #[cfg(feature = "std")]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// use futures::StreamExt;
     /// use mfio::traits::IoRead;
@@ -270,6 +291,7 @@ pub trait DirHandle: Sized {
     /// # Examples
     ///
     /// ```
+    /// # #[cfg(feature = "std")]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// # });
     /// ```
@@ -282,6 +304,7 @@ pub trait DirHandle: Sized {
     /// # Examples
     ///
     /// ```
+    /// # #[cfg(feature = "std")]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// # });
     /// ```
@@ -291,6 +314,7 @@ pub trait DirHandle: Sized {
     /// # Examples
     ///
     /// ```
+    /// # #[cfg(feature = "std")]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// # });
     /// ```
@@ -306,6 +330,7 @@ pub trait DirHandle: Sized {
     /// # Examples
     ///
     /// ```
+    /// # #[cfg(feature = "std")]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// # });
     /// ```
@@ -317,6 +342,7 @@ pub trait DirHandle: Sized {
     /// # Examples
     ///
     /// ```
+    /// # #[cfg(feature = "std")]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// # });
     /// ```
@@ -328,6 +354,7 @@ pub trait DirHandle: Sized {
     /// # Examples
     ///
     /// ```
+    /// # #[cfg(feature = "std")]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// # });
     /// ```
@@ -339,6 +366,7 @@ pub trait DirHandle: Sized {
     /// # Examples
     ///
     /// ```
+    /// # #[cfg(feature = "std")]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// # });
     /// ```
@@ -350,6 +378,7 @@ pub trait DirHandle: Sized {
     /// # Examples
     ///
     /// ```
+    /// # #[cfg(feature = "std")]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// # });
     /// ```
@@ -362,6 +391,7 @@ pub trait DirHandle: Sized {
     /// # Examples
     ///
     /// ```
+    /// # #[cfg(feature = "std")]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// # });
     /// ```
@@ -449,6 +479,12 @@ impl<P: AsRef<Path> + Copy> DirOp<P> {
         }
     }
 
+    #[cfg(not(feature = "std"))]
+    pub fn into_string(self) -> DirOp<String> {
+        self.into_pathbuf()
+    }
+
+    #[cfg(feature = "std")]
     pub fn into_string(self) -> DirOp<String> {
         match self {
             Self::SetPermissions { path, permissions } => DirOp::SetPermissions {
@@ -486,6 +522,7 @@ pub struct DirEntry {
     pub ty: FileType,
 }
 
+#[cfg(feature = "std")]
 impl From<std::fs::DirEntry> for DirEntry {
     fn from(d: std::fs::DirEntry) -> Self {
         let ty = d
@@ -521,6 +558,7 @@ pub enum FileType {
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize)]
 pub struct Permissions {}
 
+#[cfg(feature = "std")]
 impl From<std::fs::Permissions> for Permissions {
     fn from(_: std::fs::Permissions) -> Self {
         Self {}
@@ -531,9 +569,12 @@ impl From<std::fs::Permissions> for Permissions {
 pub struct Metadata {
     pub permissions: Permissions,
     pub len: u64,
-    pub modified: Option<SystemTime>,
-    pub accessed: Option<SystemTime>,
-    pub created: Option<SystemTime>,
+    /// Modified time (since unix epoch)
+    pub modified: Option<Duration>,
+    /// Accessed time (since unix epoch)
+    pub accessed: Option<Duration>,
+    /// Created time (since unix epoch)
+    pub created: Option<Duration>,
 }
 
 pub trait FileHandle: AsyncRead<u64> + AsyncWrite<u64> {}
@@ -542,6 +583,7 @@ impl<T: AsyncRead<u64> + AsyncWrite<u64>> FileHandle for T {}
 pub trait StreamHandle: AsyncRead<NoPos> + AsyncWrite<NoPos> {}
 impl<T: AsyncRead<NoPos> + AsyncWrite<NoPos>> StreamHandle for T {}
 
+#[cfg(feature = "std")]
 pub trait Tcp: IoBackend {
     type StreamHandle: TcpStreamHandle;
     type ListenerHandle: TcpListenerHandle<StreamHandle = Self::StreamHandle>;
@@ -559,6 +601,7 @@ pub trait Tcp: IoBackend {
     fn bind<'a, A: ToSocketAddrs + Send + 'a>(&'a self, addrs: A) -> Self::BindFuture<'a, A>;
 }
 
+#[cfg(feature = "std")]
 pub trait TcpStreamHandle: StreamHandle {
     fn local_addr(&self) -> MfioResult<SocketAddr>;
     fn peer_addr(&self) -> MfioResult<SocketAddr>;
@@ -571,6 +614,7 @@ pub trait TcpStreamHandle: StreamHandle {
     //fn nodelay(&self) -> MfioResult<bool>;
 }
 
+#[cfg(feature = "std")]
 pub trait TcpListenerHandle: Stream<Item = (Self::StreamHandle, SocketAddr)> {
     type StreamHandle: TcpStreamHandle;
 
