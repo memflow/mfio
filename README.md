@@ -12,9 +12,9 @@
 
 ## Framework for Async I/O Systems
 
-mfio's mission is to provide building blocks for efficient I/O systems, going beyond typical OS
-APIs. Originally built for memflow, it aims to make the following aspects of an I/O chain as simple
-as possible:
+mfio is a one-stop shop for custom async I/O systems. It allows you to go wild, beyond typical OS
+APIs. Originally built for memflow, it aims to make the following aspects of an I/O as simple as
+possible:
 
 1. Async
 2. Automatic batching (vectoring)
@@ -22,6 +22,14 @@ as possible:
 4. Partial success
 5. Lack of color (full sync support)
 6. I/O directly to the stack
+7. Using without standard library
+
+mfio achieves all this by building everything around two key, but tiny traits: `PacketIo`, and
+`IoBackend`. Backends implement these traits, which then allow asynchronous futures to be driven to
+completion. Then, high level abstractions are used to pass data to the I/O system, in the form of
+packets. These packets can have multiple views to non-overlapping segments of data, and different
+views may be processed differently. The end result is an incredibly flexible I/O system with
+unmatched potential for efficient concurrency.
 
 ## Crates
 
@@ -39,3 +47,20 @@ What each status means:
 - Alpha - API is incomplete, however, no serious bugs have been observed.
 - Experimental - Incomplete, and serious bugs have been observed. DO NOT run in production.
 
+## no_std
+
+`mfio` and `mfio-rt` do not require `std`, albeit `alloc` crate is still required. You can disable
+standard library requirements as follows:
+
+```toml
+mfio = { version = "0.1", default-features = false }
+mfio-rt = { version = "0.1", default-features = false, features = ["virt"] }
+```
+
+This will add both `mfio` and `mfio-rt` as dependencies in no\_std mode. Many features will be
+disabled, such as native polling handles, native runtime, and anything else that depends on running
+operating system.
+
+However, the remaining blocks should be sufficient to build any non-blocking I/O systems. It is not
+yet possible to define custom polling handles, for custom kernels, but it is not a significant
+amount of work left.

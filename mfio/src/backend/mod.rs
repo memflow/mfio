@@ -393,65 +393,43 @@ pub fn block_on<F: Future, B: IoBackend + ?Sized>(
     let fut = WithBackend { backend, future };
 
     if let Some(handle) = polling {
-        block_on_handle(fut, handle)
+        crate::poller::block_on_handle(fut, &handle, &handle.waker)
     } else {
         crate::poller::block_on(fut)
     }
 }
 
-#[cfg(all(miri, feature = "std"))]
-fn block_on_handle<F: Future>(_: F, _: PollingHandle) -> F::Output {
-    unimplemented!("Polling on miri is unsupported")
-}
+#[cfg(all(any(unix, windows), any(miri, not(feature = "std"))))]
+impl crate::poller::ParkHandle for PollingHandle<'_> {
+    fn unpark(&self) {
+        self.waker.wake_by_ref();
+    }
 
-#[cfg(not(feature = "std"))]
-fn block_on_handle<F: Future>(_: F, _: PollingHandle) -> F::Output {
-    // TODO: allow implementors to create their own poll function, through traits and custom types.
-    unimplemented!("Polling on no_std is unsupported")
-}
-
-#[cfg(all(unix, not(miri), feature = "std"))]
-fn block_on_handle<F: Future>(mut fut: F, handle: PollingHandle) -> F::Output {
-    let PollingHandle {
-        handle,
-        cur_flags,
-        waker,
-        ..
-    } = handle;
-
-    let mut fd = PollFd::new(handle, PollFlags::empty());
-
-    let mut cx = Context::from_waker(&waker);
-
-    loop {
-        let fut = unsafe { Pin::new_unchecked(&mut fut) };
-
-        match fut.poll(&mut cx) {
-            Poll::Ready(v) => break v,
-            Poll::Pending => {
-                fd.set_events(cur_flags.into_posix());
-                let _ = poll(&mut [fd], -1);
-            }
-        }
+    fn park(&self) {
+        unimplemented!("Polling on requires std feature, and not be run on miri")
     }
 }
 
-#[cfg(all(windows, not(miri), feature = "std"))]
-fn block_on_handle<F: Future>(mut fut: F, handle: PollingHandle) -> F::Output {
-    let PollingHandle { handle, waker, .. } = handle;
+#[cfg(all(unix, not(miri), feature = "std"))]
+impl crate::poller::ParkHandle for PollingHandle<'_> {
+    fn unpark(&self) {
+        self.waker.wake_by_ref();
+    }
 
-    use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+    fn park(&self) {
+        let fd = PollFd::new(self.handle, self.cur_flags.into_posix());
+        let _ = poll(&mut [fd], -1);
+    }
+}
 
-    let mut cx = Context::from_waker(&waker);
+#[cfg(all(windows, feature = "std"))]
+impl crate::poller::ParkHandle for PollingHandle<'_> {
+    fn unpark(&self) {
+        self.waker.wake_by_ref();
+    }
 
-    loop {
-        let fut = unsafe { Pin::new_unchecked(&mut fut) };
-
-        match fut.poll(&mut cx) {
-            Poll::Ready(v) => break v,
-            Poll::Pending => {
-                let _ = unsafe { WaitForSingleObject(handle as _, INFINITE) };
-            }
-        }
+    fn park(&self) {
+        use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+        let _ = unsafe { WaitForSingleObject(self.handle as _, INFINITE) };
     }
 }

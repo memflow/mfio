@@ -12,6 +12,7 @@
 //! 4. Partial success
 //! 5. Lack of color (full sync support)
 //! 6. I/O directly to the stack
+//! 7. Using without standard library
 //!
 //! This crate provides core, mostly unopiniated, building blocks for async I/O systems. The
 //! biggest design assumption is that this crate is to be used for thread-per-core-like I/O systems.
