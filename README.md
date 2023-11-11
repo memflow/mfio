@@ -61,6 +61,6 @@ This will add both `mfio` and `mfio-rt` as dependencies in no\_std mode. Many fe
 disabled, such as native polling handles, native runtime, and anything else that depends on running
 operating system.
 
-However, the remaining blocks should be sufficient to build any non-blocking I/O systems. It is not
-yet possible to define custom polling handles, for custom kernels, but it is not a significant
-amount of work left.
+However, the remaining blocks should be sufficient to build any non-blocking I/O systems. Custom
+polling handles may be implemented on arbitrary types to enable cooperative operations on any
+operating system.

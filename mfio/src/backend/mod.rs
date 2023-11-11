@@ -1,6 +1,8 @@
 #[cfg(not(feature = "std"))]
 use crate::std_prelude::*;
 
+use crate::poller::{self, ParkHandle};
+
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::pin::Pin;
@@ -213,13 +215,23 @@ impl<'a, Backend: Future + ?Sized, Fut: Future + ?Sized> Future for WithBackend<
     }
 }
 
-pub struct PollingHandle<'a> {
-    pub handle: DefaultHandle,
+pub struct PollingHandle<'a, Handle = DefaultHandle> {
+    pub handle: Handle,
     pub cur_flags: &'a PollingFlags,
     pub max_flags: PollingFlags,
     pub waker: Waker,
 }
 
+/// Represents desired object state flags to poll for.
+///
+/// Different backends may expose handles with different requirements. Some handles, when polled
+/// with incorrect flags may return an error, meaning it is crucial for the caller to pass correct
+/// flags in.
+///
+/// This is an object accessible from IoBackends that describes these flags. The object is designed
+/// so that these flags may get modified on the fly. Note that there is no encapsulation, so the
+/// caller should take great care in ensuring they do not modify these flags in breaking manner.
+/// However, doing so should not result in undefined behavior.
 #[repr(transparent)]
 pub struct PollingFlags {
     flags: AtomicU8,
@@ -235,18 +247,21 @@ impl PollingFlags {
         }
     }
 
+    /// Builds a new `PollingFlags` with no bits set.
     pub const fn new() -> Self {
         Self {
             flags: AtomicU8::new(0),
         }
     }
 
+    /// Builds a new `PollingFlags` with all bits set.
     pub const fn all() -> Self {
         Self {
             flags: AtomicU8::new(!0),
         }
     }
 
+    /// Consumes and returns a new `PollingFlags` with read bit set to specified value.
     pub const fn read(self, val: bool) -> Self {
         // SAFETY: data layout matches perfectly
         // We need this since AtomicU8::into_inner is not const stable yet.
@@ -259,6 +274,7 @@ impl PollingFlags {
         Self::from_flags(flags)
     }
 
+    /// Consumes and returns a new `PollingFlags` with write bit set to specified value.
     pub const fn write(self, val: bool) -> Self {
         // SAFETY: data layout matches perfectly
         let mut flags = unsafe { core::mem::transmute(self) };
@@ -270,6 +286,7 @@ impl PollingFlags {
         Self::from_flags(flags)
     }
 
+    /// Updates the read bit in-place.
     pub fn set_read(&self, val: bool) {
         if val {
             self.flags.fetch_or(READ_POLL, Ordering::Relaxed);
@@ -278,6 +295,7 @@ impl PollingFlags {
         }
     }
 
+    /// Updates the write bit in-place.
     pub fn set_write(&self, val: bool) {
         if val {
             self.flags.fetch_or(WRITE_POLL, Ordering::Relaxed);
@@ -286,13 +304,15 @@ impl PollingFlags {
         }
     }
 
+    /// Returns the values of current read and write bits.
     pub fn get(&self) -> (bool, bool) {
         let bits = self.flags.load(Ordering::Relaxed);
         (bits & READ_POLL != 0, bits & WRITE_POLL != 0)
     }
 
+    /// Converts these flags into posix PollFlags.
     #[cfg(all(unix, feature = "std"))]
-    pub fn into_posix(&self) -> PollFlags {
+    pub fn to_posix(&self) -> PollFlags {
         let mut flags = PollFlags::empty();
         // Relaxed is okay, because flags are meant to be set only by the owner of these flags, who
         // we are going to poll on behalf of.
@@ -307,7 +327,7 @@ impl PollingFlags {
     }
 }
 
-pub trait IoBackend {
+pub trait IoBackend<Handle: Pollable = DefaultHandle> {
     type Backend: Future<Output = ()> + Send + ?Sized;
 
     /// Gets handle to the backing event system.
@@ -355,7 +375,7 @@ pub trait IoBackend {
     fn block_on<F: Future>(&self, fut: F) -> F::Output {
         let backend = self.get_backend();
         let polling = self.polling_handle();
-        block_on::<F, Self>(fut, backend, polling)
+        block_on::<Handle, F, Self>(fut, backend, polling)
     }
 }
 
@@ -385,7 +405,7 @@ impl<'a, T: IoBackend + ?Sized> LinksIoBackend for RefLink<'a, T> {
     }
 }
 
-pub fn block_on<F: Future, B: IoBackend + ?Sized>(
+pub fn block_on<H: Pollable, F: Future, B: IoBackend<H> + ?Sized>(
     future: F,
     backend: BackendHandle<B::Backend>,
     polling: Option<PollingHandle>,
@@ -393,43 +413,49 @@ pub fn block_on<F: Future, B: IoBackend + ?Sized>(
     let fut = WithBackend { backend, future };
 
     if let Some(handle) = polling {
-        crate::poller::block_on_handle(fut, &handle, &handle.waker)
+        poller::block_on_handle(fut, &handle, &handle.waker)
     } else {
-        crate::poller::block_on(fut)
+        poller::block_on(fut)
     }
 }
 
-#[cfg(all(any(unix, windows), any(miri, not(feature = "std"))))]
-impl crate::poller::ParkHandle for PollingHandle<'_> {
+impl<H: Pollable> ParkHandle for PollingHandle<'_, H> {
     fn unpark(&self) {
         self.waker.wake_by_ref();
     }
 
     fn park(&self) {
+        self.handle.poll(self.cur_flags)
+    }
+}
+
+/// A pollable handle.
+///
+/// Implementing this trait on a custom type, allows one to build custom cooperation mechanisms for
+/// different operating environments.
+pub trait Pollable {
+    fn poll(&self, flags: &PollingFlags);
+}
+
+#[cfg(any(miri, not(feature = "std")))]
+impl Pollable for DefaultHandle {
+    fn poll(&self, _: &PollingFlags) {
         unimplemented!("Polling on requires std feature, and not be run on miri")
     }
 }
 
-#[cfg(all(unix, not(miri), feature = "std"))]
-impl crate::poller::ParkHandle for PollingHandle<'_> {
-    fn unpark(&self) {
-        self.waker.wake_by_ref();
-    }
-
-    fn park(&self) {
-        let fd = PollFd::new(self.handle, self.cur_flags.into_posix());
+#[cfg(all(not(miri), unix, feature = "std"))]
+impl Pollable for DefaultHandle {
+    fn poll(&self, flags: &PollingFlags) {
+        let fd = PollFd::new(*self, flags.to_posix());
         let _ = poll(&mut [fd], -1);
     }
 }
 
-#[cfg(all(windows, feature = "std"))]
-impl crate::poller::ParkHandle for PollingHandle<'_> {
-    fn unpark(&self) {
-        self.waker.wake_by_ref();
-    }
-
-    fn park(&self) {
+#[cfg(all(not(miri), windows, feature = "std"))]
+impl Pollable for DefaultHandle {
+    fn poll(&self, _: &PollingFlags) {
         use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
-        let _ = unsafe { WaitForSingleObject(self.handle as _, INFINITE) };
+        let _ = unsafe { WaitForSingleObject(*self as _, INFINITE) };
     }
 }
