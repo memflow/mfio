@@ -468,7 +468,7 @@ async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
                                             }
                                             FsRequest::OpenDir { path } => {
                                                 trace!("Open dir {path}");
-                                                let dir_id = match dh.open_dir(path).await {
+                                                let dir_id = match dh.open_dir(&path).await {
                                                     Ok(dir) => {
                                                         let dir_id = dir_handles
                                                             .borrow_mut()
@@ -507,7 +507,7 @@ async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
                                             FsRequest::Metadata { path } => {
                                                 trace!("Metadata {path}");
                                                 let metadata = dh
-                                                    .metadata(path)
+                                                    .metadata(&path)
                                                     .await
                                                     .map_err(Error::into_int_err);
                                                 FsResponse::Metadata { metadata }
@@ -515,7 +515,7 @@ async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
                                             FsRequest::DirOp(op) => {
                                                 trace!("Do dir op");
                                                 FsResponse::DirOp(
-                                                    dh.do_op(op)
+                                                    dh.do_op(op.as_path())
                                                         .await
                                                         .map_err(Error::into_int_err)
                                                         .err(),
@@ -568,12 +568,13 @@ async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
     l1.await;
 }
 
-pub fn single_client_server(addr: SocketAddr) -> (std::thread::JoinHandle<()>, SocketAddr) {
+fn single_client_server_with(
+    addr: SocketAddr,
+    fs: NativeRt,
+) -> (std::thread::JoinHandle<()>, SocketAddr) {
     let (tx, rx) = flume::bounded(1);
 
     let ret = std::thread::spawn(move || {
-        let fs = NativeRt::default();
-
         fs.block_on(async {
             let mut listener = fs.bind(addr).await.unwrap();
             let _ = tx.send_async(listener.local_addr().unwrap()).await;
@@ -587,6 +588,10 @@ pub fn single_client_server(addr: SocketAddr) -> (std::thread::JoinHandle<()>, S
     let addr = rx.recv().unwrap();
 
     (ret, addr)
+}
+
+pub fn single_client_server(addr: SocketAddr) -> (std::thread::JoinHandle<()>, SocketAddr) {
+    single_client_server_with(addr, NativeRt::default())
 }
 
 pub async fn server_bind(fs: &NativeRt, bind_addr: SocketAddr) {
@@ -663,13 +668,18 @@ mod tests {
         server.join().unwrap();
     }
 
-    mfio_rt::test_suite!(tests, |closure| {
+    mfio_rt::test_suite!(tests, |test_name, closure| {
         let _ = ::env_logger::builder().is_test(true).try_init();
-        use super::{single_client_server, NetworkFs, SocketAddr};
+        use super::{single_client_server_with, NetworkFs, SocketAddr};
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let (server, addr) = single_client_server(addr);
+
+        let mut rt = mfio_rt::NativeRt::default();
+        let dir = TempDir::new(test_name).unwrap();
+        rt.set_cwd(dir.path().to_path_buf());
+        let (server, addr) = single_client_server_with(addr, rt);
 
         let rt = mfio_rt::NativeRt::default();
+
         let mut rt = NetworkFs::with_fs(addr, rt.into(), true).unwrap();
 
         let fs = staticify(&mut rt);
@@ -681,7 +691,10 @@ mod tests {
             fs.block_on(func(fs))
         }
 
-        run(fs, closure);
+        run(fs, move |rt| {
+            let run = TestRun::new(rt, dir);
+            closure(run)
+        });
 
         core::mem::drop(rt);
 

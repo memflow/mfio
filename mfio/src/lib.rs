@@ -163,6 +163,7 @@
 
 extern crate alloc;
 
+#[allow(unused_imports)]
 pub(crate) mod std_prelude {
     #[cfg(not(feature = "std"))]
     pub use ::alloc::{boxed::Box, vec, vec::Vec};

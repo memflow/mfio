@@ -18,20 +18,23 @@ use serde::{Deserialize, Serialize};
 use std::net::{SocketAddr, ToSocketAddrs};
 
 #[cfg(feature = "std")]
-use std::path::{Path, PathBuf};
+pub use std::path::{Component, Path, PathBuf};
+
+// We may later consider supporting non-unix paths in no_std scenarios, but currently, this is not
+// the case, because TypedPath requires a lifetime argument.
 #[cfg(not(feature = "std"))]
-pub type Path = str;
-#[cfg(not(feature = "std"))]
-pub type PathBuf = String;
+pub use typed_path::{UnixComponent as Component, UnixPath as Path, UnixPathBuf as PathBuf};
 
 #[cfg(feature = "native")]
 pub mod native;
 mod util;
+#[cfg(any(feature = "virt", test, miri))]
+pub mod virt;
 
 #[doc(hidden)]
 pub mod __doctest;
 
-#[cfg(all(any(feature = "test_suite", test), feature = "std"))]
+#[cfg(any(feature = "test_suite", test))]
 pub mod test_suite;
 
 #[cfg(feature = "native")]
@@ -127,11 +130,11 @@ pub trait Fs: IoBackend {
     /// changed in this program.
     fn current_dir(&self) -> &Self::DirHandle<'_>;
 
-    fn open(
-        &self,
-        path: &Path,
+    fn open<'a>(
+        &'a self,
+        path: &'a Path,
         options: OpenOptions,
-    ) -> <Self::DirHandle<'_> as DirHandle>::OpenFileFuture<'_> {
+    ) -> <Self::DirHandle<'a> as DirHandle>::OpenFileFuture<'a> {
         self.current_dir().open_file(path, options)
     }
 }
@@ -166,16 +169,17 @@ pub trait DirHandle: Sized {
     /// # Examples
     ///
     /// ```
-    /// # #[cfg(feature = "std")]
+    /// # #[cfg(any(miri, feature = "std", feature = "virt"))]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// use mfio_rt::{DirHandle, Fs};
-    /// use std::path::Path;
+    /// // On no_std mfio_rt re-exports typed_path::UnixPath as Path
+    /// use mfio_rt::Path;
     ///
     /// let dir = fs.current_dir();
     ///
     /// let path = dir.path().await.unwrap();
     ///
-    /// assert_ne!(path, Path::new("/"));
+    /// assert_ne!(path, Path::new("/dev"));
     /// # });
     /// ```
     fn path(&self) -> Self::PathFuture<'_>;
@@ -188,7 +192,7 @@ pub trait DirHandle: Sized {
     /// # Examples
     ///
     /// ```
-    /// # #[cfg(feature = "std")]
+    /// # #[cfg(any(miri, feature = "std", feature = "virt"))]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// use futures::StreamExt;
     /// use mfio::error::Error;
@@ -226,7 +230,7 @@ pub trait DirHandle: Sized {
     /// # Examples
     ///
     /// ```
-    /// # #[cfg(feature = "std")]
+    /// # #[cfg(any(miri, feature = "std", feature = "virt"))]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// use mfio::traits::IoRead;
     /// use mfio_rt::{DirHandle, Fs, OpenOptions};
@@ -247,7 +251,11 @@ pub trait DirHandle: Sized {
     /// assert!(s.contains("mfio"));
     /// # });
     /// ```
-    fn open_file<P: AsRef<Path>>(&self, path: P, options: OpenOptions) -> Self::OpenFileFuture<'_>;
+    fn open_file<'a, P: AsRef<Path> + ?Sized>(
+        &'a self,
+        path: &'a P,
+        options: OpenOptions,
+    ) -> Self::OpenFileFuture<'a>;
 
     /// Opens a directory.
     ///
@@ -257,7 +265,7 @@ pub trait DirHandle: Sized {
     /// # Examples
     ///
     /// ```
-    /// # #[cfg(feature = "std")]
+    /// # #[cfg(any(miri, feature = "std", feature = "virt"))]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// use futures::StreamExt;
     /// use mfio::traits::IoRead;
@@ -284,18 +292,18 @@ pub trait DirHandle: Sized {
     ///
     /// # });
     /// ```
-    fn open_dir<P: AsRef<Path>>(&self, path: P) -> Self::OpenDirFuture<'_>;
+    fn open_dir<'a, P: AsRef<Path> + ?Sized>(&'a self, path: &'a P) -> Self::OpenDirFuture<'a>;
 
     /// Retrieves file metadata.
     ///
     /// # Examples
     ///
     /// ```
-    /// # #[cfg(feature = "std")]
+    /// # #[cfg(any(miri, feature = "std", feature = "virt"))]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// # });
     /// ```
-    fn metadata<P: AsRef<Path>>(&self, path: P) -> Self::MetadataFuture<'_>;
+    fn metadata<'a, P: AsRef<Path> + ?Sized>(&'a self, path: &'a P) -> Self::MetadataFuture<'a>;
 
     /// Do an operation.
     ///
@@ -304,25 +312,25 @@ pub trait DirHandle: Sized {
     /// # Examples
     ///
     /// ```
-    /// # #[cfg(feature = "std")]
+    /// # #[cfg(any(miri, feature = "std", feature = "virt"))]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// # });
     /// ```
-    fn do_op<P: AsRef<Path>>(&self, operation: DirOp<P>) -> Self::OpFuture<'_>;
+    fn do_op<'a, P: AsRef<Path> + ?Sized>(&'a self, operation: DirOp<&'a P>) -> Self::OpFuture<'a>;
 
     ///
     /// # Examples
     ///
     /// ```
-    /// # #[cfg(feature = "std")]
+    /// # #[cfg(any(miri, feature = "std", feature = "virt"))]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// # });
     /// ```
-    fn set_permissions<P: AsRef<Path>>(
-        &self,
-        path: P,
+    fn set_permissions<'a, P: AsRef<Path> + ?Sized>(
+        &'a self,
+        path: &'a P,
         permissions: Permissions,
-    ) -> Self::OpFuture<'_> {
+    ) -> Self::OpFuture<'a> {
         self.do_op(DirOp::SetPermissions { path, permissions })
     }
 
@@ -330,11 +338,11 @@ pub trait DirHandle: Sized {
     /// # Examples
     ///
     /// ```
-    /// # #[cfg(feature = "std")]
+    /// # #[cfg(any(miri, feature = "std", feature = "virt"))]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// # });
     /// ```
-    fn remove_dir<P: AsRef<Path>>(&self, path: P) -> Self::OpFuture<'_> {
+    fn remove_dir<'a, P: AsRef<Path> + ?Sized>(&'a self, path: &'a P) -> Self::OpFuture<'a> {
         self.do_op(DirOp::RemoveDir { path })
     }
 
@@ -342,11 +350,11 @@ pub trait DirHandle: Sized {
     /// # Examples
     ///
     /// ```
-    /// # #[cfg(feature = "std")]
+    /// # #[cfg(any(miri, feature = "std", feature = "virt"))]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// # });
     /// ```
-    fn remove_dir_all<P: AsRef<Path>>(&self, path: P) -> Self::OpFuture<'_> {
+    fn remove_dir_all<'a, P: AsRef<Path> + ?Sized>(&'a self, path: &'a P) -> Self::OpFuture<'a> {
         self.do_op(DirOp::RemoveDirAll { path })
     }
 
@@ -354,11 +362,35 @@ pub trait DirHandle: Sized {
     /// # Examples
     ///
     /// ```
-    /// # #[cfg(feature = "std")]
+    /// # #[cfg(any(miri, feature = "std", feature = "virt"))]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// # });
     /// ```
-    fn remove_file<P: AsRef<Path>>(&self, path: P) -> Self::OpFuture<'_> {
+    fn create_dir<'a, P: AsRef<Path> + ?Sized>(&'a self, path: &'a P) -> Self::OpFuture<'a> {
+        self.do_op(DirOp::CreateDir { path })
+    }
+
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(any(miri, feature = "std", feature = "virt"))]
+    /// # mfio_rt::__doctest::run_each(|fs| async {
+    /// # });
+    /// ```
+    fn create_dir_all<'a, P: AsRef<Path> + ?Sized>(&'a self, path: &'a P) -> Self::OpFuture<'a> {
+        self.do_op(DirOp::CreateDirAll { path })
+    }
+
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(any(miri, feature = "std", feature = "virt"))]
+    /// # mfio_rt::__doctest::run_each(|fs| async {
+    /// # });
+    /// ```
+    fn remove_file<'a, P: AsRef<Path> + ?Sized>(&'a self, path: &'a P) -> Self::OpFuture<'a> {
         self.do_op(DirOp::RemoveFile { path })
     }
 
@@ -366,11 +398,11 @@ pub trait DirHandle: Sized {
     /// # Examples
     ///
     /// ```
-    /// # #[cfg(feature = "std")]
+    /// # #[cfg(any(miri, feature = "std", feature = "virt"))]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// # });
     /// ```
-    fn rename<P: AsRef<Path>>(&self, from: P, to: P) -> Self::OpFuture<'_> {
+    fn rename<'a, P: AsRef<Path> + ?Sized>(&'a self, from: &'a P, to: &'a P) -> Self::OpFuture<'a> {
         self.do_op(DirOp::Rename { from, to })
     }
 
@@ -378,12 +410,12 @@ pub trait DirHandle: Sized {
     /// # Examples
     ///
     /// ```
-    /// # #[cfg(feature = "std")]
+    /// # #[cfg(any(miri, feature = "std", feature = "virt"))]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// # });
     /// ```
     // TODO: reflinking option
-    fn copy<P: AsRef<Path>>(&self, from: P, to: P) -> Self::OpFuture<'_> {
+    fn copy<'a, P: AsRef<Path> + ?Sized>(&'a self, from: &'a P, to: &'a P) -> Self::OpFuture<'a> {
         self.do_op(DirOp::Copy { from, to })
     }
 
@@ -391,11 +423,15 @@ pub trait DirHandle: Sized {
     /// # Examples
     ///
     /// ```
-    /// # #[cfg(feature = "std")]
+    /// # #[cfg(any(miri, feature = "std", feature = "virt"))]
     /// # mfio_rt::__doctest::run_each(|fs| async {
     /// # });
     /// ```
-    fn hard_link<P: AsRef<Path>>(&self, from: P, to: P) -> Self::OpFuture<'_> {
+    fn hard_link<'a, P: AsRef<Path> + ?Sized>(
+        &'a self,
+        from: &'a P,
+        to: &'a P,
+    ) -> Self::OpFuture<'a> {
         self.do_op(DirOp::HardLink { from, to })
     }
 
@@ -410,6 +446,8 @@ pub enum DirOp<P: AsRef<Path>> {
     SetPermissions { path: P, permissions: Permissions },
     RemoveDir { path: P },
     RemoveDirAll { path: P },
+    CreateDir { path: P },
+    CreateDirAll { path: P },
     RemoveFile { path: P },
     Rename { from: P, to: P },
     Copy { from: P, to: P },
@@ -429,6 +467,12 @@ impl<P: AsRef<Path>> DirOp<P> {
             Self::RemoveDirAll { path } => DirOp::RemoveDirAll {
                 path: path.as_ref(),
             },
+            Self::CreateDir { path } => DirOp::CreateDir {
+                path: path.as_ref(),
+            },
+            Self::CreateDirAll { path } => DirOp::CreateDirAll {
+                path: path.as_ref(),
+            },
             Self::RemoveFile { path } => DirOp::RemoveFile {
                 path: path.as_ref(),
             },
@@ -448,7 +492,43 @@ impl<P: AsRef<Path>> DirOp<P> {
     }
 }
 
-impl<P: AsRef<Path> + Copy> DirOp<P> {
+impl<'a, P: AsRef<Path> + ?Sized> DirOp<&'a P> {
+    pub fn into_path(self) -> DirOp<&'a Path> {
+        match self {
+            Self::SetPermissions { path, permissions } => DirOp::SetPermissions {
+                path: path.as_ref(),
+                permissions,
+            },
+            Self::RemoveDir { path } => DirOp::RemoveDir {
+                path: path.as_ref(),
+            },
+            Self::RemoveDirAll { path } => DirOp::RemoveDirAll {
+                path: path.as_ref(),
+            },
+            Self::CreateDir { path } => DirOp::CreateDir {
+                path: path.as_ref(),
+            },
+            Self::CreateDirAll { path } => DirOp::CreateDirAll {
+                path: path.as_ref(),
+            },
+            Self::RemoveFile { path } => DirOp::RemoveFile {
+                path: path.as_ref(),
+            },
+            Self::Rename { from, to } => DirOp::Rename {
+                from: from.as_ref(),
+                to: to.as_ref(),
+            },
+            Self::Copy { from, to } => DirOp::Copy {
+                from: from.as_ref(),
+                to: to.as_ref(),
+            },
+            Self::HardLink { from, to } => DirOp::HardLink {
+                from: from.as_ref(),
+                to: to.as_ref(),
+            },
+        }
+    }
+
     pub fn into_pathbuf(self) -> DirOp<PathBuf> {
         match self {
             Self::SetPermissions { path, permissions } => DirOp::SetPermissions {
@@ -459,6 +539,12 @@ impl<P: AsRef<Path> + Copy> DirOp<P> {
                 path: path.as_ref().into(),
             },
             Self::RemoveDirAll { path } => DirOp::RemoveDirAll {
+                path: path.as_ref().into(),
+            },
+            Self::CreateDir { path } => DirOp::CreateDir {
+                path: path.as_ref().into(),
+            },
+            Self::CreateDirAll { path } => DirOp::CreateDirAll {
                 path: path.as_ref().into(),
             },
             Self::RemoveFile { path } => DirOp::RemoveFile {
@@ -479,12 +565,6 @@ impl<P: AsRef<Path> + Copy> DirOp<P> {
         }
     }
 
-    #[cfg(not(feature = "std"))]
-    pub fn into_string(self) -> DirOp<String> {
-        self.into_pathbuf()
-    }
-
-    #[cfg(feature = "std")]
     pub fn into_string(self) -> DirOp<String> {
         match self {
             Self::SetPermissions { path, permissions } => DirOp::SetPermissions {
@@ -495,6 +575,12 @@ impl<P: AsRef<Path> + Copy> DirOp<P> {
                 path: path.as_ref().to_string_lossy().into(),
             },
             Self::RemoveDirAll { path } => DirOp::RemoveDirAll {
+                path: path.as_ref().to_string_lossy().into(),
+            },
+            Self::CreateDir { path } => DirOp::CreateDir {
+                path: path.as_ref().to_string_lossy().into(),
+            },
+            Self::CreateDirAll { path } => DirOp::CreateDirAll {
                 path: path.as_ref().to_string_lossy().into(),
             },
             Self::RemoveFile { path } => DirOp::RemoveFile {
@@ -569,12 +655,28 @@ impl From<std::fs::Permissions> for Permissions {
 pub struct Metadata {
     pub permissions: Permissions,
     pub len: u64,
-    /// Modified time (since unix epoch)
+    /// Modified time (since unix epoch, or other point)
     pub modified: Option<Duration>,
-    /// Accessed time (since unix epoch)
+    /// Accessed time (since unix epoch, or other point)
     pub accessed: Option<Duration>,
-    /// Created time (since unix epoch)
+    /// Created time (since unix epoch, or other point)
     pub created: Option<Duration>,
+}
+
+impl Metadata {
+    pub fn empty_file(permissions: Permissions, created: Option<Duration>) -> Self {
+        Self {
+            permissions,
+            len: 0,
+            modified: None,
+            accessed: None,
+            created,
+        }
+    }
+
+    pub fn empty_dir(permissions: Permissions, created: Option<Duration>) -> Self {
+        Self::empty_file(permissions, created)
+    }
 }
 
 pub trait FileHandle: AsyncRead<u64> + AsyncWrite<u64> {}

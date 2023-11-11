@@ -18,11 +18,14 @@ required-features = ["mfio/tokio", "mfio/async-io"]
 
 [dependencies]
 mfio = { version = "0.1", path = "../mfio", default-features = false }
-futures = { version = "0.3", default-features = false }
-once_cell = { version = "1", default-features = false, optional = true }
+futures = { version = "0.3", default-features = false, features = ["async-await"] }
+once_cell = { version = "1", default-features = false }
 log = "0.4"
 serde = { version = "1", features = ["derive", "alloc"], default-features = false }
 
+typed-path = { version = "0.7", default-features = false }
+
+# native rt deps
 tracing = { version = "0.1", optional = true }
 flume = { version = "0.10", optional = true }
 parking_lot = { version = "0.12", optional = true }
@@ -31,6 +34,7 @@ tempdir = { version = "0.3", optional = true }
 pathdiff = { version = "0.2", optional = true }
 async-semaphore = { version = "1", optional = true }
 slab = { version = "0.4", default-features = false }
+
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.51", features = ["Win32_System_IO", "Win32_Foundation", "Win32_System_WindowsProgramming", "Win32_Storage_FileSystem", "Win32_Networking_WinSock"] }
@@ -60,18 +64,17 @@ async-semaphore = "1"
 [target.'cfg(not(miri))'.dev-dependencies]
 tokio = { version = "1.24", features = ["rt", "rt-multi-thread", "fs", "io-util"] }
 
-#[target.'cfg(unix)'.dev-dependencies]
-#nuclei = "0.2"
-
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 rio = "0.9"
 # We need git version to compile on alpine
 glommio = { version = "0.8", git = "https://github.com/DataDog/glommio", rev = "517326bb2b63b6f6ddcf5deec7a283ee510f44df" }
 
 [features]
-default = ["mio", "io-uring", "iocp", "native", "std"]
-native = ["once_cell", "oneshot", "parking_lot", "flume", "tracing", "std"]
-std = ["mfio/std", "once_cell/std", "once_cell/parking_lot"]
+default = ["mio", "io-uring", "iocp", "native", "std", "virt"]
+native = ["oneshot", "parking_lot", "flume", "tracing", "std"]
+virt = []
+virt-sync = []
+std = ["mfio/std", "once_cell/std"]
 # technically iocp depends on native, but let's be in-line with other backends
 iocp = []
 test_suite = ["tempdir", "pathdiff", "async-semaphore"]

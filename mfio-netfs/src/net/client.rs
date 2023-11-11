@@ -664,7 +664,11 @@ impl DirHandle for NetworkFsDir {
     ///
     /// This function accepts an absolute or relative path to a file for reading. If the path is
     /// relative, it is opened relative to this `DirHandle`.
-    fn open_file<P: AsRef<Path>>(&self, path: P, options: OpenOptions) -> Self::OpenFileFuture<'_> {
+    fn open_file<'a, P: AsRef<Path> + ?Sized>(
+        &'a self,
+        path: &'a P,
+        options: OpenOptions,
+    ) -> Self::OpenFileFuture<'a> {
         OpenFileOp::make_future(
             self,
             FsRequest::OpenFile {
@@ -678,7 +682,7 @@ impl DirHandle for NetworkFsDir {
     ///
     /// This function accepts an absolute or relative path to a directory for reading. If the path
     /// is relative, it is opened relative to this `DirHandle`.
-    fn open_dir<P: AsRef<Path>>(&self, path: P) -> Self::OpenDirFuture<'_> {
+    fn open_dir<'a, P: AsRef<Path> + ?Sized>(&'a self, path: &'a P) -> Self::OpenDirFuture<'a> {
         OpenDirOp::make_future(
             self,
             FsRequest::OpenDir {
@@ -687,7 +691,7 @@ impl DirHandle for NetworkFsDir {
         )
     }
 
-    fn metadata<P: AsRef<Path>>(&self, path: P) -> Self::MetadataFuture<'_> {
+    fn metadata<'a, P: AsRef<Path> + ?Sized>(&'a self, path: &'a P) -> Self::MetadataFuture<'a> {
         MetadataOp::make_future(
             self,
             FsRequest::Metadata {
@@ -699,8 +703,8 @@ impl DirHandle for NetworkFsDir {
     /// Do an operation.
     ///
     /// This function performs an operation from the [`DirOp`](DirOp) enum.
-    fn do_op<P: AsRef<Path>>(&self, operation: DirOp<P>) -> Self::OpFuture<'_> {
-        OpOp::make_future(self, FsRequest::DirOp(operation.as_path().into_string()))
+    fn do_op<'a, P: AsRef<Path> + ?Sized>(&'a self, operation: DirOp<&'a P>) -> Self::OpFuture<'a> {
+        OpOp::make_future(self, FsRequest::DirOp(operation.into_string()))
     }
 }
 

@@ -260,6 +260,8 @@ ienum! {
         Import,
         Section,
         Backend,
+        Entry,
+        Operation,
         Other,
     }
 }
@@ -296,6 +298,8 @@ ienum! {
         Nop,
         UnexpectedEof,
         InUse,
+        Corrupted,
+        Removed,
         Other,
     }
 }

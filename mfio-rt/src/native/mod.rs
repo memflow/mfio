@@ -18,6 +18,9 @@ use crate::{
     TcpStreamHandle,
 };
 
+#[cfg(test)]
+use crate::{net_test_suite, test_suite};
+
 mod impls;
 
 macro_rules! fs_dispatch {
@@ -502,6 +505,10 @@ impl NativeRt {
     pub fn cancel_all_ops(&self) {
         self.cwd.instance.cancel_all_ops()
     }
+
+    pub fn set_cwd(&mut self, dir: PathBuf) {
+        self.cwd.dir = Some(dir);
+    }
 }
 
 impl From<NativeRtInstance> for NativeRt {
@@ -573,7 +580,11 @@ impl DirHandle for NativeRtDir {
     ///
     /// This function accepts an absolute or relative path to a file for reading. If the path is
     /// relative, it is opened relative to this `DirHandle`.
-    fn open_file<P: AsRef<Path>>(&self, path: P, options: OpenOptions) -> Self::OpenFileFuture<'_> {
+    fn open_file<'a, P: AsRef<Path> + ?Sized>(
+        &'a self,
+        path: &'a P,
+        options: OpenOptions,
+    ) -> Self::OpenFileFuture<'a> {
         let (tx, rx) = oneshot::channel();
 
         if let Ok(path) = self.join_path(path) {
@@ -597,7 +608,7 @@ impl DirHandle for NativeRtDir {
     ///
     /// This function accepts an absolute or relative path to a directory for reading. If the path
     /// is relative, it is opened relative to this `DirHandle`.
-    fn open_dir<P: AsRef<Path>>(&self, path: P) -> Self::OpenDirFuture<'_> {
+    fn open_dir<'a, P: AsRef<Path> + ?Sized>(&'a self, path: &'a P) -> Self::OpenDirFuture<'a> {
         let dir = self.join_path(path).map_err(from_io_error).and_then(|v| {
             if v.is_dir() {
                 Ok(Self {
@@ -615,7 +626,7 @@ impl DirHandle for NativeRtDir {
         ready(dir)
     }
 
-    fn metadata<P: AsRef<Path>>(&self, path: P) -> Self::MetadataFuture<'_> {
+    fn metadata<'a, P: AsRef<Path> + ?Sized>(&'a self, path: &'a P) -> Self::MetadataFuture<'a> {
         let (tx, rx) = oneshot::channel();
 
         if let Ok(path) = self.join_path(path) {
@@ -633,7 +644,7 @@ impl DirHandle for NativeRtDir {
     /// Do an operation.
     ///
     /// This function performs an operation from the [`DirOp`] enum.
-    fn do_op<P: AsRef<Path>>(&self, operation: DirOp<P>) -> Self::OpFuture<'_> {
+    fn do_op<'a, P: AsRef<Path> + ?Sized>(&'a self, operation: DirOp<&'a P>) -> Self::OpFuture<'a> {
         let (tx, rx) = oneshot::channel();
 
         let _ = self.ops.send(RtBgOp::DirOp {
@@ -771,6 +782,8 @@ impl RtBgOp {
                     }
                     DirOp::RemoveDir { path } => fs::remove_dir(path),
                     DirOp::RemoveDirAll { path } => fs::remove_dir_all(path),
+                    DirOp::CreateDir { path } => fs::create_dir(path),
+                    DirOp::CreateDirAll { path } => fs::create_dir_all(path),
                     DirOp::RemoveFile { path } => fs::remove_file(path),
                     DirOp::Rename { from, to } => fs::rename(from, to),
                     DirOp::Copy { from, to } => fs::copy(from, to).map(|_| ()),
@@ -1102,3 +1115,53 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+test_suite!(tests_default, |test_name, closure| {
+    let _ = ::env_logger::builder().is_test(true).try_init();
+    let mut rt = crate::NativeRt::default();
+    let rt = staticify(&mut rt);
+    let dir = TempDir::new(test_name).unwrap();
+    rt.set_cwd(dir.path().to_path_buf());
+    rt.run(move |rt| {
+        let run = TestRun::new(rt, dir);
+        closure(run)
+    });
+});
+
+#[cfg(test)]
+test_suite!(tests_all, |test_name, closure| {
+    let _ = ::env_logger::builder().is_test(true).try_init();
+    for (name, rt) in crate::NativeRt::builder().enable_all().build_each() {
+        println!("{name}");
+        if let Ok(mut rt) = rt {
+            let rt = staticify(&mut rt);
+            let dir = TempDir::new(test_name).unwrap();
+            rt.set_cwd(dir.path().to_path_buf());
+            rt.run(move |rt| {
+                let run = TestRun::new(rt, dir);
+                closure(run)
+            });
+        }
+    }
+});
+
+#[cfg(test)]
+net_test_suite!(net_tests_default, |closure| {
+    let _ = ::env_logger::builder().is_test(true).try_init();
+    let mut rt = crate::NativeRt::default();
+    let rt = staticify(&mut rt);
+    rt.run(closure);
+});
+
+#[cfg(test)]
+net_test_suite!(net_tests_all, |closure| {
+    let _ = ::env_logger::builder().is_test(true).try_init();
+    for (name, rt) in crate::NativeRt::builder().enable_all().build_each() {
+        println!("{name}");
+        if let Ok(mut rt) = rt {
+            let rt = staticify(&mut rt);
+            rt.run(closure);
+        }
+    }
+});

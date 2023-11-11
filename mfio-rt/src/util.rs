@@ -1,10 +1,83 @@
-use alloc::{boxed::Box, vec::Vec};
+#![cfg_attr(not(feature = "std"), allow(dead_code))]
+
+use crate::{Component, Path, PathBuf};
+use alloc::{boxed::Box, vec, vec::Vec};
 use core::mem::MaybeUninit;
 use mfio::error::{Error, Location, State, Subject, INTERNAL_ERROR};
 use mfio::io::*;
 
 #[cfg(feature = "std")]
 pub mod stream;
+
+/// Compute path difference
+///
+/// This was taken from `pathdiff` crate, but made compatible with `typed-path` paths.
+pub fn diff_paths<P, B>(path: P, base: B) -> Option<PathBuf>
+where
+    P: AsRef<Path>,
+    B: AsRef<Path>,
+{
+    let path = path.as_ref();
+    let base = base.as_ref();
+
+    if path.is_absolute() != base.is_absolute() {
+        if path.is_absolute() {
+            Some(PathBuf::from(path))
+        } else {
+            None
+        }
+    } else {
+        let mut ita = path.components();
+        let mut itb = base.components();
+        let mut comps: Vec<Component> = vec![];
+        loop {
+            match (ita.next(), itb.next()) {
+                (None, None) => break,
+                (Some(a), None) => {
+                    comps.push(a);
+                    comps.extend(ita.by_ref());
+                    break;
+                }
+                (None, _) => comps.push(Component::ParentDir),
+                (Some(a), Some(b)) if comps.is_empty() && a == b => (),
+                (Some(a), Some(b)) if b == Component::CurDir => comps.push(a),
+                (Some(_), Some(b)) if b == Component::ParentDir => return None,
+                (Some(a), Some(_)) => {
+                    comps.push(Component::ParentDir);
+                    for _ in itb {
+                        comps.push(Component::ParentDir);
+                    }
+                    comps.push(a);
+                    comps.extend(ita.by_ref());
+                    break;
+                }
+            }
+        }
+
+        Some(
+            comps
+                .iter()
+                .map(|c| {
+                    #[cfg(feature = "std")]
+                    let r = c.as_os_str();
+                    #[cfg(not(feature = "std"))]
+                    let r: &[u8] = c.as_ref();
+                    r
+                })
+                .collect(),
+        )
+    }
+}
+
+pub fn path_filename_str(path: &Path) -> Option<&str> {
+    let filename = path.file_name()?;
+    #[cfg(feature = "std")]
+    let filename = filename.to_str()?;
+    #[cfg(not(feature = "std"))]
+    let filename = core::str::from_utf8(filename).ok()?;
+
+    Some(filename)
+}
 
 pub fn io_err(state: State) -> Error {
     Error {

@@ -1061,6 +1061,7 @@ unsafe impl<T: 'static, Perms: PacketPerms> OpaqueStore for FullPacket<T, Perms>
     where
         Self: 'a,
     {
+        #[allow(clippy::useless_conversion)]
         self.into()
     }
 

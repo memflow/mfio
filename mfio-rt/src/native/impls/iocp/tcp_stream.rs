@@ -18,7 +18,6 @@ use crate::{Shutdown, TcpStreamHandle};
 use ::windows::Win32::Foundation::HANDLE;
 use ::windows::Win32::Networking::WinSock::{
     shutdown, WSAGetLastError, SD_BOTH, SD_RECEIVE, SD_SEND, SOCKET, WSABUF, WSAECONNRESET,
-    WSAENOTCONN,
 };
 use ::windows::Win32::System::IO::CancelIoEx;
 use ::windows::Win32::System::IO::OVERLAPPED;
@@ -228,7 +227,7 @@ impl StreamInner {
                 let operation = Operation {
                     header: hdr.into(),
                     mode: OperationMode::StreamWrite(WsaOp {
-                        bufs: (&queue[..]) as *const [_] as *const [WSABUF],
+                        bufs: queue as *const [_] as *const [WSABUF],
                         transferred: 0,
                         flags: 0,
                         sock_idx: idx,
