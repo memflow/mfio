@@ -569,36 +569,92 @@ impl<'a, A> Future for TcpConnectFuture<'a, A> {
 
 pub struct TcpListener {
     listener: BaseArc<net::TcpListener>,
-    rx: flume::r#async::RecvStream<'static, (net::TcpStream, SocketAddr)>,
+    exit_handle: BaseArc<AtomicBool>,
+    rx: ManuallyDrop<flume::r#async::RecvStream<'static, (net::TcpStream, SocketAddr)>>,
     store: Store<net::TcpStream>,
+    thread: ManuallyDrop<JoinHandle<()>>,
 }
 
 impl TcpListener {
     fn new(listener: net::TcpListener, store: Store<net::TcpStream>) -> Self {
-        let (tx, rx) = flume::bounded(16);
+        let (tx, rx) = flume::bounded(0);
         let listener = BaseArc::from(listener);
-        let rx = rx.into_stream();
+        let rx = ManuallyDrop::new(rx.into_stream());
+        let exit_handle = BaseArc::new(AtomicBool::default());
 
-        thread::spawn({
+        let thread = thread::spawn({
             let listener = listener.clone();
-            move || loop {
-                match listener.accept() {
-                    Err(e) if e.kind() != io::ErrorKind::ConnectionAborted => break,
-                    Ok(v) => {
-                        if tx.send(v).is_err() {
+            let exit_handle = exit_handle.clone();
+            move || {
+                while !exit_handle.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Err(e) if e.kind() != io::ErrorKind::ConnectionAborted => {
                             break;
                         }
+                        Ok(v) => {
+                            if tx.send(v).is_err() {
+                                break;
+                            }
+                        }
+                        _ => (),
                     }
-                    _ => (),
                 }
             }
         });
+
+        let thread = ManuallyDrop::new(thread);
 
         Self {
             listener,
             rx,
             store,
+            thread,
+            exit_handle,
         }
+    }
+}
+
+impl Drop for TcpListener {
+    fn drop(&mut self) {
+        self.exit_handle.fetch_or(true, Ordering::Release);
+        unsafe { ManuallyDrop::drop(&mut self.rx) };
+        let thread = unsafe { ManuallyDrop::take(&mut self.thread) };
+
+        if let Err(e) = self.listener.set_nonblocking(true) {
+            log::error!("Unable to set listener to non-blocking: {e}");
+        }
+
+        // Now force-kick the listener
+        if let Ok(addr) = self.listener.local_addr() {
+            let mut success = false;
+            'outer: for i in 0.. {
+                for _ in 0..16 {
+                    if thread.is_finished() {
+                        break 'outer;
+                    }
+
+                    if let Err(e) = net::TcpStream::connect(addr) {
+                        // This seems like a temporary error on macOS.
+                        if e.kind() == std::io::ErrorKind::AddrNotAvailable {
+                            std::thread::sleep(core::time::Duration::from_millis(1 << i));
+                        } else {
+                            break 'outer;
+                        }
+                    } else {
+                        success = true;
+                        break 'outer;
+                    }
+                }
+            }
+
+            if !success && !thread.is_finished() {
+                log::error!("Unable initiate socket shutdown. We may block forever.");
+            }
+        } else {
+            log::error!("Unable to get local address, listener thraed may end up deadlocking...");
+        }
+
+        let _ = thread.join();
     }
 }
 
@@ -615,7 +671,7 @@ impl Stream for TcpListener {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         let this = unsafe { self.get_unchecked_mut() };
-        let rx = unsafe { Pin::new_unchecked(&mut this.rx) };
+        let rx = unsafe { Pin::new_unchecked(&mut *this.rx) };
 
         match rx.poll_next(cx) {
             Poll::Ready(v) => {

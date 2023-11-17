@@ -6,7 +6,12 @@
 //! Note that at the current moment this can be considered more as a toy example, rather than fully
 //! featured implementation.
 
-use alloc::{collections::BTreeMap, string::ToString, vec, vec::Vec};
+use alloc::{
+    collections::BTreeMap,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 use core::future::{pending, ready, Future, Ready};
 use core::mem::drop;
 use core::ops::Bound;
