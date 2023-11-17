@@ -244,13 +244,12 @@ impl<
     > IoToFut<'a, T, Perms, Param, Pkt, Out>
 {
     pub fn submit(self: Pin<&mut Self>) -> &Out::StackReq<'a> {
-        let state = unsafe { self.get_unchecked_mut() };
-
-        if let Some((io, param)) = unsafe { (*state.initial_state.get()).take() } {
+        let this = self.into_ref();
+        if let Some((io, param)) = unsafe { (*this.initial_state.get()).take() } {
             // SAFETY: this packet's existence is tied to 'a lifetime, meaning it will be valid
             // throughout 'a.
             let (pkt, out): &'a mut (Pkt::StackReq<'a>, Out::StackReq<'a>) =
-                unsafe { (*state.pkt_out.get()).as_mut().unwrap() };
+                unsafe { (*this.pkt_out.get()).as_mut().unwrap() };
             let view: PacketView<'a, Perms> = Pkt::stack_opaque(pkt);
             // SAFETY: PacketView's lifetime is a marker, and we are using the marker lifetime to guide
             // assumptions about type's validity. A sound implementation would put a 'static object
@@ -260,7 +259,7 @@ impl<
             io.send_io(param, bound)
         }
 
-        unsafe { (*state.pkt_out.get()).as_ref().map(|(_, out)| out).unwrap() }
+        unsafe { (*this.pkt_out.get()).as_ref().map(|(_, out)| out).unwrap() }
     }
 }
 
@@ -275,10 +274,10 @@ impl<
 {
     type Output = (Pkt::StackReq<'a>, Out::StackReq<'a>);
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        let state = unsafe { self.get_unchecked_mut() };
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        self.as_mut().submit();
 
-        unsafe { Pin::new_unchecked(&mut *state) }.submit();
+        let state = self.into_ref();
 
         let pkt: &'a Pkt::StackReq<'a> = unsafe { &(*state.pkt_out.get()).as_ref().unwrap().0 };
         let mut pkt: &'a Packet<Perms> = Pkt::stack_hdr(pkt);

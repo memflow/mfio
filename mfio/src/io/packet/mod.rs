@@ -5,7 +5,7 @@ use crate::error::Error;
 pub use cglue::task::{CWaker, FastCWaker};
 use core::cell::UnsafeCell;
 use core::future::Future;
-use core::marker::PhantomData;
+use core::marker::{PhantomData, PhantomPinned};
 use core::mem::ManuallyDrop;
 use core::mem::MaybeUninit;
 use core::num::NonZeroI32;
@@ -84,6 +84,7 @@ impl RcAndWaker {
         unsafe { *self.waker.get() = MaybeUninit::new(waker) };
 
         self.rc_and_flags.fetch_or(HAS_WAKER_BIT, Ordering::Relaxed);
+
         self.rc_and_flags.fetch_and(!LOCK_BIT, Ordering::AcqRel) & !ALL_BITS
     }
 
@@ -105,11 +106,6 @@ impl RcAndWaker {
     }
 
     pub fn wait_finalize(&self) {
-        // When we are holding data on the stack, this synchronization is somehow needed to avoid
-        // data races. To be fair, it is unlikely that this is eliminating them completely, but it
-        // probably pushes the statistical probability enough to not trigger it.
-        #[cfg(mfio_assume_linear_types)]
-        let _ = self.take();
         while (self.rc_and_flags.load(Ordering::Acquire) & FINALIZED_BIT) == 0 {
             core::hint::spin_loop();
         }
@@ -653,6 +649,13 @@ pub struct Packet<Perms: PacketPerms> {
     error_clamp: AtomicU64,
     /// Note that this may be raced against so it should not be relied as "the minimum error".
     min_error: AtomicI32,
+    // We need miri to treat packets magically. Without marking this type as !Unpin, miri would
+    // detect UB in situations where a packet is shared across threads, even though we are not
+    // performing any mutable aliasing.
+    //
+    // See:
+    // https://github.com/RalfJung/rfcs/blob/9881c94c5a9b7b24b12aaa07541c8b25e64ad5ae/text/0000-unsafe-aliased.md
+    _phantom: PhantomPinned,
     // data afterwards
 }
 
@@ -709,7 +712,7 @@ impl<Perms: PacketPerms> Packet<Perms> {
 
         let (prev, has_waker) = self.rc_and_waker.dec_rc();
 
-        // Do nothing, because we are not the last packet (any of the first 62 bits set).
+        // Do nothing, because we are not the last packet
         if prev != 1 {
             return None;
         }
@@ -755,6 +758,7 @@ impl<Perms: PacketPerms> Packet<Perms> {
             rc_and_waker: Default::default(),
             error_clamp: (!0u64).into(),
             min_error: 0.into(),
+            _phantom: PhantomPinned,
         }
     }
 
