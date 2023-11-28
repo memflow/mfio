@@ -4,14 +4,6 @@ version = "0.1.0"
 rust-version = "1.72"
 edition = "2021"
 
-[lib]
-bench = false
-
-[[bench]]
-name = "main"
-harness = false
-required-features = ["mfio/tokio"]
-
 [[example]]
 name = "trace"
 required-features = ["tokio/net"]

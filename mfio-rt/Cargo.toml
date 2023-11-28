@@ -8,14 +8,6 @@ license = "MIT"
 repository = "https://github.com/memflow/mfio"
 description = "mfio based async runtime"
 
-[lib]
-bench = false
-
-[[bench]]
-name = "main"
-harness = false
-required-features = ["mfio/tokio", "mfio/async-io"]
-
 [dependencies]
 mfio = { version = "0.1", path = "../mfio", default-features = false }
 futures = { version = "0.3", default-features = false, features = ["async-await"] }
@@ -56,7 +48,6 @@ rand = "0.8"
 flume = "0.10"
 smol = "1"
 env_logger = "0.10"
-tracing-tracy = { version = "0.10", features = ["fibers", "only-localhost"] }
 tempdir = "0.3"
 pathdiff = "0.2"
 async-semaphore = "1"
