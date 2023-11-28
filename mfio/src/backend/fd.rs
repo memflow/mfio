@@ -1,3 +1,4 @@
+use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU8, Ordering};
 use core::task::{RawWaker, RawWakerVTable, Waker};
 use std::fs::File;
@@ -18,7 +19,7 @@ impl<F: AsRawFd> From<F> for FdWakerOwner<F> {
     fn from(fd: F) -> Self {
         Self(FdWaker(
             BaseArc::new(FdWakerInner {
-                fd,
+                fd: ManuallyDrop::new(fd),
                 flags: Default::default(),
             })
             .into_raw(),
@@ -86,7 +87,11 @@ impl<F: AsRawFd> FdWaker<F> {
 
     pub fn close(&self) {
         let inner = unsafe { &*self.0 };
-        inner.flags.fetch_or(0b100, Ordering::AcqRel);
+        if inner.flags.fetch_or(0b100, Ordering::AcqRel) & 0b100 == 0 {
+            // SAFETY: we are attesting exclusive access to the
+            let fd = unsafe { &mut (*self.0.cast_mut()).fd };
+            unsafe { ManuallyDrop::drop(fd) }
+        }
     }
 
     pub fn into_raw_waker(self) -> RawWaker {
@@ -125,8 +130,16 @@ impl<F: AsRawFd> FdWaker<F> {
 }
 
 struct FdWakerInner<F: AsRawFd> {
-    fd: F,
+    fd: ManuallyDrop<F>,
     flags: AtomicU8,
+}
+
+impl<F: AsRawFd> Drop for FdWakerInner<F> {
+    fn drop(&mut self) {
+        if *self.flags.get_mut() & 0b100 == 0 {
+            unsafe { ManuallyDrop::drop(&mut self.fd) }
+        }
+    }
 }
 
 impl<F: AsRawFd> AsRef<AtomicU8> for FdWakerInner<F> {
