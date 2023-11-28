@@ -148,7 +148,7 @@
 //! By default mfio is conservative and does not enable invoking undefined behavior. However, with
 //! a custom opt-in config switch, enabled by passing `--cfg mfio_assume_linear_types` to the rust
 //! compiler, mfio is able to provide significant performance improvements, at the cost of
-//! potential for invoking UB in safe code.
+//! potential for invoking UB in safe code*.
 //!
 //! With `mfio_assume_linear_types` config enabled, mfio wrappers will prefer storing data on the
 //! stack, and if a future waiting for I/O operations to complete is cancelled, a `panic!` may get
@@ -156,9 +156,10 @@
 //! `mem::forget`, undefined behavior may be invoked, because use-after-(stack)-free safeguards are
 //! discarded.
 //!
-//! ### Safety examples
-//!
-//! TODO: write new safety examples for assume_linear_types
+//! *NOTE: `Pin<P>` includes a
+//! [drop guarantee](https://doc.rust-lang.org/std/pin/index.html#drop-guarantee), making this
+//! claim technically invalid. In the future releases of `mfio`, the config switch will be removed
+//! and most I/O will be done through stack (see <https://github.com/memflow/mfio/issues/2>).
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -180,12 +181,12 @@ pub(crate) mod std_prelude {
 
 pub mod backend;
 pub mod error;
-pub mod heap;
 pub mod io;
-mod poller;
 pub mod stdeq;
 pub mod traits;
-pub mod util;
+
+mod poller;
+mod util;
 
 #[cfg(not(mfio_assume_linear_types))]
 #[macro_export]

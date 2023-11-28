@@ -8,6 +8,9 @@ license = "MIT"
 repository = "https://github.com/memflow/mfio"
 description = "memflow completion-based I/O primitives"
 
+[package.metadata.docs.rs]
+features = ["default", "tokio", "async-io"]
+
 [lib]
 bench = false
 
@@ -33,7 +36,7 @@ spin = "0.9"
 nix = { version = "0.26", features = ["poll"] }
 # incompatible with miri
 tokio = { version = "1", optional = true, features = ["net"] }
-async-io = { version = "1", optional = true }
+async-io = { version = "2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.48", features = ["Win32_System_Threading", "Win32_Foundation", "Win32_Security"] }
@@ -45,5 +48,5 @@ pollster = "0.2"
 bytemuck = { version = "1", features = ["derive"] }
 
 [features]
-default = []#["std", "http"]
+default = ["std", "http"]
 std = ["parking_lot"]

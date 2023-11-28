@@ -87,9 +87,119 @@ pub use packet::*;
 mod opaque;
 pub use opaque::*;
 
+/// The primary trait enabling I/O.
+///
+/// This trait is generic in as many aspects as possible. The typical input is a parameter,
+/// typically representing a location, while view contains a slice of a packet. These 2 are
+/// disjoint, because the parameter may change on multiple hops of I/O chain, without data on the
+/// view changing.
+///
+/// `Perms` represents access permissions the packets sent through this trait have. This typically
+/// means reversed meaning when it comes to desired I/O operation. For instance, `Write` packets
+/// allow read operations to be performced, because data is read into the packet. Meanwhile, `Read`
+/// permission implies the packet holds the data, and that data can be transferred to the internal
+/// data store of the I/O backend.
+///
+/// # Example
+///
+/// Request-response handler:
+///
+/// ```
+/// use mfio::io::*;
+/// use mfio::traits::*;
+/// use mfio::mferr;
+///
+/// enum Request {
+///     Hi,
+///     Ho,
+/// }
+///
+/// impl Request {
+///     fn response(self) -> &'static [u8] {
+///         match self {
+///             Self::Hi => b"Hi",
+///             Self::Ho => b"Hoooooo",
+///         }
+///     }
+/// }
+///
+/// struct Backend;
+///
+/// impl PacketIo<Write, Request> for Backend {
+///     fn send_io(&self, param: Request, view: BoundPacketView<Write>) {
+///         let resp = param.response();
+///
+///         let view = if view.len() > resp.len() as u64 {
+///             let (a, b) = view.split_at(resp.len() as u64);
+///             b.error(mferr!(Memory, Outside, Backend));
+///             a
+///         } else {
+///             view
+///         };
+///
+///         // SAFETY: we have verified the packet view is at most the size of the response.
+///         unsafe {
+///             let _ = view.transfer_data(resp.as_ptr().cast());
+///         }
+///     }
+/// }
+///
+/// # pollster::block_on(async {
+/// let backend = Backend;
+///
+/// let mut buf = [0u8; 64];
+/// let _ = backend.read_all(Request::Ho, &mut buf[..]).await;
+/// assert_eq!(&buf[..7], b"Hoooooo");
+/// let _ = backend.read_all(Request::Hi, &mut buf[..]).await;
+/// assert_eq!(&buf[..2], b"Hi");
+/// assert_eq!(&buf[..10], b"Hiooooo\0\0\0");
+/// # });
+/// ```
 #[cglue_trait]
 pub trait PacketIo<Perms: PacketPerms, Param>: Sized {
-    // TODO: make this a sink
+    /// Send I/O request to the backend.
+    ///
+    /// This is a low level function for sending I/O to the backend. Typically, you'd use
+    /// [`PacketIoExt`], and [`StreamIoExt`] traits as second level abstractions. Third level
+    /// abstractions include [`IoRead`](crate::traits::IoRead), [`IoWrite`](crate::traits::IoWrite),
+    /// [`AsyncRead`](crate::stdeq::AsyncRead), and [`AsyncWrite`](crate::stdeq::AsyncWrite). Use
+    /// of these traits is highly encouraged.
+    ///
+    /// TODO: make this a sink (<https://github.com/memflow/mfio/issues/3>)
+    ///
+    /// # Example
+    ///
+    /// Manually sending I/O and awaiting it:
+    ///
+    /// ```
+    /// # mod sample {
+    /// #     include!("../sample.rs");
+    /// # }
+    /// # use sample::SampleIo;
+    /// use mfio::io::*;
+    /// use mfio::backend::*;
+    /// use mfio::mferr;
+    ///
+    /// let handle = SampleIo::new(vec![0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144]);
+    ///
+    /// handle.block_on(async {
+    ///     // Create a "simple" packet on the stack. Note that use of this must be careful - such
+    ///     // usage can be considered to fall within the description of `mfio_assume_linear_types`
+    ///     let packet = FullPacket::<_, Write>::new([0u8; 5]);
+    ///
+    ///     let view = PacketView::from_ref(&packet, 0);
+    ///     // SAFETY: through block_on, we ensure the packet will be waited until completion, and
+    ///     // not be moved from the original location.
+    ///     let view = unsafe { view.bind(None) };
+    ///
+    ///     handle.send_io(3, view);
+    ///
+    ///     // Packet is awaitable, and blocks until there are no more in-flight segments.
+    ///     let _ = (&*packet).await;
+    ///
+    ///     assert_eq!(packet.simple_contiguous_slice().unwrap(), &[2, 3, 5, 8, 13]);
+    /// })
+    /// ```
     fn send_io(&self, param: Param, view: BoundPacketView<Perms>);
 }
 

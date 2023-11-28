@@ -1,3 +1,9 @@
+//! Backends for `mfio`.
+//!
+//! A backend is a stateful object that can be used to resolve a future to completion, either by
+//! blocking execution, or, exposing a handle, which can then be integrated into other asynchronous
+//! runtimes through [integrations].
+
 #[cfg(not(feature = "std"))]
 use crate::std_prelude::*;
 
@@ -327,6 +333,10 @@ impl PollingFlags {
     }
 }
 
+/// Primary trait describing I/O backends.
+///
+/// This trait is implemented at the outer-most stateful object of the I/O context. A `IoBackend`
+/// has the opportunity to expose efficient ways of driving said backend to completion.
 pub trait IoBackend<Handle: Pollable = DefaultHandle> {
     type Backend: Future<Output = ()> + Send + ?Sized;
 

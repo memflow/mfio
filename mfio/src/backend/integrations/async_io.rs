@@ -1,5 +1,11 @@
+//! `async-io` 2.0 integration.
+//!
+//! We technically support `async-io` 1, however, the system had a
+//! [limitation](https://github.com/smol-rs/async-io/issues/132) that was only resolved in version
+//! 2.
+
 use async_io::Async;
-use std::os::fd::RawFd;
+use std::os::fd::BorrowedFd;
 
 use super::super::*;
 use super::{BorrowingFn, Integration};
@@ -26,7 +32,7 @@ enum AsyncIoState<'a, B: IoBackend + ?Sized + 'a, Func, F> {
     Initial(Func),
     Loaded(
         WithBackend<'a, B::Backend, F>,
-        Option<(Async<RawFd>, &'a PollingFlags, Waker)>,
+        Option<(Async<BorrowedFd<'a>>, &'a PollingFlags, Waker)>,
     ),
     Finished,
 }
@@ -76,12 +82,10 @@ impl<'a, B: LinksIoBackend + 'a, Func: BorrowingFn<B::Link>> Future
                                  waker,
                                  ..
                              }| {
+                                let handle = unsafe { BorrowedFd::borrow_raw(handle) };
                                 (
-                                    // FIXME: we need to make `Async` not set nonblocking mode, as it
-                                    // is unsupported on kqueues. We should talk with upstream to
-                                    // enable our usage.
-                                    // Async::with_nonblocking_mode(h, false)
-                                    Async::new(handle).expect("Could not register the IO resource"),
+                                    Async::new_nonblocking(handle)
+                                        .expect("Could not register the IO resource"),
                                     cur_flags,
                                     waker,
                                 )

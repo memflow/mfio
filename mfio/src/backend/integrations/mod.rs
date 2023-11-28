@@ -1,3 +1,11 @@
+//! Integrates `mfio` backends with other async runtimes.
+//!
+//! Integrations allow `mfio` backend objects to be used in other runtimes with true cooperation.
+//!
+//! Note that the current integration use is rather limited, mainly, both `tokio` and `async-io`
+//! require unix platforms, since async equivalents for windows raw handle polling is not exposed
+//! at the moment.
+
 #[cfg(all(unix, feature = "async-io"))]
 pub mod async_io;
 pub mod null;

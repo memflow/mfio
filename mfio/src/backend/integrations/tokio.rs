@@ -1,3 +1,5 @@
+//! `tokio` integration.
+
 use std::os::fd::RawFd;
 use tokio::io::{unix::AsyncFd, Interest};
 

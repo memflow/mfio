@@ -1,3 +1,9 @@
+//! A null integration.
+//!
+//! This integration assumes external wakers, and no backend dependence on cooperative handles.
+//! This works great whenever the I/O backend runs on a separate thread, however, this usually
+//! leads to severe latency penalty due to cross-thread synchronization.
+
 use super::super::*;
 use super::{BorrowingFn, Integration};
 

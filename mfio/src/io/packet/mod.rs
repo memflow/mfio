@@ -1892,6 +1892,9 @@ impl<T: PacketPerms> Errorable for TransferredPacket<T> {
     }
 }
 
+/// Standard packet variations.
+///
+/// This is a small helper used to enable easy storage of different packet types in one place.
 pub enum StandardPktVariations<Perms: PacketPerms> {
     BoundPacketView(BoundPacketView<Perms>),
     Alloced(<Perms as PacketPerms>::Alloced),
@@ -1948,6 +1951,9 @@ impl<Perms: PacketPerms> Errorable for StandardPktVariations<Perms> {
 
 macro_rules! packet_combos {
     ($name:ident, $($perms:ident),*) => {
+        /// Packet combinations.
+        ///
+        /// This is a small helper used to enable easy storage of different packet types in one place.
         pub enum $name {
             $($perms(StandardPktVariations<$perms>)),*
         }
