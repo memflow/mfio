@@ -4,10 +4,6 @@ version = "0.1.0"
 rust-version = "1.72"
 edition = "2021"
 
-[[example]]
-name = "trace"
-required-features = ["tokio/net"]
-
 [[bin]]
 name = "mfio-netfs-server"
 test = false
@@ -43,7 +39,6 @@ mfio-rt = { version = "0.1", path = "../mfio-rt", features = ["test_suite"], def
 env_logger = "0.10"
 criterion = { version = "0.5", git = "https://github.com/h33p/criterion.rs", branch = "tput2", features = ["async_tokio", "async_smol", "async_futures"] }
 rand = "0.8"
-tracing-tracy = { version = "0.10", features = ["fibers", "only-localhost"] }
 tracing-subscriber = "0.3"
 
 [target.'cfg(not(miri))'.dev-dependencies]
