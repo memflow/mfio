@@ -274,6 +274,14 @@ impl NetworkFs {
                             }
                         };
 
+                        // Verify that the tag is proper, since otherwise we may jump to the wrong place of
+                        // code. TODO: use proper deserialization techniques
+                        // SAFETY: memunsafe made safe
+                        // while adding this check saves us from memory safety bugs, this will probably
+                        // still lead to arbitrarily large allocations that make us crash.
+                        let tag = unsafe { *(&resp as *const _ as *const u8) };
+                        assert!(tag < 4, "incoming data tag is invalid {tag}");
+
                         trace!("Response: {resp:?}");
 
                         match resp {

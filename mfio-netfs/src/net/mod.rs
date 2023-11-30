@@ -14,6 +14,9 @@ use mfio::io::{
 use mfio::tarc::BaseArc;
 use mfio_rt::{DirEntry, DirOp, Metadata, OpenOptions};
 
+// SAFETY: memunsafe
+// We cannot have safe implementation of this, because malformed data may lead to invalid tag.
+// This may lead to incorrect jumps in pattern matching.
 unsafe impl Zeroable for Request {}
 unsafe impl Pod for Request {}
 unsafe impl Zeroable for Response {}

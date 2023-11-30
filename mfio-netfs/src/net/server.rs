@@ -147,6 +147,14 @@ async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
         } {
             let end_span = tracing::span!(tracing::Level::TRACE, "server read Request");
             let op = async {
+                // Verify that the tag is proper, since otherwise we may jump to the wrong place of
+                // code. TODO: use proper deserialization techniques
+                // SAFETY: memunsafe made safe
+                // while adding this check saves us from memory safety bugs, this will probably
+                // still lead to arbitrarily large allocations that make us crash.
+                let tag = unsafe { *(&v as *const _ as *const u8) };
+                assert!(tag < 5, "incoming data tag is invalid {tag}");
+
                 trace!("Receive req: {v:?}");
 
                 match v {
