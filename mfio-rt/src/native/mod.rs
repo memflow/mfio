@@ -1117,51 +1117,194 @@ mod tests {
 }
 
 #[cfg(test)]
-test_suite!(tests_default, |test_name, closure| {
-    let _ = ::env_logger::builder().is_test(true).try_init();
-    let mut rt = crate::NativeRt::default();
-    let rt = staticify(&mut rt);
-    let dir = TempDir::new(test_name).unwrap();
-    rt.set_cwd(dir.path().to_path_buf());
-    rt.run(move |rt| {
-        let run = TestRun::new(rt, dir);
-        closure(run)
+mod suite_tests {
+    use super::*;
+    test_suite!(tests_default, |test_name, closure| {
+        let _ = ::env_logger::builder().is_test(true).try_init();
+        let mut rt = crate::NativeRt::default();
+        let rt = staticify(&mut rt);
+        let dir = TempDir::new(test_name).unwrap();
+        rt.set_cwd(dir.path().to_path_buf());
+        rt.run(move |rt| {
+            let run = TestRun::new(rt, dir);
+            closure(run)
+        });
     });
-});
 
-#[cfg(test)]
-test_suite!(tests_all, |test_name, closure| {
-    let _ = ::env_logger::builder().is_test(true).try_init();
-    for (name, rt) in crate::NativeRt::builder().enable_all().build_each() {
-        println!("{name}");
-        if let Ok(mut rt) = rt {
-            let rt = staticify(&mut rt);
-            let dir = TempDir::new(test_name).unwrap();
-            rt.set_cwd(dir.path().to_path_buf());
-            rt.run(move |rt| {
-                let run = TestRun::new(rt, dir);
-                closure(run)
+    test_suite!(tests_all, |test_name, closure| {
+        let _ = ::env_logger::builder().is_test(true).try_init();
+        for (name, rt) in crate::NativeRt::builder().enable_all().build_each() {
+            println!("{name}");
+            if let Ok(mut rt) = rt {
+                let rt = staticify(&mut rt);
+                let dir = TempDir::new(test_name).unwrap();
+                rt.set_cwd(dir.path().to_path_buf());
+                rt.run(move |rt| {
+                    let run = TestRun::new(rt, dir);
+                    closure(run)
+                });
+            }
+        }
+    });
+
+    net_test_suite!(net_tests_default, |closure| {
+        let _ = ::env_logger::builder().is_test(true).try_init();
+        let mut rt = crate::NativeRt::default();
+        let rt = staticify(&mut rt);
+        rt.run(closure);
+    });
+
+    net_test_suite!(net_tests_all, |closure| {
+        let _ = ::env_logger::builder().is_test(true).try_init();
+        for (name, rt) in crate::NativeRt::builder().enable_all().build_each() {
+            println!("{name}");
+            if let Ok(mut rt) = rt {
+                let rt = staticify(&mut rt);
+                rt.run(closure);
+            }
+        }
+    });
+
+    // Test with different async runtimes
+    #[cfg(all(unix, not(miri)))]
+    mod smol {
+        use super::*;
+
+        test_suite!(tests_default, |test_name, closure| {
+            let _ = ::env_logger::builder().is_test(true).try_init();
+
+            smol::block_on(async {
+                use mfio::backend::{integrations::async_io::AsyncIo, *};
+
+                let mut rt = crate::NativeRt::default();
+                let rt = staticify(&mut rt);
+                let dir = TempDir::new(test_name).unwrap();
+                rt.set_cwd(dir.path().to_path_buf());
+
+                AsyncIo::run_with_mut(rt, move |rt| {
+                    let run = TestRun::new(rt, dir);
+                    closure(run)
+                })
+                .await;
             });
-        }
-    }
-});
+        });
 
-#[cfg(test)]
-net_test_suite!(net_tests_default, |closure| {
-    let _ = ::env_logger::builder().is_test(true).try_init();
-    let mut rt = crate::NativeRt::default();
-    let rt = staticify(&mut rt);
-    rt.run(closure);
-});
+        test_suite!(tests_all, |test_name, closure| {
+            let _ = ::env_logger::builder().is_test(true).try_init();
 
-#[cfg(test)]
-net_test_suite!(net_tests_all, |closure| {
-    let _ = ::env_logger::builder().is_test(true).try_init();
-    for (name, rt) in crate::NativeRt::builder().enable_all().build_each() {
-        println!("{name}");
-        if let Ok(mut rt) = rt {
-            let rt = staticify(&mut rt);
-            rt.run(closure);
-        }
+            smol::block_on(async {
+                use mfio::backend::{integrations::async_io::AsyncIo, *};
+
+                for (name, rt) in crate::NativeRt::builder().enable_all().build_each() {
+                    println!("{name}");
+                    if let Ok(mut rt) = rt {
+                        let rt = staticify(&mut rt);
+                        let dir = TempDir::new(test_name).unwrap();
+                        rt.set_cwd(dir.path().to_path_buf());
+                        AsyncIo::run_with_mut(rt, move |rt| {
+                            let run = TestRun::new(rt, dir);
+                            closure(run)
+                        })
+                        .await;
+                    }
+                }
+            });
+        });
+
+        net_test_suite!(net_tests_default, |closure| {
+            let _ = ::env_logger::builder().is_test(true).try_init();
+
+            smol::block_on(async {
+                use mfio::backend::{integrations::async_io::AsyncIo, *};
+                let mut rt = crate::NativeRt::default();
+                let rt = staticify(&mut rt);
+                AsyncIo::run_with_mut(rt, closure).await;
+            });
+        });
+
+        net_test_suite!(net_tests_all, |closure| {
+            let _ = ::env_logger::builder().is_test(true).try_init();
+            smol::block_on(async {
+                use mfio::backend::{integrations::async_io::AsyncIo, *};
+                for (name, rt) in crate::NativeRt::builder().enable_all().build_each() {
+                    println!("{name}");
+                    if let Ok(mut rt) = rt {
+                        let rt = staticify(&mut rt);
+                        AsyncIo::run_with_mut(rt, closure).await;
+                    }
+                }
+            });
+        });
     }
-});
+
+    #[cfg(all(unix, not(miri)))]
+    mod tokio {
+        use super::*;
+
+        test_suite!(tests_default, |test_name, closure| {
+            let _ = ::env_logger::builder().is_test(true).try_init();
+
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                use mfio::backend::{integrations::tokio::Tokio, *};
+
+                let mut rt = crate::NativeRt::default();
+                let rt = staticify(&mut rt);
+                let dir = TempDir::new(test_name).unwrap();
+                rt.set_cwd(dir.path().to_path_buf());
+
+                Tokio::run_with_mut(rt, move |rt| {
+                    let run = TestRun::new(rt, dir);
+                    closure(run)
+                })
+                .await;
+            });
+        });
+
+        test_suite!(tests_all, |test_name, closure| {
+            let _ = ::env_logger::builder().is_test(true).try_init();
+
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                use mfio::backend::{integrations::tokio::Tokio, *};
+
+                for (name, rt) in crate::NativeRt::builder().enable_all().build_each() {
+                    println!("{name}");
+                    if let Ok(mut rt) = rt {
+                        let rt = staticify(&mut rt);
+                        let dir = TempDir::new(test_name).unwrap();
+                        rt.set_cwd(dir.path().to_path_buf());
+                        Tokio::run_with_mut(rt, move |rt| {
+                            let run = TestRun::new(rt, dir);
+                            closure(run)
+                        })
+                        .await;
+                    }
+                }
+            });
+        });
+
+        net_test_suite!(net_tests_default, |closure| {
+            let _ = ::env_logger::builder().is_test(true).try_init();
+
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                use mfio::backend::{integrations::tokio::Tokio, *};
+                let mut rt = crate::NativeRt::default();
+                let rt = staticify(&mut rt);
+                Tokio::run_with_mut(rt, closure).await;
+            });
+        });
+
+        net_test_suite!(net_tests_all, |closure| {
+            let _ = ::env_logger::builder().is_test(true).try_init();
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                use mfio::backend::{integrations::tokio::Tokio, *};
+                for (name, rt) in crate::NativeRt::builder().enable_all().build_each() {
+                    println!("{name}");
+                    if let Ok(mut rt) = rt {
+                        let rt = staticify(&mut rt);
+                        Tokio::run_with_mut(rt, closure).await;
+                    }
+                }
+            });
+        });
+    }
+}

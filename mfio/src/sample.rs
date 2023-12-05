@@ -88,7 +88,7 @@ impl VolatileMem {
             });
             return;
         }
-        let dest = if pos > self.len - dest.len() {
+        let dest = if self.len < dest.len() || pos > self.len - dest.len() {
             let (a, b) = dest.split_at(self.len - pos);
             b.error(Error {
                 code: INTERNAL_ERROR,

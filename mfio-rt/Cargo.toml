@@ -41,7 +41,7 @@ nix = "0.26"
 io-uring = { version = "0.6", optional = true }
 
 [dev-dependencies]
-mfio = { version = "0.1", path = "../mfio", default-features = false }
+mfio = { version = "0.1", path = "../mfio", default-features = false, features = ["tokio", "async-io"] }
 pollster = { version = "0.3.0", features = ["macro"] }
 criterion = { version = "0.5", git = "https://github.com/h33p/criterion.rs", branch = "tput2", features = ["async_tokio", "async_smol", "async_futures"] }
 rand = "0.8"
@@ -53,7 +53,7 @@ pathdiff = "0.2"
 async-semaphore = "1"
 
 [target.'cfg(not(miri))'.dev-dependencies]
-tokio = { version = "1.24", features = ["rt", "rt-multi-thread", "fs", "io-util"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "fs", "io-util"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 rio = "0.9"

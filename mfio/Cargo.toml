@@ -34,9 +34,10 @@ spin = "0.9"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.26", features = ["poll"] }
-# incompatible with miri
-tokio = { version = "1", optional = true, features = ["net"] }
 async-io = { version = "2", optional = true }
+
+[target.'cfg(all(unix, not(miri)))'.dependencies]
+tokio = { version = "1", optional = true, features = ["net"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.48", features = ["Win32_System_Threading", "Win32_Foundation", "Win32_Security"] }

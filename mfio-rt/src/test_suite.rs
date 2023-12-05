@@ -9,7 +9,7 @@ pub use alloc::{
 };
 pub use core::future::Future;
 pub use futures::StreamExt;
-pub use mfio::backend::IoBackend;
+pub use mfio::backend::IoBackendExt;
 pub use mfio::traits::{IoRead, IoWrite};
 pub use once_cell::sync::Lazy;
 pub use tempdir::TempDir;

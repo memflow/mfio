@@ -106,8 +106,8 @@ pub use opaque::*;
 ///
 /// ```
 /// use mfio::io::*;
-/// use mfio::traits::*;
 /// use mfio::mferr;
+/// use mfio::traits::*;
 ///
 /// enum Request {
 ///     Hi,
@@ -176,8 +176,8 @@ pub trait PacketIo<Perms: PacketPerms, Param>: Sized {
     /// #     include!("../sample.rs");
     /// # }
     /// # use sample::SampleIo;
-    /// use mfio::io::*;
     /// use mfio::backend::*;
+    /// use mfio::io::*;
     /// use mfio::mferr;
     ///
     /// let handle = SampleIo::new(vec![0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144]);
@@ -285,14 +285,19 @@ impl NoPos {
     }
 }
 
-pub struct IoFut<'a, T, Perms: PacketPerms, Param, Packet: PacketStore<'a, Perms>> {
+pub struct IoFut<'a, T: ?Sized, Perms: PacketPerms, Param, Packet: PacketStore<'a, Perms>> {
     pkt: UnsafeCell<Option<Packet::StackReq<'a>>>,
     initial_state: UnsafeCell<Option<(&'a T, Param)>>,
     _phantom: PhantomData<Perms>,
 }
 
-impl<'a, T: PacketIo<Perms, Param>, Perms: PacketPerms, Param, Pkt: PacketStore<'a, Perms>> Future
-    for IoFut<'a, T, Perms, Param, Pkt>
+impl<
+        'a,
+        T: PacketIo<Perms, Param> + ?Sized,
+        Perms: PacketPerms,
+        Param,
+        Pkt: PacketStore<'a, Perms>,
+    > Future for IoFut<'a, T, Perms, Param, Pkt>
 {
     type Output = Pkt::StackReq<'a>;
 
@@ -333,7 +338,7 @@ impl<'a, T: PacketIo<Perms, Param>, Perms: PacketPerms, Param, Pkt: PacketStore<
 
 pub struct IoToFut<
     'a,
-    T,
+    T: ?Sized,
     Perms: PacketPerms,
     Param,
     Packet: PacketStore<'a, Perms>,
@@ -346,7 +351,7 @@ pub struct IoToFut<
 
 impl<
         'a,
-        T: PacketIo<Perms, Param>,
+        T: PacketIo<Perms, Param> + ?Sized,
         Perms: PacketPerms,
         Param,
         Pkt: PacketStore<'a, Perms>,

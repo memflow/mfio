@@ -5,7 +5,7 @@ use crate::NativeRt;
 #[cfg(any(miri, test, feature = "native", feature = "virt"))]
 use core::future::Future;
 #[cfg(any(miri, test, feature = "native", feature = "virt"))]
-use mfio::backend::IoBackend;
+use mfio::backend::IoBackendExt;
 
 #[cfg(feature = "native")]
 pub fn run_each<'a, Func: Fn(&'a NativeRt) -> F, F: Future>(func: Func) {

@@ -185,6 +185,23 @@ pub mod io;
 pub mod stdeq;
 pub mod traits;
 
+pub mod prelude {
+    pub mod v1 {
+        #[cfg(all(unix, feature = "async-io"))]
+        pub use crate::backend::integrations::async_io::AsyncIo;
+        #[cfg(all(unix, not(miri), feature = "tokio"))]
+        pub use crate::backend::integrations::tokio::Tokio;
+        pub use crate::backend::{Integration, IoBackend, IoBackendExt, Null};
+        pub use crate::error::*;
+        pub use crate::io::{
+            FullPacket, IntoPacket, OwnedPacket, Packet, PacketIo, PacketIoExt, PacketView, Read,
+            RefPacket, VecPacket, Write,
+        };
+        pub use crate::stdeq::{Seekable, SeekableRef};
+        pub use crate::traits::{IoRead, IoWrite};
+    }
+}
+
 mod poller;
 mod util;
 
@@ -230,14 +247,10 @@ mod sample {
 #[cfg(test)]
 mod tests {
 
+    use crate::prelude::v1::*;
     use crate::std_prelude::*;
 
-    use io::{IntoPacket, Packet, PacketIo, PacketIoExt, PacketView, Write};
-
-    use super::traits::*;
     use super::*;
-    use crate::backend::*;
-    use crate::error::*;
     use crate::sample::SampleIo;
     use bytemuck::{Pod, Zeroable};
     use core::pin::pin;

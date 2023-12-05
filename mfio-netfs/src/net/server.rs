@@ -10,7 +10,7 @@ use super::{FsRequest, FsResponse, HeaderRouter, Request, Response};
 use async_mutex::Mutex as AsyncMutex;
 use cglue::result::IntError;
 use log::*;
-use mfio::backend::IoBackend;
+use mfio::backend::IoBackendExt;
 use mfio::error::Error;
 use mfio::io::{NoPos, OwnedPacket, PacketIoExt, PacketView, PacketVtblRef, Read};
 use mfio::stdeq::Seekable;

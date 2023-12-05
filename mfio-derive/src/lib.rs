@@ -11,8 +11,14 @@ pub fn io_read(item: TokenStream) -> TokenStream {
     let impl_bounds = &st.generics.params;
     let where_bounds = st.generics.where_clause.as_ref().map(|v| &v.predicates);
 
+    let impl_comma = if !impl_bounds.trailing_punct() && !impl_bounds.is_empty() {
+        Some(token::Comma::default())
+    } else {
+        None
+    };
+
     quote! {
-        impl<__Pos: 'static, #impl_bounds> mfio::traits::sync::SyncIoRead<__Pos> for #ident #type_gens where #ident #type_gens: mfio::traits::IoRead<__Pos> + mfio::backend::IoBackend, #where_bounds {}
+        impl<#impl_bounds #impl_comma __Pos: 'static> mfio::traits::sync::SyncIoRead<__Pos> for #ident #type_gens where #ident #type_gens: mfio::traits::IoRead<__Pos> + mfio::backend::IoBackend, #where_bounds {}
     }.into()
 }
 
@@ -25,7 +31,13 @@ pub fn io_write(item: TokenStream) -> TokenStream {
     let impl_bounds = &st.generics.params;
     let where_bounds = st.generics.where_clause.as_ref().map(|v| &v.predicates);
 
+    let impl_comma = if !impl_bounds.trailing_punct() && !impl_bounds.is_empty() {
+        Some(token::Comma::default())
+    } else {
+        None
+    };
+
     quote! {
-        impl<__Pos: 'static, #impl_bounds> mfio::traits::sync::SyncIoWrite<__Pos> for #ident #type_gens where #ident #type_gens: mfio::traits::IoWrite<__Pos> + mfio::backend::IoBackend, #where_bounds {}
+        impl<#impl_bounds #impl_comma __Pos: 'static> mfio::traits::sync::SyncIoWrite<__Pos> for #ident #type_gens where #ident #type_gens: mfio::traits::IoWrite<__Pos> + mfio::backend::IoBackend, #where_bounds {}
     }.into()
 }

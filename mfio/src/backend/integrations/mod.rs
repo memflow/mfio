@@ -9,7 +9,7 @@
 #[cfg(all(unix, feature = "async-io"))]
 pub mod async_io;
 pub mod null;
-#[cfg(all(unix, feature = "tokio"))]
+#[cfg(all(unix, not(miri), feature = "tokio"))]
 pub mod tokio;
 
 use super::{IoBackend, LinksIoBackend, RefLink};

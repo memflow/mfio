@@ -24,6 +24,44 @@ pub trait StreamPos<Param> {
     }
 }
 
+#[cfg(feature = "std")]
+pub fn std_seek(
+    io: &(impl StreamPos<u64> + ?Sized),
+    pos: std::io::SeekFrom,
+) -> std::io::Result<u64> {
+    match pos {
+        std::io::SeekFrom::Start(val) => {
+            io.set_pos(val);
+            Ok(val)
+        }
+        std::io::SeekFrom::End(val) => {
+            if let Some(end) = io.end() {
+                let pos = if val < 0 {
+                    end.checked_sub((-val) as u64)
+                        .ok_or_else(|| std::io::ErrorKind::InvalidInput)?
+                } else {
+                    end + val as u64
+                };
+                io.set_pos(pos);
+                Ok(pos)
+            } else {
+                Err(std::io::ErrorKind::Unsupported.into())
+            }
+        }
+        std::io::SeekFrom::Current(val) => {
+            let pos = io.get_pos();
+            let pos = if val < 0 {
+                pos.checked_sub((-val) as u64)
+                    .ok_or_else(|| std::io::ErrorKind::InvalidInput)?
+            } else {
+                pos + val as u64
+            };
+            io.set_pos(pos);
+            Ok(pos)
+        }
+    }
+}
+
 impl<Param: Copy + UsizeMath, Io: StreamPos<Param>> PosShift<Io> for Param {
     fn add_pos(&mut self, out: usize, io: &Io) {
         self.add_assign(out);
@@ -110,16 +148,10 @@ impl<T: IoWrite<NoPos>> AsyncWrite<NoPos> for T {
     }
 }
 
-pub struct AsyncIoFut<
-    'a,
-    Io: PacketIo<Perms, Param>,
-    Perms: PacketPerms,
-    Param: 'a,
-    Obj: IntoPacket<'a, Perms>,
-> {
+pub struct AsyncIoFut<'a, Io: ?Sized, Perms: PacketPerms, Param: 'a, Obj: IntoPacket<'a, Perms>> {
     io: &'a Io,
     fut: IoFut<'a, Io, Perms, Param, Obj::Target>,
-    sync: Option<Obj::SyncHandle>,
+    pub(crate) sync: Option<Obj::SyncHandle>,
     len: usize,
 }
 
@@ -180,40 +212,10 @@ impl<'a, Io: PacketIo<Write, Param>, Param: PosShift<Io>> Future
 /// Implements `io::Seek` on type implementing `StreamPos<u64>`, `io::Write` on type implementing
 /// `AsyncWrite<u64>` and `io::Read` on type implementing `AsyncRead<u64>`.
 macro_rules! stdio_impl {
-    (<$($ty2:ident),*> $t:ident <$($ty:ident),*> @ $($tt:tt)*) => {
-        impl<$($ty2),*> std::io::Seek for $t<$($ty),*> where $($tt)* {
+    (<$($lt2:lifetime,)* $($ty2:ident),*> $t:ident <$($lt:lifetime,)* $($ty:ident),*> @ $($tt:tt)*) => {
+        impl<$($lt2,)* $($ty2),*> std::io::Seek for $t<$($lt,)* $($ty),*> where $($tt)* {
             fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-                match pos {
-                    std::io::SeekFrom::Start(val) => {
-                        self.set_pos(val);
-                        Ok(val)
-                    }
-                    std::io::SeekFrom::End(val) => {
-                        if let Some(end) = $crate::stdeq::StreamPos::<u64>::end(self) {
-                            let pos = if val < 0 {
-                                end.checked_sub((-val) as u64)
-                                    .ok_or_else(|| std::io::ErrorKind::InvalidInput)?
-                            } else {
-                                end + val as u64
-                            };
-                            self.set_pos(pos);
-                            Ok(pos)
-                        } else {
-                            Err(std::io::ErrorKind::Unsupported.into())
-                        }
-                    }
-                    std::io::SeekFrom::Current(val) => {
-                        let pos = $crate::stdeq::StreamPos::<u64>::get_pos(self);
-                        let pos = if val < 0 {
-                            pos.checked_sub((-val) as u64)
-                                .ok_or_else(|| std::io::ErrorKind::InvalidInput)?
-                        } else {
-                            pos + val as u64
-                        };
-                        self.set_pos(pos);
-                        Ok(pos)
-                    }
-                }
+                $crate::stdeq::std_seek(self, pos)
             }
 
             fn stream_position(&mut self) -> std::io::Result<u64> {
@@ -226,23 +228,23 @@ macro_rules! stdio_impl {
             }
         }
 
-        impl<$($ty2),*> std::io::Read for $t<$($ty),*> where $t<$($ty),*>: $crate::stdeq::AsyncRead<u64> + $crate::backend::IoBackend, $($tt)* {
+        impl<$($lt2,)* $($ty2),*> std::io::Read for $t<$($lt,)* $($ty),*> where $t<$($lt,)* $($ty),*>: $crate::stdeq::AsyncRead<u64> + $crate::backend::IoBackend, $($tt)* {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                use $crate::backend::IoBackend;
+                use $crate::backend::IoBackendExt;
                 self.block_on($crate::stdeq::AsyncRead::read(self, buf)).map_err(|_| std::io::ErrorKind::Other.into())
             }
 
             fn read_to_end(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
-                use $crate::backend::IoBackend;
+                use $crate::backend::IoBackendExt;
                 let len = buf.len();
                 self.block_on($crate::stdeq::AsyncRead::read_to_end(self, buf)).map_err(|_| std::io::ErrorKind::Other)?;
                 Ok(buf.len() - len)
             }
         }
 
-        impl<$($ty2),*> std::io::Write for $t<$($ty),*> where $t<$($ty),*>: $crate::stdeq::AsyncWrite<u64> + $crate::backend::IoBackend, $($tt)* {
+        impl<$($lt2,)* $($ty2),*> std::io::Write for $t<$($lt,)* $($ty),*> where $t<$($lt,)* $($ty),*>: $crate::stdeq::AsyncWrite<u64> + $crate::backend::IoBackend, $($tt)* {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                use $crate::backend::IoBackend;
+                use $crate::backend::IoBackendExt;
                 self.block_on(AsyncWrite::write(self, buf)).map_err(|_| std::io::ErrorKind::Other.into())
             }
 
@@ -296,6 +298,47 @@ impl<T, Param: Copy> StreamPos<Param> for Seekable<T, Param> {
 
 #[cfg(feature = "std")]
 stdio_impl!(<T> Seekable<T, u64> @);
+
+#[derive(SyncIoWrite, SyncIoRead)]
+pub struct SeekableRef<'a, T, Param> {
+    pos: Mutex<Param>,
+    handle: &'a T,
+}
+
+impl<'a, T, Param: Default> From<&'a T> for SeekableRef<'a, T, Param> {
+    fn from(handle: &'a T) -> Self {
+        Self {
+            pos: Default::default(),
+            handle,
+        }
+    }
+}
+
+impl<T: PacketIo<Perms, Param>, Perms: PacketPerms, Param: core::fmt::Debug> PacketIo<Perms, Param>
+    for SeekableRef<'_, T, Param>
+{
+    fn send_io(&self, param: Param, view: BoundPacketView<Perms>) {
+        self.handle.send_io(param, view)
+    }
+}
+
+impl<T, Param: Copy> StreamPos<Param> for SeekableRef<'_, T, Param> {
+    fn get_pos(&self) -> Param {
+        *self.pos.lock()
+    }
+
+    fn set_pos(&self, pos: Param) {
+        *self.pos.lock() = pos;
+    }
+
+    fn update_pos<F: FnOnce(Param) -> Param>(&self, f: F) {
+        let mut pos = self.pos.lock();
+        *pos = f(*pos);
+    }
+}
+
+#[cfg(feature = "std")]
+stdio_impl!(<'a, T> SeekableRef<'a, T, u64> @);
 
 #[derive(SyncIoWrite, SyncIoRead)]
 pub struct FakeSeek<T> {

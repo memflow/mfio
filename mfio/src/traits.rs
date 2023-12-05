@@ -2,7 +2,7 @@ use crate::std_prelude::*;
 
 use crate::io::*;
 
-use crate::backend::IoBackend;
+use crate::backend::{IoBackend, IoBackendExt};
 use crate::error::Error;
 use crate::util::{CopyPos, UsizeMath};
 use bytemuck::Pod;

@@ -360,7 +360,9 @@ pub trait IoBackend<Handle: Pollable = DefaultHandle> {
     /// function does not return an `Option`, because such case usually indicates a bug in the
     /// code.
     fn get_backend(&self) -> BackendHandle<Self::Backend>;
+}
 
+pub trait IoBackendExt<Handle: Pollable>: IoBackend<Handle> {
     /// Builds a composite future that also polls the backend future.
     ///
     /// If second tuple element is not `None`, then the caller is responsible for registering and
@@ -388,6 +390,8 @@ pub trait IoBackend<Handle: Pollable = DefaultHandle> {
         block_on::<Handle, F, Self>(fut, backend, polling)
     }
 }
+
+impl<T: ?Sized + IoBackend<Handle>, Handle: Pollable> IoBackendExt<Handle> for T {}
 
 /// Represents types that contain an `IoBackend`.
 pub trait LinksIoBackend {
