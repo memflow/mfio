@@ -14,7 +14,7 @@ jobs:
       RUSTFLAGS: --cfg tokio_unstable ${{matrix.rustflags}}
     strategy:
       matrix:
-        toolchain: ["nightly-2023-09-01"]
+        toolchain: ["nightly-2023-10-01"]
         seed: [1, 2, 3, 4, 5, 6, 7, 8]
         rustflags: ["", "--cfg mfio_assume_linear_types"]
     steps:
