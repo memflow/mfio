@@ -844,6 +844,13 @@ macro_rules! net_test_suite {
                 unsafe { core::mem::transmute(val) }
             }
 
+            async fn test_run<T: 'static, F: Future<Output = ()>>(
+                rt: &'static T,
+                closure: fn(&'static T) -> F,
+            ) {
+                closure(rt).await
+            }
+
             #[cfg(not(miri))]
             #[test]
             fn tcp_connect() {
