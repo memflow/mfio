@@ -181,6 +181,8 @@ pub(crate) mod std_prelude {
 
 pub mod backend;
 pub mod error;
+#[cfg(feature = "std")]
+pub mod futures_compat;
 pub mod io;
 pub mod stdeq;
 pub mod traits;
@@ -193,6 +195,8 @@ pub mod prelude {
         pub use crate::backend::integrations::tokio::Tokio;
         pub use crate::backend::{Integration, IoBackend, IoBackendExt, Null};
         pub use crate::error::*;
+        #[cfg(feature = "std")]
+        pub use crate::futures_compat::FuturesCompat;
         pub use crate::io::{
             FullPacket, IntoPacket, OwnedPacket, Packet, PacketIo, PacketIoExt, PacketView, Read,
             RefPacket, VecPacket, Write,
