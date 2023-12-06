@@ -15,8 +15,6 @@ use core::task::{Context, Poll};
 use rangemap::RangeSet;
 use tarc::BaseArc;
 
-pub type BoxedFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
-
 mod output;
 pub use output::*;
 mod view;
@@ -527,6 +525,11 @@ pub enum PacketVtblTag {
     Complex,
 }
 
+/// Describes packet type.
+///
+/// If the value within this union is less than [`PacketVtblTag::Complex`], then the packet is
+/// simple, and `tag` should be accessed. Meanwhile, any other value implies the packet is a
+/// complex one, and `vtable` should be accessed instead.
 #[derive(Clone, Copy)]
 pub union PacketVtblRef<Perms: PacketPerms> {
     pub tag: usize,
@@ -1275,6 +1278,10 @@ trait AnyBytes {}
 impl AnyBytes for u8 {}
 impl AnyBytes for MaybeUninit<u8> {}
 
+/// Object convertable into a packet.
+///
+/// This is an extension of [`OpaqueStore`], where an object may have additional synchronization
+/// steps taken upon the end of I/O processing.
 pub trait IntoPacket<'a, Perms: PacketPerms> {
     type Target: PacketStore<'a, Perms>;
     type SyncHandle;
@@ -1391,12 +1398,16 @@ pub type TransferDataFn<T> = for<'a> unsafe extern "C" fn(
 );
 
 /// Retrieves total length of the packet.
-///
-/// This
 pub type LenFn<T> = unsafe extern "C" fn(packet: &Packet<T>) -> u64;
 
+/// Packet that may be alloced.
+///
+/// `Ok` represents alloced, `Err` represents unalloced (bound packet view).
 pub type MaybeAlloced<T> = Result<<T as PacketPerms>::Alloced, BoundPacketView<T>>;
 
+/// Represents the state where packet is either alloced or transferred.
+///
+/// `Ok` represents alloced, `Err` represents transferred.
 pub type AllocedOrTransferred<T> = Result<<T as PacketPerms>::Alloced, TransferredPacket<T>>;
 
 /// Describes type constraints on packet operations.
@@ -1480,6 +1491,10 @@ pub trait PacketPerms: 'static + core::fmt::Debug + Clone + Copy {
     }
 }
 
+/// ReadWrite permissions.
+///
+/// The behavior of ReadWrite is not well defined, but for simple buffers, it implies the swapping
+/// of data between the 2 buffers.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ReadWrite {
@@ -1534,6 +1549,9 @@ impl PacketPerms for ReadWrite {
     }
 }
 
+/// Write permissions.
+///
+/// This implies the packet is writeable and may not have valid data beforehand.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Write {
@@ -1592,6 +1610,9 @@ impl PacketPerms for Write {
     }
 }
 
+/// Read permissions.
+///
+/// This implies this packet contains valid data and it can be read.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Read {
@@ -1645,7 +1666,15 @@ impl PacketPerms for Read {
     }
 }
 
+/// Objects that can be split.
+///
+/// This trait enables splitting objects into non-overlapping parts.
 pub trait Splittable<T: Default + PartialEq>: Sized {
+    /// Splits an object at given position.
+    ///
+    /// # Panics
+    ///
+    /// This function may panic if len is outside the bounds of the given object.
     fn split_at(self, len: T) -> (Self, Self);
     fn len(&self) -> T;
     fn is_empty(&self) -> bool {
@@ -1675,6 +1704,10 @@ impl<T: Default + PartialEq, A: Splittable<T>, B: Splittable<T>> Splittable<T> f
     }
 }
 
+/// Object that can be returned with an error.
+///
+/// This is meant for all types of packets - allow backend to easily return them to the user with
+/// an appropriate error condition attached.
 pub trait Errorable: Sized {
     fn error(self, err: Error);
 }
@@ -1688,6 +1721,9 @@ impl<A: Errorable, B: Errorable> Errorable for Result<A, B> {
     }
 }
 
+/// Packet which has been allocated.
+///
+/// Allocated packets expose direct access to the underlying buffer.
 pub trait AllocatedPacket: Splittable<u64> + Errorable {
     type Perms: PacketPerms;
     type Pointer: Copy;
@@ -1695,6 +1731,7 @@ pub trait AllocatedPacket: Splittable<u64> + Errorable {
     fn as_ptr(&self) -> Self::Pointer;
 }
 
+/// Represents a simple allocated packet with write permissions.
 #[repr(C)]
 pub struct ReadWritePacketObj {
     alloced_packet: *mut u8,
@@ -1756,6 +1793,9 @@ impl core::ops::DerefMut for ReadWritePacketObj {
     }
 }
 
+/// Represents a simple allocated packet with write permissions.
+///
+/// The data inside may not be initialized, therefore, this packet should only be written to.
 #[repr(C)]
 pub struct WritePacketObj {
     alloced_packet: *mut MaybeUninit<u8>,
@@ -1817,6 +1857,7 @@ impl core::ops::DerefMut for WritePacketObj {
     }
 }
 
+/// Represents a simple allocated packet with read permissions.
 #[repr(C)]
 pub struct ReadPacketObj {
     alloced_packet: *const u8,
@@ -1870,6 +1911,12 @@ impl core::ops::Deref for ReadPacketObj {
     }
 }
 
+/// Represents the state of the packet that has already had data transferred to.
+///
+/// This struct is marked as `must_use`, because the intention is for the backend to be explicit
+/// about when the packet is dropped and released to the user. Since bound packets may call a
+/// function that generates more I/O requests, it is important to drop the packet outside critical
+/// sections.
 #[repr(transparent)]
 #[must_use = "please handle point of drop intentionally"]
 pub struct TransferredPacket<T: PacketPerms>(BoundPacketView<T>);

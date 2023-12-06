@@ -26,6 +26,7 @@ impl core::fmt::Display for Code {
 
 const HTTP_SHIFT: usize = 399;
 
+/// HTTP 500 error.
 pub const INTERNAL_ERROR: Code =
     Code(unsafe { NonZeroU8::new_unchecked((500 - HTTP_SHIFT) as u8) });
 
@@ -228,6 +229,10 @@ macro_rules! ienum {
 }
 
 ienum! {
+    /// Describes the error subject.
+    ///
+    /// While [`Location`] points to a module where the error originated from, Subject attempts to
+    /// narrow the error down to the main actor that was involved in the creation of the error.
     pub enum Subject {
         Argument,
         Data,
@@ -267,6 +272,9 @@ ienum! {
 }
 
 ienum! {
+    /// Describes the state of the error subject.
+    ///
+    /// State allows to specify what caused the [`Subject`] to fail.
     pub enum State {
         Invalid,
         Unreadable,
@@ -305,6 +313,11 @@ ienum! {
 }
 
 ienum! {
+    /// Describes the error origin.
+    ///
+    /// The Origin specifies general location where the error originates from - be it a module,
+    /// crate, or subsystem. It is not meant to be descriptive in terms of error handling. For
+    /// better locality, check the [`Subject`].
     pub enum Location {
         Backend,
         Memory,
@@ -319,19 +332,6 @@ ienum! {
         Library,
         Stdlib,
         Other,
-    }
-}
-
-pub struct ErrorConstLocation<const N: u8>(pub Code, pub Subject, pub State);
-
-impl<const N: u8> From<ErrorConstLocation<N>> for Error {
-    fn from(ErrorConstLocation(code, subject, state): ErrorConstLocation<N>) -> Self {
-        Self {
-            code,
-            subject,
-            state,
-            location: N.into(),
-        }
     }
 }
 
@@ -378,16 +378,14 @@ impl From<std::io::ErrorKind> for State {
 }
 
 #[cfg(feature = "std")]
-impl<const N: u8> From<std::io::ErrorKind> for ErrorConstLocation<N> {
-    fn from(kind: std::io::ErrorKind) -> Self {
-        ErrorConstLocation(INTERNAL_ERROR, Subject::Io, State::from(kind))
-    }
-}
-
-#[cfg(feature = "std")]
 impl From<std::io::ErrorKind> for Error {
     fn from(kind: std::io::ErrorKind) -> Self {
-        ErrorConstLocation::<{ Location::Other as u8 }>::from(kind).into()
+        Error {
+            code: INTERNAL_ERROR,
+            location: Location::Other,
+            subject: Subject::Io,
+            state: kind.into(),
+        }
     }
 }
 
@@ -397,6 +395,7 @@ impl From<core::convert::Infallible> for Error {
     }
 }
 
+/// Allows easy specification of different error properties.
 pub trait ErrorSpecify: Sized {
     fn code(self, code: Code) -> Self;
     fn subject(self, subject: Subject) -> Self;

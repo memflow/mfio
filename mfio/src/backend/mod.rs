@@ -37,6 +37,8 @@ pub mod handle;
 #[cfg(all(windows, feature = "std"))]
 pub mod windows;
 
+// TODO: rename DefaultHandle to OsHandle, and get rid of Infallible one.
+
 #[cfg(all(unix, feature = "std"))]
 pub type DefaultHandle = RawFd;
 #[cfg(all(windows, feature = "std"))]
@@ -53,6 +55,12 @@ struct NestedBackend {
     release: unsafe extern "C" fn(*const ()),
 }
 
+/// Stores a backend.
+///
+/// This type is always stored on backends, and is acquired by users in [`IoBackend::get_backend`].
+/// A backend can only be acquired once at a time, however, it does not matter who does it.
+///
+/// Once the backend is acquired, it can be used to drive I/O to completion.
 #[repr(C)]
 pub struct BackendContainer<B: ?Sized> {
     nest: UnsafeCell<Option<NestedBackend>>,
@@ -64,8 +72,16 @@ unsafe impl<B: ?Sized + Send> Send for BackendContainer<B> {}
 unsafe impl<B: ?Sized + Send> Sync for BackendContainer<B> {}
 
 impl<B: ?Sized> BackendContainer<B> {
+    /// Acquire a backend.
+    ///
+    /// This function locks the backend and the returned handle keeps it locked, until the handle
+    /// gets released.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the backend has already been acquired.
     pub fn acquire(&self, wake_flags: Option<Arc<AtomicU8>>) -> BackendHandle<B> {
-        if self.lock.swap(true, Ordering::Acquire) {
+        if self.lock.swap(true, Ordering::AcqRel) {
             panic!("Tried to acquire backend twice!");
         }
 
@@ -78,6 +94,12 @@ impl<B: ?Sized> BackendContainer<B> {
         }
     }
 
+    /// Acquires a backend in nested mode.
+    ///
+    /// This function is useful when layered I/O backends are desirable. When polling, first, this
+    /// backend will be polled, and afterwards, the provided handle. The ordering is consistent
+    /// with the behavior of first polling the user's future, and then polling the backend. In the
+    /// end, backends will be peeled off layer by layer, until the innermost backend is reached.
     pub fn acquire_nested<B2: ?Sized + Future<Output = ()>>(
         &self,
         mut handle: BackendHandle<B2>,
@@ -122,6 +144,7 @@ impl<B: ?Sized> BackendContainer<B> {
 }
 
 impl BackendContainer<DynBackend> {
+    /// Creates a new [`DynBackend`] container.
     pub fn new_dyn<T: Future<Output = ()> + Send + 'static>(backend: T) -> Self {
         Self {
             backend: UnsafeCell::new(Box::pin(backend) as Pin<Box<dyn Future<Output = ()> + Send>>),
@@ -131,6 +154,14 @@ impl BackendContainer<DynBackend> {
     }
 }
 
+/// Handle to a backend.
+///
+/// This handle can be used to drive arbitrary future to completion by attaching a backend to it.
+/// This is typically done using [`WithBackend`] that is constructed in
+/// [`IoBackendExt::with_backend`].
+///
+/// Usually, the user would want to bypass this type and use [`IoBackendExt::block_on`], or an
+/// [`Integration`] equivalent.
 pub struct BackendHandle<'a, B: ?Sized> {
     owner: &'a BackendContainer<B>,
     backend: Pin<&'a mut B>,
@@ -166,6 +197,13 @@ impl<'a, B: ?Sized> core::ops::DerefMut for BackendHandle<'a, B> {
     }
 }
 
+/// Future combined with a backend.
+///
+/// This future can be used to drive arbitrary future to completion by attaching a backend to it.
+/// Construct this type using [`IoBackendExt::with_backend`].
+///
+/// Usually, the user would want to bypass this type and use [`IoBackendExt::block_on`], or an
+/// [`Integration`] equivalent.
 pub struct WithBackend<'a, Backend: ?Sized, Fut: ?Sized> {
     backend: BackendHandle<'a, Backend>,
     future: Fut,
@@ -221,6 +259,12 @@ impl<'a, Backend: Future + ?Sized, Fut: Future + ?Sized> Future for WithBackend<
     }
 }
 
+/// Cooperative polling handle.
+///
+/// This handle contains a handle and necessary metadata needed to cooperatively drive mfio code to
+/// completion.
+///
+/// This handle is typically created on the [`IoBackend`] side.
 pub struct PollingHandle<'a, Handle = DefaultHandle> {
     pub handle: Handle,
     pub cur_flags: &'a PollingFlags,
@@ -337,6 +381,9 @@ impl PollingFlags {
 ///
 /// This trait is implemented at the outer-most stateful object of the I/O context. A `IoBackend`
 /// has the opportunity to expose efficient ways of driving said backend to completion.
+///
+/// Users may want to call methods available on [`IoBackendExt`], instead of the ones on this
+/// trait.
 pub trait IoBackend<Handle: Pollable = DefaultHandle> {
     type Backend: Future<Output = ()> + Send + ?Sized;
 
@@ -362,6 +409,7 @@ pub trait IoBackend<Handle: Pollable = DefaultHandle> {
     fn get_backend(&self) -> BackendHandle<Self::Backend>;
 }
 
+/// Helpers for [`IoBackend`].
 pub trait IoBackendExt<Handle: Pollable>: IoBackend<Handle> {
     /// Builds a composite future that also polls the backend future.
     ///

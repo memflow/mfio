@@ -7,6 +7,34 @@
 use super::super::*;
 use super::{BorrowingFn, Integration};
 
+/// Minimal integration.
+///
+/// This integration works in all async runtimes, however, it does not support the backend's
+/// `PollingHandle`. If the backend returns `Some(handle)`, then this integration panics.
+///
+/// # Examples
+///
+/// Running with `pollster`:
+///
+/// ```
+/// # mod sample {
+/// #     include!("../../sample.rs");
+/// # }
+/// # use sample::SampleIo;
+/// use mfio::prelude::v1::*;
+///
+/// pollster::block_on(async {
+///     let mut handle = SampleIo::new(vec![1, 2, 3, 4]);
+///
+///     // Run the integration. Prefer to use `run_with_mut`, so that panics can be avoided.
+///     Null::run_with_mut(&mut handle, |handle| async move {
+///         // Read value
+///         let val = handle.read(0).await.unwrap();
+///         assert_eq!(1u8, val);
+///     })
+///     .await
+/// });
+/// ```
 #[derive(Clone, Copy, Default)]
 pub struct Null;
 
@@ -31,6 +59,7 @@ enum NullState<'a, B: IoBackend + ?Sized + 'a, Func, F> {
     Finished,
 }
 
+#[doc(hidden)]
 pub struct NullImpl<'a, B: LinksIoBackend + 'a, Func, F> {
     backend: B,
     state: NullState<'a, B::Link, Func, F>,

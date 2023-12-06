@@ -16,8 +16,20 @@ use tarc::BaseArc;
 use super::{OpaqueStore, PacketPerms, PacketView};
 use crate::error::Error;
 
+/// Typical output of packets.
+///
+/// Whenever a backend returns a packet view to the user, it will have both the view, and optional
+/// error case attached. If `Option<Error>` is not `None` then the packet should be considered
+/// failed. However, note that the given packet view may have been accessed. If it was accessed,
+/// the user should still assume the operation has failed.
+///
+/// Meanwhile, if the error is `None`, then the packet will have been accessed. If it hasn't, then
+/// it's a logic bug of the backend.
+///
+/// Access considers allocation (+ transfer of data), or invokation of transfer function.
 pub type Output<'a, Perms> = (PacketView<'a, Perms>, Option<Error>);
 
+/// Represents a reference where final packet views are collected.
 #[repr(C)]
 pub struct OutputRef<'a, Perms: PacketPerms> {
     pub(crate) out: NonNull<PacketOutput<Perms>>,
@@ -110,6 +122,9 @@ impl<'a, Perms: PacketPerms, T> OutputStore<'a, Perms> for T where
 {
 }
 
+/// Describes an object where packet output is collected.
+///
+/// Note that this is an opaque object with data referenced beyond the size of this struct.
 #[repr(C)]
 #[derive(Debug)]
 pub struct PacketOutput<Perms: PacketPerms> {
@@ -118,6 +133,7 @@ pub struct PacketOutput<Perms: PacketPerms> {
     // data afterwards
 }
 
+/// Describes operations that can be performed on a packet output object.
 #[repr(C)]
 #[derive(Debug)]
 pub struct PacketOutputVtbl<Perms: PacketPerms> {
@@ -135,6 +151,40 @@ pub struct PacketOutputVtbl<Perms: PacketPerms> {
     ),
 }
 
+/// Invokes a closure on each packet segment.
+///
+/// The closure must be const, and reentrable, i.e. `Fn`.
+///
+/// # Examples
+///
+/// ```rust
+/// # mod sample {
+/// #     include!("../../sample.rs");
+/// # }
+/// # use sample::SampleIo;
+/// # fn work() -> mfio::error::Result<()> {
+/// use mfio::backend::*;
+/// use mfio::io::*;
+///
+/// let mut mem = vec![0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144];
+/// let handle = SampleIo::new(mem.clone());
+///
+/// handle.block_on(async {
+///     let (packet, _) = handle.io_to_fn(10, Packet::<Write>::new_buf(4), |packet, err| {
+///         if err.is_some() {
+///             assert_eq!(packet.len(), 1);
+///         } else {
+///             assert_eq!(packet.len(), 3);
+///         }
+///     }).await;
+///
+///     assert_eq!(packet.simple_contiguous_slice(), Some(&[55, 89, 144][..]));
+///
+///     Ok(())
+/// })
+/// # }
+/// # work().unwrap();
+/// ```
 #[repr(C)]
 pub struct OutputFunction<F, Perms: PacketPerms> {
     hdr: PacketOutput<Perms>,
@@ -214,6 +264,45 @@ unsafe impl<'b, F: Fn(PacketView<'b, Perms>, Option<Error>) + Send + Sync, Perms
     }
 }
 
+/// Outputs resulting packet views to a stream.
+///
+/// Custom backing storage may be supported through [`PushPop`] trait.
+///
+/// # Examples
+///
+/// ```rust
+/// # mod sample {
+/// #     include!("../../sample.rs");
+/// # }
+/// # use sample::SampleIo;
+/// # fn work() -> mfio::error::Result<()> {
+/// use mfio::backend::*;
+/// use mfio::io::*;
+/// use core::pin::pin;
+/// use futures::stream::StreamExt;
+///
+/// let mut mem = vec![0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144];
+/// let handle = SampleIo::new(mem.clone());
+///
+/// handle.block_on(async {
+///     let mut fut = handle.io_to_stream(10, Packet::<Write>::new_buf(4), vec![]);
+///     let mut fut = pin!(fut);
+///
+///     let stream = fut.as_mut().submit();
+///
+///     while let Some((packet, err)) = (&**stream).next().await {
+///         if err.is_some() {
+///             assert_eq!(packet.len(), 1);
+///         } else {
+///             assert_eq!(packet.len(), 3);
+///         }
+///     }
+///
+///     Ok(())
+/// })
+/// # }
+/// # work().unwrap();
+/// ```
 #[repr(C)]
 pub struct PacketStream<'a, T, Perms: PacketPerms> {
     hdr: PacketOutput<Perms>,
@@ -460,6 +549,7 @@ unsafe impl<T, Perms: PacketPerms> OpaqueStore for PacketStream<'_, T, Perms> {
     }
 }
 
+/// Providees a stack/queue mechanism for [`PacketStream`]s.
 pub trait PushPop<T> {
     fn push(&mut self, val: T);
     fn pop(&mut self) -> Option<T>;

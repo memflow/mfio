@@ -9,6 +9,11 @@ use core::ptr::NonNull;
 use core::sync::atomic::*;
 use tarc::BaseArc;
 
+/// Bound Packet View.
+///
+/// Views may be bound to an output reference before being sent to the I/O backend. If the packet
+/// is bound to such output ref, then, upon completion of processing, every resulting packet view
+/// is passed to the given output ref.
 #[repr(C)]
 pub struct BoundPacketView<Perms: PacketPerms> {
     pub(crate) view: ManuallyDrop<PacketView<'static, Perms>>,
@@ -198,6 +203,11 @@ impl<Perms: PacketPerms> BoundPacketView<Perms> {
     }
 }
 
+/// Describes a view to a given packet.
+///
+/// A bound packet view is sent to an I/O backend, where it can be split into multiple, strictly
+/// non-overlapping views. This structure contains necessary data for describing the bounds of each
+/// sub-view.
 #[repr(C)]
 pub struct PacketView<'a, Perms: PacketPerms> {
     pub(crate) pkt: NonNull<Packet<Perms>>,

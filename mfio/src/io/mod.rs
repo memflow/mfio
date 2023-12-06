@@ -100,6 +100,9 @@ pub use opaque::*;
 /// permission implies the packet holds the data, and that data can be transferred to the internal
 /// data store of the I/O backend.
 ///
+/// You may want to check [`PacketIoExt`] trait and the [`traits`](crate::traits) module for easier
+/// to use abstractions.
+///
 /// # Example
 ///
 /// Request-response handler:
@@ -155,7 +158,7 @@ pub use opaque::*;
 /// assert_eq!(&buf[..10], b"Hiooooo\0\0\0");
 /// # });
 /// ```
-#[cglue_trait]
+#[cfg_attr(feature = "cglue-trait", cglue_trait)]
 pub trait PacketIo<Perms: PacketPerms, Param>: Sized {
     /// Send I/O request to the backend.
     ///
@@ -203,13 +206,15 @@ pub trait PacketIo<Perms: PacketPerms, Param>: Sized {
     fn send_io(&self, param: Param, view: BoundPacketView<Perms>);
 }
 
+/// I/O helpers.
+///
+/// Use these helpers to simplify the usage of [`PacketIo`].
 pub trait PacketIoExt<Perms: PacketPerms, Param>: PacketIo<Perms, Param> {
     fn io<'a, T: PacketStore<'a, Perms>>(
         &'a self,
         param: Param,
         packet: T,
     ) -> IoFut<'a, Self, Perms, Param, T> {
-        //IoFut::NewId(self, param, packet.stack())
         IoFut {
             pkt: UnsafeCell::new(Some(packet.stack())),
             initial_state: UnsafeCell::new(Some((self, param))),
@@ -223,7 +228,6 @@ pub trait PacketIoExt<Perms: PacketPerms, Param>: PacketIo<Perms, Param> {
         packet: T,
         output: O,
     ) -> IoToFut<'a, Self, Perms, Param, T, O> {
-        //IoFut::NewId(self, param, packet.stack())
         IoToFut {
             pkt_out: UnsafeCell::new(Some((packet.stack(), output.stack()))),
             initial_state: UnsafeCell::new(Some((self, param))),
@@ -256,6 +260,10 @@ pub trait PacketIoExt<Perms: PacketPerms, Param>: PacketIo<Perms, Param> {
 
 impl<T: PacketIo<Perms, Param>, Perms: PacketPerms, Param> PacketIoExt<Perms, Param> for T {}
 
+/// Helpers for Stream I/O.
+///
+/// This is mainly meant for cases where I/O does not have a position parameter, such as TCP
+/// streams.
 pub trait StreamIoExt<Perms: PacketPerms>: PacketIo<Perms, NoPos> {
     fn stream_io<'a, T: PacketStore<'a, Perms>>(
         &'a self,
@@ -275,6 +283,10 @@ pub trait StreamIoExt<Perms: PacketPerms>: PacketIo<Perms, NoPos> {
 
 impl<T: PacketIo<Perms, NoPos>, Perms: PacketPerms> StreamIoExt<Perms> for T {}
 
+/// Describes lack of position.
+///
+/// This type is used in streams to signify that I/O is sequential. The convention is that I/O is
+/// processed on first-come, first-served basis
 #[repr(transparent)]
 #[derive(Clone)]
 pub struct NoPos(core::marker::PhantomData<()>);
@@ -285,6 +297,11 @@ impl NoPos {
     }
 }
 
+/// The simplest I/O future.
+///
+/// This future will drive an operation on the packet to completion, and then return `Poll::Ready`.
+///
+/// To perform more complex actions on partial results, please look at [`IoToFut`].
 pub struct IoFut<'a, T: ?Sized, Perms: PacketPerms, Param, Packet: PacketStore<'a, Perms>> {
     pkt: UnsafeCell<Option<Packet::StackReq<'a>>>,
     initial_state: UnsafeCell<Option<(&'a T, Param)>>,
@@ -336,6 +353,11 @@ impl<
     }
 }
 
+/// I/O future with custom actions per returned packet segment.
+///
+/// This future allows customizing behavior upon each completed packet segment. This may include
+/// logging, storing segments in a collection, or processing them in a stream. Please see
+/// appropriate output modules for more details.
 pub struct IoToFut<
     'a,
     T: ?Sized,

@@ -1,3 +1,10 @@
+//! File descriptor based waker.
+//!
+//! [`FdWaker`] allows one to wake a runtime by pushing a write operation to the underlying file
+//! descriptor, be it a pipe, eventfd, or anything else that can be pollable for readability.
+//!
+//! Create a [`FdWakerOwner`] from a [`AsRawFd`] object to allow controlling the waker properties.
+
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU8, Ordering};
 use core::task::{RawWaker, RawWakerVTable, Waker};
@@ -6,6 +13,42 @@ use std::io::{ErrorKind, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use tarc::{Arc, BaseArc};
 
+/// Owner of [`FdWaker`]s.
+///
+/// When this type gets dropped, the underlying file descriptor gets closed and released. This
+/// effectively breaks all remaining wakers, however, the references to them stay valid.
+///
+/// # Examples
+///
+/// Poll for the pipe to become readable:
+///
+/// ```
+/// # #[cfg(miri)]
+/// # fn main() { }
+/// # #[cfg(not(miri))]
+/// # fn main() {
+/// use mfio::backend::fd::FdWakerOwner;
+/// use nix::poll::*;
+///
+/// let (wake_read, wake_write) = nix::unistd::pipe().unwrap();
+///
+/// let waker_owner = FdWakerOwner::from(wake_write);
+///
+/// std::thread::spawn({
+///     let waker = waker_owner.clone().into_waker();
+///     move || {
+///         std::thread::sleep(std::time::Duration::from_millis(500));
+///         waker.wake();
+///     }
+/// });
+///
+/// let mut fd = [PollFd::new(wake_read, PollFlags::POLLIN)];
+/// assert_ne!(0, poll(&mut fd[..], 5000).unwrap());
+///
+/// // Let's verify that we did indeed get woken up.
+/// assert!(fd[0].revents().unwrap().contains(PollFlags::POLLIN));
+/// # }
+/// ```
 #[repr(transparent)]
 pub struct FdWakerOwner<F: AsRawFd>(FdWaker<F>);
 

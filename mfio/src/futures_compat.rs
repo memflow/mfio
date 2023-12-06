@@ -1,14 +1,31 @@
+//! Provides compatibility with `futures` traits.
+
 use crate::io::*;
 use crate::stdeq::{self, AsyncIoFut};
 use crate::util::PosShift;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use futures::io::{AsyncRead, AsyncSeek, AsyncWrite};
+#[cfg(not(mfio_assume_linear_types))]
+use futures::io::AsyncRead;
+use futures::io::{AsyncSeek, AsyncWrite};
 use std::io::{Result, SeekFrom};
 
+/// Container for intermediate values.
+///
+/// Currently, reading and writing is not cancel safe. Meaning, cancelling the I/O operation and
+/// issuing a new one would continue the previous operation, and sync the results to the currently
+/// provided buffer. Note that the types of operations are handled separately so they do not mix
+/// and it is okay to cancel a read to issue a write.
+///
+/// If you wish to cancel the operation, do drop the entire `Compat` object. However, be warned
+/// that `mfio` may panic, since it does not yet support cancellation at all.
+///
+/// Note that at the time of writing, `AsyncRead` is not supported when `mfio_assume_linear_types`
+/// config is set.
 pub struct Compat<'a, Io: ?Sized> {
     io: &'a Io,
+    #[cfg(not(mfio_assume_linear_types))]
     read: Option<AsyncIoFut<'a, Io, Write, u64, &'a mut [u8]>>,
     write: Option<AsyncIoFut<'a, Io, Read, u64, &'a [u8]>>,
 }
@@ -25,6 +42,9 @@ pub struct Compat<'a, Io: ?Sized> {
 /// # }
 /// # use sample::SampleIo;
 /// # fn work() -> mfio::error::Result<()> {
+/// # mfio::linear_types_switch!(
+/// #     Linear => { Ok(()) }
+/// #     Standard => {{
 /// use futures::io::{AsyncReadExt, Cursor};
 /// use mfio::backend::*;
 /// use mfio::futures_compat::FuturesCompat;
@@ -42,6 +62,38 @@ pub struct Compat<'a, Io: ?Sized> {
 ///
 ///     Ok(())
 /// })
+/// # }}
+/// # )
+/// # }
+/// # work().unwrap();
+/// ```
+///
+/// Write using futures traits.
+///
+/// ```rust
+/// # mod sample {
+/// #     include!("sample.rs");
+/// # }
+/// # use sample::SampleIo;
+/// # fn work() -> mfio::error::Result<()> {
+/// use futures::io::AsyncWriteExt;
+/// use mfio::backend::*;
+/// use mfio::futures_compat::FuturesCompat;
+/// use mfio::stdeq::SeekableRef;
+/// use mfio::traits::IoRead;
+///
+/// let mut mem = vec![0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144];
+/// let handle = SampleIo::new(mem.clone());
+///
+/// handle.block_on(async {
+///     let handle = SeekableRef::from(&handle);
+///     handle.compat().write_all(&[9, 9, 9]).await?;
+///
+///     handle.read_all(0, &mut mem[..5]).await.unwrap();
+///     assert_eq!(&mem[..5], &[9, 9, 9, 2, 3]);
+///
+///     Ok(())
+/// })
 /// # }
 /// # work().unwrap();
 /// ```
@@ -49,6 +101,7 @@ pub trait FuturesCompat {
     fn compat(&self) -> Compat<Self> {
         Compat {
             io: self,
+            #[cfg(not(mfio_assume_linear_types))]
             read: None,
             write: None,
         }
@@ -58,6 +111,10 @@ pub trait FuturesCompat {
 // StreamPos is needed for all I/O traits, so we use it to make sure rust gives better diagnostics.
 impl<'a, Io: ?Sized + stdeq::StreamPos<u64>> FuturesCompat for Io {}
 
+// Currently we cannot guarantee that the user won't swap the buffer when using linear types.
+// FIXME: always allocate an intermediary and sync in `Compat`. This way we could also retain the
+// buffer, so that's nice.
+#[cfg(not(mfio_assume_linear_types))]
 impl<'a, Io: ?Sized + stdeq::AsyncRead<u64>> AsyncRead for Compat<'a, Io>
 where
     u64: PosShift<Io>,
@@ -68,12 +125,9 @@ where
         loop {
             if let Some(read) = this.read.as_mut() {
                 // Update the sync handle. This is how we hack around the lifetimes of input buffer.
-                #[cfg(not(mfio_assume_linear_types))]
-                {
-                    // SAFETY: AsyncIoFut will only use the sync object if, and only if the buffer is
-                    // to be written in this poll.
-                    read.sync = Some(unsafe { &mut *(buf as *mut _) });
-                }
+                // SAFETY: AsyncIoFut will only use the sync object if, and only if the buffer is
+                // to be written in this poll.
+                read.sync = Some(unsafe { &mut *(buf as *mut _) });
 
                 let read = unsafe { Pin::new_unchecked(read) };
 

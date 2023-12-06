@@ -1,3 +1,5 @@
+//! Helper traits
+
 use crate::std_prelude::*;
 
 use crate::io::*;
@@ -11,7 +13,11 @@ use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
+/// I/O read operations.
 pub trait IoRead<Pos: 'static>: PacketIo<Write, Pos> {
+    /// Forwards a read request to the I/O object.
+    ///
+    /// This is equivalent to `PacketIo::io`, but disambiguates packet permissions.
     fn read_raw<'a, T: PacketStore<'a, Write>>(
         &'a self,
         pos: Pos,
@@ -20,6 +26,7 @@ pub trait IoRead<Pos: 'static>: PacketIo<Write, Pos> {
         self.io(pos, packet)
     }
 
+    /// Read all data into the given object.
     fn read_all<'a, T: IntoPacket<'a, Write>>(
         &'a self,
         pos: Pos,
@@ -32,6 +39,7 @@ pub trait IoRead<Pos: 'static>: PacketIo<Write, Pos> {
         }
     }
 
+    /// Reads data into a `Pod` struct.
     fn read_into<'a, T: Pod>(
         &'a self,
         pos: Pos,
@@ -46,11 +54,13 @@ pub trait IoRead<Pos: 'static>: PacketIo<Write, Pos> {
         self.read_all(pos, buf)
     }
 
+    /// Reads data into a new `Pod` struct.
     fn read<T: Pod>(&self, pos: Pos) -> IoReadFut<Self, Pos, T> {
         let pkt = FullPacket::<_, Write>::new_uninit();
         IoReadFut(self.io(pos, pkt))
     }
 
+    /// Reads data into given buffer until a gap is reached.
     fn read_to_end<'a>(&'a self, pos: Pos, buf: &'a mut Vec<u8>) -> ReadToEndFut<'a, Self, Pos>
     where
         Pos: CopyPos,
@@ -86,7 +96,11 @@ pub trait IoRead<Pos: 'static>: PacketIo<Write, Pos> {
 
 impl<Pos: 'static, T> IoRead<Pos> for T where T: PacketIo<Write, Pos> {}
 
+/// I/O write operations.
 pub trait IoWrite<Pos>: PacketIo<Read, Pos> {
+    /// Forwards a write request to the I/O object.
+    ///
+    /// This is equivalent to `PacketIo::io`, but disambiguates packet permissions.
     fn write_raw<'a, T: PacketStore<'a, Read>>(
         &'a self,
         pos: Pos,
@@ -95,6 +109,7 @@ pub trait IoWrite<Pos>: PacketIo<Read, Pos> {
         self.io(pos, packet)
     }
 
+    /// Writes all data in the given packet to destination.
     fn write_all<'a, T: IntoPacket<'a, Read>>(
         &'a self,
         pos: Pos,
@@ -107,6 +122,7 @@ pub trait IoWrite<Pos>: PacketIo<Read, Pos> {
         }
     }
 
+    /// Writes a pod object into to destination.
     fn write<'a, T>(&'a self, pos: Pos, data: &'a T) -> IoFullFut<'a, Self, Read, Pos, &'a [u8]> {
         let buf = unsafe {
             core::slice::from_raw_parts(data as *const T as *const u8, core::mem::size_of::<T>())
@@ -250,10 +266,15 @@ impl<'a, Io: PacketIo<Write, Param>, Param, T: 'a> Future for IoReadFut<'a, Io, 
 }
 
 pub mod sync {
+    //! Synchronous I/O wrappers
     use super::*;
 
     // TODO: figure out how to expose these over cglue
 
+    /// Synchronous I/O read operations.
+    ///
+    /// This trait simply wraps `PacketIo + IoBackend` types in order to not subject the user to
+    /// async code.
     pub trait SyncIoRead<Pos: 'static>: IoRead<Pos> + IoBackend {
         fn read_all<'a>(
             &'a self,
@@ -286,6 +307,10 @@ pub mod sync {
         }
     }
 
+    /// Synchronous I/O write operations.
+    ///
+    /// This trait simply wraps `PacketIo + IoBackend` types in order to not subject the user to
+    /// async code.
     pub trait SyncIoWrite<Pos: 'static>: IoWrite<Pos> + IoBackend {
         fn write_all<'a>(
             &'a self,

@@ -6,6 +6,39 @@ use tokio::io::{unix::AsyncFd, Interest};
 use super::super::*;
 use super::{BorrowingFn, Integration};
 
+/// Tokio integration.
+///
+/// Unlike [`Null`], this integration supports backends with polling handles, however, only tokio
+/// runtime is supported.
+///
+/// Internally, this uses tokio's [`AsyncFd`] to wait for readiness of the polling handle, which
+/// means only unix platforms are supported.
+///
+/// # Examples
+///
+/// ```
+/// # mod sample {
+/// #     include!("../../sample.rs");
+/// # }
+/// # use sample::SampleIo;
+/// use mfio::prelude::v1::*;
+///
+/// #[tokio::main]
+/// # #[cfg(all(unix, not(miri)))]
+/// async fn main() {
+///     let mut handle = SampleIo::new(vec![1, 2, 3, 4]);
+///
+///     // Run the integration. Prefer to use `run_with_mut`, so that panics can be avoided.
+///     Tokio::run_with_mut(&mut handle, |handle| async move {
+///         // Read value
+///         let val = handle.read(0).await.unwrap();
+///         assert_eq!(1u8, val);
+///     })
+///     .await
+/// }
+/// # #[cfg(not(all(unix, not(miri))))]
+/// # fn main() {}
+/// ```
 #[derive(Clone, Copy, Default)]
 pub struct Tokio;
 
@@ -42,6 +75,7 @@ enum TokioState<'a, B: IoBackend + ?Sized + 'a, Func, F> {
     Finished,
 }
 
+#[doc(hidden)]
 pub struct TokioImpl<'a, B: LinksIoBackend + 'a, Func, F> {
     backend: B,
     state: TokioState<'a, B::Link, Func, F>,
