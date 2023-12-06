@@ -6,7 +6,7 @@
 //! require unix platforms, since async equivalents for windows raw handle polling is not exposed
 //! at the moment.
 
-#[cfg(all(unix, feature = "async-io"))]
+#[cfg(all(any(unix, windows), feature = "async-io"))]
 pub mod async_io;
 pub mod null;
 #[cfg(all(unix, not(miri), feature = "tokio"))]

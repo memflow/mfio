@@ -1166,7 +1166,7 @@ mod suite_tests {
     });
 
     // Test with different async runtimes
-    #[cfg(all(unix, not(miri)))]
+    #[cfg(all(any(unix, windows), not(miri)))]
     mod smol {
         use super::*;
 

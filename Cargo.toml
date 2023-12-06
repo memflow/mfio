@@ -19,3 +19,5 @@ default-members = [
 	"mfio-netfs",
 ]
 
+[patch.crates-io]
+async-io = { git = "https://github.com/smol-rs/async-io", branch = "notgull/waitable" }

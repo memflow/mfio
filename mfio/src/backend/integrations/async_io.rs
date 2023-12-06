@@ -4,8 +4,15 @@
 //! [limitation](https://github.com/smol-rs/async-io/issues/132) that was only resolved in version
 //! 2.
 
+#[cfg(windows)]
+use async_io::os::windows::Waitable as Async;
+#[cfg(unix)]
 use async_io::Async;
-use std::os::fd::BorrowedFd;
+
+#[cfg(unix)]
+type BorrowedHandle<'a> = std::os::fd::BorrowedFd<'a>;
+#[cfg(windows)]
+type BorrowedHandle<'a> = std::os::windows::io::BorrowedHandle<'a>;
 
 use super::super::*;
 use super::{BorrowingFn, Integration};
@@ -32,7 +39,7 @@ enum AsyncIoState<'a, B: IoBackend + ?Sized + 'a, Func, F> {
     Initial(Func),
     Loaded(
         WithBackend<'a, B::Backend, F>,
-        Option<(Async<BorrowedFd<'a>>, &'a PollingFlags, Waker)>,
+        Option<(Async<BorrowedHandle<'a>>, &'a PollingFlags, Waker)>,
     ),
     Finished,
 }
@@ -82,10 +89,13 @@ impl<'a, B: LinksIoBackend + 'a, Func: BorrowingFn<B::Link>> Future
                                  waker,
                                  ..
                              }| {
-                                let handle = unsafe { BorrowedFd::borrow_raw(handle) };
+                                let handle = unsafe { BorrowedHandle::borrow_raw(handle) };
                                 (
+                                    #[cfg(unix)]
                                     Async::new_nonblocking(handle)
                                         .expect("Could not register the IO resource"),
+                                    #[cfg(windows)]
+                                    Async::new(handle).expect("Could not register the IO resource"),
                                     cur_flags,
                                     waker,
                                 )
@@ -99,6 +109,7 @@ impl<'a, B: LinksIoBackend + 'a, Func: BorrowingFn<B::Link>> Future
                             break Poll::Ready(v);
                         }
 
+                        #[cfg(unix)]
                         if let Some((fd, p, _)) = fd {
                             let (read, write) = p.get();
                             // TODO: what to do when read = write = false?
@@ -112,6 +123,11 @@ impl<'a, B: LinksIoBackend + 'a, Func: BorrowingFn<B::Link>> Future
                             if let Some(ret) = ret {
                                 break ret;
                             }
+                        }
+
+                        #[cfg(windows)]
+                        if let Some((fd, _, _)) = fd {
+                            let _ = core::task::ready!(fd.poll_ready(cx));
                         }
                     };
                 }
