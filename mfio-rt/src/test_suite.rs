@@ -1,5 +1,11 @@
+//! mfio-rt test suite.
+//!
+//! This module contains all blocks needed for testing [`Fs`] and [`Tcp`] implementations in a
+//! standard, extensive way. The main entry point for using the test suite are the
+//! [`test_suite!`](crate::test_suite!) and [`net_test_suite!`](crate::net_test_suite!) macros.
+
 use crate::util::diff_paths;
-pub use crate::{DirHandle, Fs, OpenOptions, Path, Shutdown};
+pub use crate::{DirHandle, DirHandleExt, Fs, OpenOptions, Path, Shutdown};
 pub use alloc::{
     collections::BTreeSet,
     format,
@@ -769,6 +775,40 @@ pub mod fs_tests {
     }
 }
 
+/// Builds filesystem test suite.
+///
+/// Unlike [`test_suite!`](crate::test_suite!), this function does not include any tests, and they
+/// must be added manually. Please see the [`fs_tests`] module for a list of available tests.
+///
+/// The first parameter of the macro is the name of the generated module, while the second one
+/// contains a closure containing the test name and an asynchronous closure to be executed.
+///
+/// The third argument an onwards is a comma separated list of tests to run.
+///
+/// The closure that runs contains the entire test_suite modules. It accepts a `&'static mut T`,
+/// where `T: Fs`. To get a static ref, use the `staticify` function. It is unsound, but necessary
+/// to make test suite generation code ergonomic.
+///
+/// # Examples
+///
+/// ```no_run
+/// use mfio_rt::*;
+///
+/// test_suite_base!(tests_default, |test_name, closure| {
+///     let _ = ::env_logger::builder().is_test(true).try_init();
+///     let mut rt = NativeRt::default();
+///     let rt = staticify(&mut rt);
+///     let dir = TempDir::new(test_name).unwrap();
+///     rt.set_cwd(dir.path().to_path_buf());
+///     rt.run(move |rt| {
+///         let run = TestRun::new(rt, dir);
+///         closure(run)
+///     });
+/// },
+///     dirs_equal,
+///     files_equal
+/// );
+/// ```
 #[macro_export]
 macro_rules! test_suite_base {
     ($test_ident:ident, $fs_builder:expr, $($(#[cfg($meta:meta)])* $test:ident),*) => {
@@ -799,6 +839,36 @@ macro_rules! test_suite_base {
     };
 }
 
+/// Builds filesystem test suite.
+///
+/// This includes all default tests, if you wish to not do that, please use
+/// [`test_suite_base!`](crate::test_suite_base!) macro.
+///
+/// The first parameter of the macro is the name of the generated module, while the second one
+/// contains a closure containing the test name and an asynchronous closure to be executed.
+///
+/// The closure that runs contains the entire test_suite modules. It accepts a `&'static mut T`,
+/// where `T: Fs`. To get a static ref, use the `staticify` function. It is unsound, but necessary
+/// to make test suite generation code ergonomic.
+///
+///
+/// # Examples
+///
+/// ```no_run
+/// use mfio_rt::*;
+///
+/// test_suite!(tests_default, |test_name, closure| {
+///     let _ = ::env_logger::builder().is_test(true).try_init();
+///     let mut rt = NativeRt::default();
+///     let rt = staticify(&mut rt);
+///     let dir = TempDir::new(test_name).unwrap();
+///     rt.set_cwd(dir.path().to_path_buf());
+///     rt.run(move |rt| {
+///         let run = TestRun::new(rt, dir);
+///         closure(run)
+///     });
+/// });
+/// ```
 #[macro_export]
 macro_rules! test_suite {
     ($test_ident:ident, $fs_builder:expr) => {
@@ -819,6 +889,27 @@ macro_rules! test_suite {
     };
 }
 
+/// Builds network test suite.
+///
+/// The first parameter of the macro is the name of the generated module, while the second one
+/// contains a closure containing the test name and an asynchronous closure to be executed.
+///
+/// The closure that runs contains the entire test_suite and net modules. It accepts a `&'static
+/// mut T` where `T: Tcp`. To get a static ref, use the `staticify` function. It is unsound, but
+/// necessary to make test suite generation code ergonomic.
+///
+/// # Examples
+///
+/// ```no_run
+/// use mfio_rt::*;
+///
+/// net_test_suite!(net_tests_default, |closure| {
+///     let _ = ::env_logger::builder().is_test(true).try_init();
+///     let mut rt = NativeRt::default();
+///     let rt = staticify(&mut rt);
+///     rt.run(closure);
+/// });
+/// ```
 #[cfg(feature = "std")]
 #[macro_export]
 macro_rules! net_test_suite {
@@ -842,13 +933,6 @@ macro_rules! net_test_suite {
 
             fn staticify<T>(val: &mut T) -> &'static mut T {
                 unsafe { core::mem::transmute(val) }
-            }
-
-            async fn test_run<T: 'static, F: Future<Output = ()>>(
-                rt: &'static T,
-                closure: fn(&'static T) -> F,
-            ) {
-                closure(rt).await
             }
 
             #[cfg(not(miri))]

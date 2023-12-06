@@ -1,3 +1,19 @@
+//! # mfio-rt
+//!
+//! ## mfio Backed Runtime
+//!
+//! This crate aims to provide building blocks for mfio backed asynchronous runtimes. The traits
+//! have the option to not rely on the standard library. This makes the system great for `no_std`
+//! embedded environments or kernel-side code.
+//!
+//! `native` feature (depends on `std`) enables native implementations of the runtime through
+//! [`NativeRt`] structure.
+//!
+//! `virt` feature enables a virtual in-memory runtime through [`VirtRt`](virt::VirtRt) structure.
+//!
+//! Custom runtimes may be implemented by implementing [`IoBackend`], and any of the runtime
+//! traits, such as [`Fs`] or [`Tcp`].
+
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
@@ -40,6 +56,10 @@ pub mod test_suite;
 #[cfg(feature = "native")]
 pub use native::{NativeFile, NativeRt, NativeRtBuilder};
 
+/// File open options.
+///
+/// This type is equivalent to [`OpenOptions`](std::fs::OpenOptions) found in the standard library,
+/// but omits `append` mode.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq, PartialOrd, Ord)]
 pub struct OpenOptions {
@@ -51,39 +71,6 @@ pub struct OpenOptions {
     // Append would currently require us to get file pos after opening.
     // So we don't support it at the moment.
     //pub append: bool,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq, PartialOrd, Ord)]
-pub enum Shutdown {
-    Read,
-    Write,
-    Both,
-}
-
-#[cfg(feature = "std")]
-use std::net;
-
-#[cfg(feature = "std")]
-impl From<net::Shutdown> for Shutdown {
-    fn from(o: net::Shutdown) -> Self {
-        match o {
-            net::Shutdown::Write => Self::Write,
-            net::Shutdown::Read => Self::Read,
-            net::Shutdown::Both => Self::Both,
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-impl From<Shutdown> for net::Shutdown {
-    fn from(o: Shutdown) -> Self {
-        match o {
-            Shutdown::Write => Self::Write,
-            Shutdown::Read => Self::Read,
-            Shutdown::Both => Self::Both,
-        }
-    }
 }
 
 impl OpenOptions {
@@ -118,6 +105,47 @@ impl OpenOptions {
     }
 }
 
+/// Network stream shutdown options.
+///
+/// This type is equivalent to [`Shutdown`](std::net::Shutdown) in the standard library.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq, PartialOrd, Ord)]
+pub enum Shutdown {
+    Read,
+    Write,
+    Both,
+}
+
+#[cfg(feature = "std")]
+use std::net;
+
+#[cfg(feature = "std")]
+impl From<net::Shutdown> for Shutdown {
+    fn from(o: net::Shutdown) -> Self {
+        match o {
+            net::Shutdown::Write => Self::Write,
+            net::Shutdown::Read => Self::Read,
+            net::Shutdown::Both => Self::Both,
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl From<Shutdown> for net::Shutdown {
+    fn from(o: Shutdown) -> Self {
+        match o {
+            Shutdown::Write => Self::Write,
+            Shutdown::Read => Self::Read,
+            Shutdown::Both => Self::Both,
+        }
+    }
+}
+
+/// Primary filesystem trait.
+///
+/// This provides an entrypoint for filesystem operations. However, since operations are typically
+/// performed on a directory, this trait only serves as a proxy for retrieving the current
+/// directory handle.
 pub trait Fs: IoBackend {
     type DirHandle<'a>: DirHandle + 'a
     where
@@ -140,6 +168,11 @@ pub trait Fs: IoBackend {
 }
 
 /// Represents a location in filesystem operations are performed from.
+///
+/// Directory handles may refer to fixed directory entries throughout time, even if said entry is
+/// unlinked from the filesystem. So long as the handle is held, it may be valid. However, this
+/// behavior is implementation-specific, and, for instance, [`NativeRt`] does not follow it,
+/// because directory handles are simply stored as paths, rather than dir FDs/handles.
 pub trait DirHandle: Sized {
     type FileHandle: FileHandle;
     type OpenFileFuture<'a>: Future<Output = MfioResult<Self::FileHandle>> + 'a
@@ -317,7 +350,10 @@ pub trait DirHandle: Sized {
     /// # });
     /// ```
     fn do_op<'a, P: AsRef<Path> + ?Sized>(&'a self, operation: DirOp<&'a P>) -> Self::OpFuture<'a>;
+}
 
+/// Helpers for running directory operations more ergonomically.
+pub trait DirHandleExt: DirHandle {
     ///
     /// # Examples
     ///
@@ -440,6 +476,9 @@ pub trait DirHandle: Sized {
     // fn symlink_dir(&self, from: &Path, to: &Path) -> Self::OpFuture<'_>;
 }
 
+impl<T: DirHandle> DirHandleExt for T {}
+
+/// List of operations that can be done on a filesystem.
 #[non_exhaustive]
 #[derive(Serialize, Deserialize, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug)]
 pub enum DirOp<P: AsRef<Path>> {
@@ -602,6 +641,9 @@ impl<'a, P: AsRef<Path> + ?Sized> DirOp<&'a P> {
     }
 }
 
+/// Directory list entry.
+///
+/// This type is equivalent to [`DirEntry`](std::fs::DirEntry) in the standard library.
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
 pub struct DirEntry {
     pub name: String,
@@ -633,6 +675,9 @@ impl From<std::fs::DirEntry> for DirEntry {
     }
 }
 
+/// Directory list entry type.
+///
+/// This type is equivalent to [`FileType`](std::fs::FileType) in the standard library.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub enum FileType {
     Unknown,
@@ -641,6 +686,12 @@ pub enum FileType {
     Symlink,
 }
 
+/// Directory list entry permission.
+///
+/// This type is equivalent to [`Permission`](std::fs::Permissions) in the standard library.
+/// However, this currently contains nothing, and is effectively useless.
+///
+/// TODO: make this type do something.
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize)]
 pub struct Permissions {}
 
@@ -651,6 +702,9 @@ impl From<std::fs::Permissions> for Permissions {
     }
 }
 
+/// Directory list entry metadata.
+///
+/// This type is equivalent to [`Metadata`](std::fs::Metadata) in the standard library.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct Metadata {
     pub permissions: Permissions,
@@ -679,12 +733,15 @@ impl Metadata {
     }
 }
 
+/// Supertrait for file handles.
 pub trait FileHandle: AsyncRead<u64> + AsyncWrite<u64> {}
 impl<T: AsyncRead<u64> + AsyncWrite<u64>> FileHandle for T {}
 
+/// Supertrait for stream handles.
 pub trait StreamHandle: AsyncRead<NoPos> + AsyncWrite<NoPos> {}
 impl<T: AsyncRead<NoPos> + AsyncWrite<NoPos>> StreamHandle for T {}
 
+/// Describes TCP capable runtime operations.
 #[cfg(feature = "std")]
 pub trait Tcp: IoBackend {
     type StreamHandle: TcpStreamHandle;
@@ -703,6 +760,7 @@ pub trait Tcp: IoBackend {
     fn bind<'a, A: ToSocketAddrs + Send + 'a>(&'a self, addrs: A) -> Self::BindFuture<'a, A>;
 }
 
+/// Describes operations performable on a TCP connection.
 #[cfg(feature = "std")]
 pub trait TcpStreamHandle: StreamHandle {
     fn local_addr(&self) -> MfioResult<SocketAddr>;
@@ -716,6 +774,7 @@ pub trait TcpStreamHandle: StreamHandle {
     //fn nodelay(&self) -> MfioResult<bool>;
 }
 
+/// Describes operations performable on a TCP listener.
 #[cfg(feature = "std")]
 pub trait TcpListenerHandle: Stream<Item = (Self::StreamHandle, SocketAddr)> {
     type StreamHandle: TcpStreamHandle;

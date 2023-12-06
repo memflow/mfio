@@ -1,3 +1,8 @@
+//! Native async runtime
+//!
+//! This module provides native OS-backed runtime/backend implementations. To start, please access
+//! [`NativeRt`] or [`NativeRtBuilder`] types.
+
 use core::future::{ready, Future, Ready};
 use core::pin::Pin;
 use core::task::{Context, Poll};
