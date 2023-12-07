@@ -5,6 +5,7 @@ use mfio::locks::Mutex;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Waker;
 
+#[allow(unused)]
 use mfio_derive::*;
 
 use tarc::{Arc, BaseArc};

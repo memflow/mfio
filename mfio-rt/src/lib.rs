@@ -13,6 +13,13 @@
 //!
 //! Custom runtimes may be implemented by implementing [`IoBackend`], and any of the runtime
 //! traits, such as [`Fs`] or [`Tcp`].
+//!
+//! ## `no_std`
+//!
+//! Currently, only [`Fs`] is exposed in `no_std` environments. [`Tcp`] depends on structures, such
+//! as [`SocketAddr`](https://doc.rust-lang.org/nightly/core/net/enum.SocketAddr.html) that are
+//! currently not available in `core`. This will change once
+//! [`ip_in_core`](https://github.com/rust-lang/rust/issues/108443) is stabilized.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]

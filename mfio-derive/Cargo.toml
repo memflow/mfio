@@ -3,6 +3,11 @@ name = "mfio-derive"
 version = "0.1.0"
 rust-version = "1.72"
 edition = "2021"
+authors = ["Aurimas Blažulionis <0x60@pm.me>"]
+license = "MIT"
+repository = "https://github.com/memflow/mfio"
+documentation = "https://docs.rs/mfio-derive"
+description = "mfio derive macros"
 
 [lib]
 proc-macro = true

@@ -1,8 +1,6 @@
 pub mod client;
 pub mod server;
 
-pub use client::NetworkFs;
-
 use serde::{Deserialize, Serialize};
 
 use bytemuck::{Pod, Zeroable};

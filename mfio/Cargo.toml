@@ -6,7 +6,11 @@ edition = "2021"
 authors = ["Aurimas Blažulionis <0x60@pm.me>"]
 license = "MIT"
 repository = "https://github.com/memflow/mfio"
-description = "memflow completion-based I/O primitives"
+documentation = "https://docs.rs/mfio"
+description = "Flexible completion I/O primitives"
+keywords = [ "mfio", "memflow", "async", "completion", "io" ]
+categories = [ "asynchronous", "no-std", "concurrency" ]
+readme = "../README.md"
 
 [package.metadata.docs.rs]
 features = ["default", "tokio", "async-io"]

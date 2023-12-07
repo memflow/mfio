@@ -176,9 +176,12 @@ pub(crate) mod std_prelude {
     pub mod std {
         pub use ::alloc::*;
     }
+    pub use crate::derive::*;
     #[cfg(feature = "std")]
     pub use ::std;
 }
+
+pub use mfio_derive as derive;
 
 pub mod backend;
 pub mod error;

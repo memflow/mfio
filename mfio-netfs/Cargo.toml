@@ -1,8 +1,16 @@
 [package]
 name = "mfio-netfs"
 version = "0.1.0"
-rust-version = "1.72"
+rust-version = "1.74"
 edition = "2021"
+authors = ["Aurimas Blažulionis <0x60@pm.me>"]
+license = "MIT"
+repository = "https://github.com/memflow/mfio"
+description = "mfio based network filesystem"
+documentation = "https://docs.rs/mfio-netfs"
+keywords = [ "mfio", "async", "network", "filesystem" ]
+categories = [ "asynchronous", "network-programming", "filesystem" ]
+readme = "README.md"
 
 [[bin]]
 name = "mfio-netfs-server"

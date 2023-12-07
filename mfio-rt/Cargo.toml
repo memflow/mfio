@@ -1,12 +1,16 @@
 [package]
 name = "mfio-rt"
 version = "0.1.0"
-rust-version = "1.72"
+rust-version = "1.74"
 edition = "2021"
 authors = ["Aurimas Blažulionis <0x60@pm.me>"]
 license = "MIT"
 repository = "https://github.com/memflow/mfio"
 description = "mfio based async runtime"
+documentation = "https://docs.rs/mfio-rt"
+keywords = [ "mfio", "async", "runtime", "io_uring", "iocp" ]
+categories = [ "asynchronous", "network-programming", "no-std", "os", "filesystem" ]
+readme = "README.md"
 
 [package.metadata.docs.rs]
 all-features = true
