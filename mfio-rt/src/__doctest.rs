@@ -1,7 +1,7 @@
-#[cfg(all(any(miri, test, feature = "virt"), not(feature = "native")))]
-use crate::virt::VirtRt;
 #[cfg(feature = "native")]
 use crate::NativeRt;
+#[cfg(all(any(miri, test, feature = "virt"), not(feature = "native")))]
+use crate::{virt::VirtRt, DirHandleExt};
 #[cfg(any(miri, test, feature = "native", feature = "virt"))]
 use core::future::Future;
 #[cfg(any(miri, test, feature = "native", feature = "virt"))]

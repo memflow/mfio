@@ -6,10 +6,12 @@
 //! require unix platforms, since async equivalents for windows raw handle polling is not exposed
 //! at the moment.
 
-#[cfg(all(unix, feature = "async-io"))]
+#[cfg(all(unix, feature = "std", feature = "async-io"))]
+#[cfg_attr(docsrs, doc(cfg(all(unix, feature = "std", feature = "async-io"))))]
 pub mod async_io;
 pub mod null;
-#[cfg(all(unix, not(miri), feature = "tokio"))]
+#[cfg(all(unix, not(miri), feature = "std", feature = "tokio"))]
+#[cfg_attr(docsrs, doc(cfg(all(unix, feature = "std", feature = "tokio"))))]
 pub mod tokio;
 
 use super::{IoBackend, LinksIoBackend, RefLink};

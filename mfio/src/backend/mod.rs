@@ -29,12 +29,15 @@ use std::os::fd::RawFd;
 use std::os::windows::io::RawHandle;
 
 #[cfg(all(any(unix, target_os = "wasi"), feature = "std"))]
+#[cfg_attr(docsrs, doc(cfg(all(any(unix, target_os = "wasi"), feature = "std"))))]
 pub mod fd;
 
 #[cfg(all(windows, feature = "std"))]
+#[cfg_attr(docsrs, doc(cfg(all(windows, feature = "std"))))]
 pub mod handle;
 
 #[cfg(all(windows, feature = "std"))]
+#[cfg_attr(docsrs, doc(cfg(windows)))]
 pub mod windows;
 
 // TODO: rename DefaultHandle to OsHandle, and get rid of Infallible one.
@@ -507,6 +510,7 @@ impl Pollable for DefaultHandle {
 }
 
 #[cfg(all(not(miri), unix, feature = "std"))]
+#[cfg_attr(docsrs, doc(cfg(all(not(miri), feature = "std"))))]
 impl Pollable for DefaultHandle {
     fn poll(&self, flags: &PollingFlags) {
         let fd = PollFd::new(*self, flags.to_posix());
@@ -515,6 +519,7 @@ impl Pollable for DefaultHandle {
 }
 
 #[cfg(all(not(miri), windows, feature = "std"))]
+#[cfg_attr(docsrs, doc(cfg(all(not(miri), feature = "std"))))]
 impl Pollable for DefaultHandle {
     fn poll(&self, _: &PollingFlags) {
         use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};

@@ -75,6 +75,7 @@
 //! successful, it will then fall back to allocating an intermediary buffer.
 
 use crate::error::Error;
+#[cfg(feature = "cglue-trait")]
 use cglue::prelude::v1::*;
 use core::cell::UnsafeCell;
 use core::future::Future;

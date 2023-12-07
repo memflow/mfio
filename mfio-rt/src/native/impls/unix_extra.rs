@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::os::fd::RawFd;
 
 // From mio
+#[allow(dead_code)]
 pub(crate) fn new_for_addr(
     address: SocketAddr,
     nonblock: bool,

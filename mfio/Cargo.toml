@@ -10,6 +10,7 @@ description = "memflow completion-based I/O primitives"
 
 [package.metadata.docs.rs]
 features = ["default", "tokio", "async-io"]
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
 bench = false
@@ -51,5 +52,5 @@ bytemuck = { version = "1", features = ["derive"] }
 
 [features]
 default = ["std", "http"]
-std = ["parking_lot"]
+std = ["parking_lot", "futures/std"]
 cglue-trait = []

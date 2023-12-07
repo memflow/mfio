@@ -162,6 +162,7 @@
 //! and most I/O will be done through stack (see <https://github.com/memflow/mfio/issues/2>).
 
 #![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 extern crate alloc;
 
@@ -182,6 +183,7 @@ pub(crate) mod std_prelude {
 pub mod backend;
 pub mod error;
 #[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub mod futures_compat;
 pub mod io;
 pub mod stdeq;
@@ -189,9 +191,9 @@ pub mod traits;
 
 pub mod prelude {
     pub mod v1 {
-        #[cfg(all(unix, feature = "async-io"))]
+        #[cfg(all(unix, feature = "std", feature = "async-io"))]
         pub use crate::backend::integrations::async_io::AsyncIo;
-        #[cfg(all(unix, not(miri), feature = "tokio"))]
+        #[cfg(all(unix, not(miri), feature = "std", feature = "tokio"))]
         pub use crate::backend::integrations::tokio::Tokio;
         pub use crate::backend::{Integration, IoBackend, IoBackendExt, Null};
         pub use crate::error::*;

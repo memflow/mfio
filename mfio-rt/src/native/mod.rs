@@ -32,7 +32,7 @@ macro_rules! fs_dispatch {
     ($($(#[cfg($meta:meta)])* $name:ident => $mod:ident),*$(,)?) => {
 
         pub enum NativeRtInstance {
-            $($(#[cfg($meta)])* $name(impls::$mod::Runtime)),*
+            $($(#[cfg($meta)] #[cfg_attr(docsrs, doc(cfg($meta)))])* $name(impls::$mod::Runtime)),*
         }
 
         impl NativeRtInstance {
@@ -140,7 +140,7 @@ macro_rules! fs_dispatch {
                 Self::all_backends()
             }
 
-            $($(#[cfg($meta)])*
+            $($(#[cfg($meta)] #[cfg_attr(docsrs, doc(cfg($meta)))])*
             #[doc = concat!("Enables the ", stringify!($mod), " backend.")]
             pub fn $mod(self, $mod: bool) -> Self {
                 Self {

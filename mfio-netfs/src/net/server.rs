@@ -367,8 +367,8 @@ async fn run_server(stream: NativeTcpStream, fs: &NativeRt) {
                                     count,
                                 );
                                 async {
-                                    let rm_stream = if let Some(stream) =
-                                        read_dir_streams.borrow().get(stream_id as usize)
+                                    let stream = read_dir_streams.borrow().get(stream_id as usize).cloned();
+                                    let rm_stream = if let Some(stream) = stream
                                     {
                                         let stream_buf = &mut *stream.lock().await;
                                         // SAFETY: we already ensure the stream is pinned at the

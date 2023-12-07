@@ -38,7 +38,7 @@ pub fn std_seek(
             if let Some(end) = io.end() {
                 let pos = if val < 0 {
                     end.checked_sub((-val) as u64)
-                        .ok_or_else(|| std::io::ErrorKind::InvalidInput)?
+                        .ok_or(std::io::ErrorKind::InvalidInput)?
                 } else {
                     end + val as u64
                 };
@@ -52,7 +52,7 @@ pub fn std_seek(
             let pos = io.get_pos();
             let pos = if val < 0 {
                 pos.checked_sub((-val) as u64)
-                    .ok_or_else(|| std::io::ErrorKind::InvalidInput)?
+                    .ok_or(std::io::ErrorKind::InvalidInput)?
             } else {
                 pos + val as u64
             };

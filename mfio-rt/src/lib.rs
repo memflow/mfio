@@ -15,6 +15,7 @@
 //! traits, such as [`Fs`] or [`Tcp`].
 
 #![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 extern crate alloc;
 
@@ -42,15 +43,18 @@ pub use std::path::{Component, Path, PathBuf};
 pub use typed_path::{UnixComponent as Component, UnixPath as Path, UnixPathBuf as PathBuf};
 
 #[cfg(feature = "native")]
+#[cfg_attr(docsrs, doc(cfg(feature = "native")))]
 pub mod native;
 mod util;
 #[cfg(any(feature = "virt", test, miri))]
+#[cfg_attr(docsrs, doc(cfg(feature = "virt")))]
 pub mod virt;
 
 #[doc(hidden)]
 pub mod __doctest;
 
 #[cfg(any(feature = "test_suite", test))]
+#[cfg_attr(docsrs, doc(cfg(feature = "test_suite")))]
 pub mod test_suite;
 
 #[cfg(feature = "native")]
@@ -743,6 +747,7 @@ impl<T: AsyncRead<NoPos> + AsyncWrite<NoPos>> StreamHandle for T {}
 
 /// Describes TCP capable runtime operations.
 #[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub trait Tcp: IoBackend {
     type StreamHandle: TcpStreamHandle;
     type ListenerHandle: TcpListenerHandle<StreamHandle = Self::StreamHandle>;
@@ -762,6 +767,7 @@ pub trait Tcp: IoBackend {
 
 /// Describes operations performable on a TCP connection.
 #[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub trait TcpStreamHandle: StreamHandle {
     fn local_addr(&self) -> MfioResult<SocketAddr>;
     fn peer_addr(&self) -> MfioResult<SocketAddr>;
@@ -776,6 +782,7 @@ pub trait TcpStreamHandle: StreamHandle {
 
 /// Describes operations performable on a TCP listener.
 #[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub trait TcpListenerHandle: Stream<Item = (Self::StreamHandle, SocketAddr)> {
     type StreamHandle: TcpStreamHandle;
 

@@ -109,12 +109,13 @@ pub trait FuturesCompat {
 }
 
 // StreamPos is needed for all I/O traits, so we use it to make sure rust gives better diagnostics.
-impl<'a, Io: ?Sized + stdeq::StreamPos<u64>> FuturesCompat for Io {}
+impl<Io: ?Sized + stdeq::StreamPos<u64>> FuturesCompat for Io {}
 
 // Currently we cannot guarantee that the user won't swap the buffer when using linear types.
 // FIXME: always allocate an intermediary and sync in `Compat`. This way we could also retain the
 // buffer, so that's nice.
 #[cfg(not(mfio_assume_linear_types))]
+#[cfg_attr(docsrs, doc(cfg(not(mfio_assume_linear_types))))]
 impl<'a, Io: ?Sized + stdeq::AsyncRead<u64>> AsyncRead for Compat<'a, Io>
 where
     u64: PosShift<Io>,

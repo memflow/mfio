@@ -8,6 +8,10 @@ license = "MIT"
 repository = "https://github.com/memflow/mfio"
 description = "mfio based async runtime"
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 mfio = { version = "0.1", path = "../mfio", default-features = false }
 futures = { version = "0.3", default-features = false, features = ["async-await"] }
