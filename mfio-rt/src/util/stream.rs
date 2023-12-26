@@ -265,7 +265,7 @@ impl StreamBuf {
             let spare_len = core::cmp::min(spare.len(), self.read_cached);
 
             if (spare_len as u64) < packet.len() {
-                let (a, b) = packet.split_at(spare_len as u64);
+                let (a, b) = packet.split_at(spare_len);
                 let transferred = unsafe { a.transfer_data(spare.as_mut_ptr().cast()) };
                 self.read_buf.release(transferred.len() as usize);
                 self.read_cached -= transferred.len() as usize;
@@ -365,7 +365,7 @@ impl StreamBuf {
                         let packet = if len as u64 >= packet.len() {
                             packet
                         } else {
-                            let (a, b) = packet.split_at(len as u64);
+                            let (a, b) = packet.split_at(len);
                             self.read_ops2.push_front(b);
                             a
                         };
@@ -575,7 +575,7 @@ impl StreamBuf {
                         self.read_ops1.push_front(Err(pkt));
                         break;
                     } else if (spare_len as u64) < pkt.len() {
-                        let (a, b) = pkt.split_at(spare_len as u64);
+                        let (a, b) = pkt.split_at(spare_len);
                         self.read_buf.reserve(spare_len);
                         self.read_ops2.push_back(Err(a));
                         pkt = b;
@@ -650,7 +650,7 @@ impl StreamBuf {
                             *queued = Some(pkt);
                             break;
                         } else if (spare_len as u64) < pkt.len() {
-                            let (a, b) = pkt.split_at(spare_len as u64);
+                            let (a, b) = pkt.split_at(spare_len);
                             let pkt = unsafe { a.transfer_data(spare.as_mut_ptr().cast()) };
                             self.write_buf.reserve(spare_len);
                             transferred.push_back(pkt);

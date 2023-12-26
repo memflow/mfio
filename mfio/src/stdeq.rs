@@ -11,6 +11,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use mfio_derive::*;
+use num::ToPrimitive;
 
 pub trait StreamPos<Param> {
     fn set_pos(&self, pos: Param);
@@ -174,7 +175,7 @@ impl<
             let hdr = <<Obj as IntoPacket<'a, Perms>>::Target as OpaqueStore>::stack_hdr(&pkt);
             // TODO: put this after error checking
             Obj::sync_back(hdr, this.sync.take().unwrap());
-            let progressed = core::cmp::min(hdr.error_clamp() as usize, this.len);
+            let progressed = core::cmp::min(hdr.error_clamp().to_usize().unwrap_or(!0), this.len);
             Param::add_io_pos(this.io, progressed);
             // TODO: actual error checking
             Ok(progressed)

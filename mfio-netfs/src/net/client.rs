@@ -69,25 +69,25 @@ impl IntoOp for Write {
     }
 }
 
-struct ShardedPacket<T: Splittable<u64>> {
-    shards: BTreeMap<u64, T>,
+struct ShardedPacket<T: Splittable> {
+    shards: BTreeMap<T::Bounds, T>,
 }
 
-impl<T: Splittable<u64>> From<T> for ShardedPacket<T> {
+impl<T: Splittable> From<T> for ShardedPacket<T> {
     fn from(pkt: T) -> Self {
         Self {
-            shards: std::iter::once((0, pkt)).collect(),
+            shards: std::iter::once((Default::default(), pkt)).collect(),
         }
     }
 }
 
-impl<T: Splittable<u64>> ShardedPacket<T> {
+impl<T: Splittable> ShardedPacket<T> {
     fn is_empty(&self) -> bool {
         // TODO: do this or self.len() == 0?
         self.shards.is_empty()
     }
 
-    fn extract(&mut self, idx: u64, len: u64) -> Option<T> {
+    fn extract(&mut self, idx: T::Bounds, len: T::Bounds) -> Option<T> {
         let (&shard_idx, _) = self.shards.range(..=idx).next_back()?;
         let mut shard = self.shards.remove(&shard_idx)?;
 

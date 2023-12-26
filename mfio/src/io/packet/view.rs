@@ -1,5 +1,6 @@
 use super::{
-    Errorable, MaybeAlloced, OutputRef, Packet, PacketPerms, Splittable, TransferredPacket,
+    Errorable, MaybeAlloced, NumBounds, OutputRef, Packet, PacketPerms, Splittable,
+    TransferredPacket,
 };
 use crate::error::Error;
 use cglue::prelude::v1::*;
@@ -7,6 +8,7 @@ use core::marker::PhantomData;
 use core::mem::{ManuallyDrop, MaybeUninit};
 use core::ptr::NonNull;
 use core::sync::atomic::*;
+use num::{NumCast, ToPrimitive};
 use tarc::BaseArc;
 
 /// Bound Packet View.
@@ -29,11 +31,13 @@ impl<Perms: PacketPerms> Drop for BoundPacketView<Perms> {
     }
 }
 
-impl<T: PacketPerms> Splittable<u64> for BoundPacketView<T> {
-    fn split_at(self, len: u64) -> (Self, Self) {
+impl<T: PacketPerms> Splittable for BoundPacketView<T> {
+    type Bounds = T::Bounds;
+
+    fn split_at(self, len: impl NumBounds) -> (Self, Self) {
         let mut this = ManuallyDrop::new(self);
         let view = unsafe { ManuallyDrop::take(&mut this.view) };
-        let (v1, v2) = view.split_local(len);
+        let (v1, v2) = view.split_local(NumCast::from(len).expect("Input bound out of range"));
 
         //this.id.size.fetch_add(1, Ordering::Release);
 
@@ -61,7 +65,7 @@ impl<T: PacketPerms> Splittable<u64> for BoundPacketView<T> {
         )
     }
 
-    fn len(&self) -> u64 {
+    fn len(&self) -> T::Bounds {
         self.view.len()
     }
 }
@@ -116,7 +120,7 @@ impl<Perms: PacketPerms> BoundPacketView<Perms> {
     ///
     /// 3. Before the last extracted packet is dropped, `self` must be released with
     ///    [`BoundPacketView::forget`].
-    pub unsafe fn extract_packet(&self, pos: u64, len: u64) -> Self {
+    pub unsafe fn extract_packet(&self, pos: Perms::Bounds, len: Perms::Bounds) -> Self {
         let b = self.view.extract_packet(pos, len);
 
         Self {
@@ -162,7 +166,8 @@ impl<Perms: PacketPerms> BoundPacketView<Perms> {
     ///
     /// Please see [`PacketView::extract_packet`] documentation for details.
     pub unsafe fn unbound(&self) -> PacketView<'static, Perms> {
-        self.view.extract_packet(0, self.view.len())
+        self.view
+            .extract_packet(Default::default(), self.view.len())
     }
 
     /// Transfers data between the packet and the `input`.
@@ -197,7 +202,7 @@ impl<Perms: PacketPerms> BoundPacketView<Perms> {
                 self.view
                     .pkt()
                     .simple_data_ptr()
-                    .add(self.view.start as usize)
+                    .add(self.view.start.to_usize().unwrap())
             }
         }
     }
@@ -213,8 +218,8 @@ pub struct PacketView<'a, Perms: PacketPerms> {
     pub(crate) pkt: NonNull<Packet<Perms>>,
     /// Right-most bit indicates whether packet is an Arc or a ref. The rest is user-defined.
     pub(crate) tag: u64,
-    pub(crate) start: u64,
-    pub(crate) end: u64,
+    pub(crate) start: Perms::Bounds,
+    pub(crate) end: Perms::Bounds,
     phantom: PhantomData<&'a Packet<Perms>>,
 }
 
@@ -264,7 +269,7 @@ impl<'a, Perms: PacketPerms> PacketView<'a, Perms> {
         Self {
             pkt,
             tag: tag << 1 | 1,
-            start: 0,
+            start: Default::default(),
             end,
             phantom: PhantomData,
         }
@@ -335,7 +340,7 @@ impl<'a, Perms: PacketPerms> PacketView<'a, Perms> {
         Self {
             pkt: NonNull::new((pkt as *const Packet<Perms>).cast_mut()).unwrap(),
             tag: tag << 1,
-            start: 0,
+            start: Default::default(),
             end,
             phantom: PhantomData,
         }
@@ -367,27 +372,27 @@ impl<'a, Perms: PacketPerms> PacketView<'a, Perms> {
     }
 
     /// Returns the length this packet view covers.
-    pub fn len(&self) -> u64 {
+    pub fn len(&self) -> Perms::Bounds {
         self.end - self.start
     }
 
     /// Returns the starting offset within the packet that this view represents.
-    pub fn start(&self) -> u64 {
+    pub fn start(&self) -> Perms::Bounds {
         self.start
     }
 
     /// Returns the ending position (+1) within the packet that this view represents.
-    pub fn end(&self) -> u64 {
+    pub fn end(&self) -> Perms::Bounds {
         self.end
     }
 
     /// Returns true if packet length is 0.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.len() == Default::default()
     }
 
     /// Split the packet view into 2 at given offset.
-    pub fn split_local(self, pos: u64) -> (Self, Self) {
+    pub fn split_local(self, pos: Perms::Bounds) -> (Self, Self) {
         assert!(pos < self.len());
 
         // TODO: maybe relaxed is enough here?
@@ -434,7 +439,7 @@ impl<'a, Perms: PacketPerms> PacketView<'a, Perms> {
     /// # Safety
     ///
     /// Please see [`BoundPacketView::extract_packet`] documentation for details.
-    pub unsafe fn extract_packet(&self, offset: u64, len: u64) -> Self {
+    pub unsafe fn extract_packet(&self, offset: Perms::Bounds, len: Perms::Bounds) -> Self {
         self.pkt().rc_and_waker.inc_rc();
 
         let Self {
@@ -452,8 +457,8 @@ impl<'a, Perms: PacketPerms> PacketView<'a, Perms> {
         Self {
             pkt: *pkt,
             tag: *tag,
-            start: start + offset,
-            end: start + offset + len,
+            start: *start + offset,
+            end: *start + offset + len,
             phantom: PhantomData,
         }
     }

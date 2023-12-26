@@ -268,7 +268,7 @@ impl<Handle: IoHandle + Send + Sync + 'static> From<BaseArc<IoInner<Handle>>>
                             match buf.try_alloc() {
                                 Ok(mut alloced) => match copy_buf(&mut alloced[..]) {
                                     Ok(read) if (read as u64) < alloced.len() => {
-                                        let (_, right) = alloced.split_at(read as _);
+                                        let (_, right) = alloced.split_at(read);
                                         right.error(io_err(State::Nop));
                                     }
                                     Err(e) => alloced.error(io_err(e.kind().into())),
@@ -284,7 +284,7 @@ impl<Handle: IoHandle + Send + Sync + 'static> From<BaseArc<IoInner<Handle>>>
                                     }
                                     match copy_buf(&mut tmp_buf[..(buf.len() as usize)]) {
                                         Ok(read) if (read as u64) < buf.len() => {
-                                            let (left, right) = buf.split_at(read as u64);
+                                            let (left, right) = buf.split_at(read);
                                             let _ = unsafe {
                                                 left.transfer_data(tmp_buf.as_ptr().cast())
                                             };
@@ -321,7 +321,7 @@ impl<Handle: IoHandle + Send + Sync + 'static> From<BaseArc<IoInner<Handle>>>
                             let alloced: ReadPacketObj = alloced;
                             match file.write_at(&alloced[..], pos) {
                                 Ok(written) if (written as u64) < alloced.len() => {
-                                    let (_, right) = alloced.split_at(written as u64);
+                                    let (_, right) = alloced.split_at(written);
                                     right.error(io_err(State::Nop));
                                 }
                                 Err(e) => alloced.error(io_err(e.kind().into())),
@@ -342,7 +342,7 @@ impl<Handle: IoHandle + Send + Sync + 'static> From<BaseArc<IoInner<Handle>>>
                             };
                             match file.write_at(tmp_buf, pos) {
                                 Ok(written) if (written as u64) < buf.len() => {
-                                    let (_, right) = buf.split_at(written as u64);
+                                    let (_, right) = buf.split_at(written);
                                     right.error(io_err(State::Nop));
                                 }
                                 Err(e) => buf.error(io_err(e.kind().into())),

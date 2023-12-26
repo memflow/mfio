@@ -86,7 +86,7 @@ impl Operation {
         match self {
             Operation::FileRead(pkt, buf) => match res {
                 Ok(read) if (read as u64) < pkt.len() => {
-                    let (left, right) = pkt.split_at(read as u64);
+                    let (left, right) = pkt.split_at(read);
                     if let Err(pkt) = left {
                         assert!(!buf.0.is_null());
                         let buf = unsafe { &*buf.0 };
@@ -111,7 +111,7 @@ impl Operation {
             },
             Operation::FileWrite(pkt, _) => match res {
                 Ok(read) if (read as u64) < pkt.len() => {
-                    let (left, right) = pkt.split_at(read as u64);
+                    let (left, right) = pkt.split_at(read);
                     deferred_pkts.ok(left);
                     right.error(io_err(State::Nop));
                 }

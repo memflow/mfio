@@ -2,6 +2,7 @@ use crate::std_prelude::*;
 
 use super::OpaqueStore;
 use crate::error::Error;
+use atomic_traits::{fetch::Min, Atomic};
 pub use cglue::task::{CWaker, FastCWaker};
 use core::cell::UnsafeCell;
 use core::future::Future;
@@ -12,6 +13,7 @@ use core::num::NonZeroI32;
 use core::pin::Pin;
 use core::sync::atomic::*;
 use core::task::{Context, Poll};
+use num::{Integer, NumCast, One, Saturating, ToPrimitive};
 use rangemap::RangeSet;
 use tarc::BaseArc;
 
@@ -649,7 +651,7 @@ pub struct Packet<Perms: PacketPerms> {
     /// This value is initialized to !0, and upon each errored packet segment, is minned
     /// atomically. Upon I/O is complete, this allows the caller to check for the size of the
     /// contiguous memory region being successfully processed without gaps.
-    error_clamp: AtomicU64,
+    error_clamp: <Perms::Bounds as NumBounds>::Atomic,
     /// Note that this may be raced against so it should not be relied as "the minimum error".
     min_error: AtomicI32,
     // We need miri to treat packets magically. Without marking this type as !Unpin, miri would
@@ -706,7 +708,7 @@ impl<Perms: PacketPerms> Packet<Perms> {
         (self.rc_and_waker.acquire_rc()) as usize
     }
 
-    unsafe fn on_output(&self, error: Option<(u64, NonZeroI32)>) -> Option<CWaker> {
+    unsafe fn on_output(&self, error: Option<(Perms::Bounds, NonZeroI32)>) -> Option<CWaker> {
         if let Some((start, error)) = error {
             if self.error_clamp.fetch_min(start, Ordering::AcqRel) > start {
                 self.min_error.store(error.into(), Ordering::Relaxed);
@@ -745,7 +747,8 @@ impl<Perms: PacketPerms> Packet<Perms> {
     ///
     /// This function is safe to call only when all packet operations have concluded.
     pub unsafe fn reset_err(&self) {
-        self.error_clamp.store(!0u64, Ordering::Release);
+        self.error_clamp
+            .store(!<Perms::Bounds as Default>::default(), Ordering::Release);
         self.min_error.store(0, Ordering::Release);
     }
 
@@ -759,7 +762,7 @@ impl<Perms: PacketPerms> Packet<Perms> {
         Packet {
             vtbl,
             rc_and_waker: Default::default(),
-            error_clamp: (!0u64).into(),
+            error_clamp: (!<Perms::Bounds as Default>::default()).into(),
             min_error: 0.into(),
             _phantom: PhantomPinned,
         }
@@ -842,7 +845,7 @@ impl<Perms: PacketPerms> Packet<Perms> {
                 core::slice::from_raw_parts(
                     self.simple_data_ptr(),
                     core::cmp::min(
-                        self.error_clamp.load(Ordering::Acquire) as usize,
+                        self.error_clamp.load(Ordering::Acquire).to_usize().unwrap(),
                         *Self::simple_len(self),
                     ),
                 )
@@ -887,13 +890,13 @@ impl<Perms: PacketPerms> Packet<Perms> {
     ///
     /// If there was an error case, this function will return the length of the first contiguous
     /// segment. However, if the packet encountered no error cases, `!0` will be returned.
-    pub fn error_clamp(&self) -> u64 {
+    pub fn error_clamp(&self) -> Perms::Bounds {
         self.error_clamp.load(Ordering::Relaxed)
     }
 
     /// Returns [`min_error`](Self::min_error) if 0 leading bytes were processed.
     pub fn err_on_zero(&self) -> Result<(), Error> {
-        if self.error_clamp() > 0 {
+        if self.error_clamp() > Default::default() {
             Ok(())
         } else {
             Err(self.min_error().expect("No error when error_clamp is 0"))
@@ -1398,7 +1401,7 @@ pub type TransferDataFn<T> = for<'a> unsafe extern "C" fn(
 );
 
 /// Retrieves total length of the packet.
-pub type LenFn<T> = unsafe extern "C" fn(packet: &Packet<T>) -> u64;
+pub type LenFn<T> = unsafe extern "C" fn(packet: &Packet<T>) -> <T as PacketPerms>::Bounds;
 
 /// Packet that may be alloced.
 ///
@@ -1415,16 +1418,19 @@ pub trait PacketPerms: 'static + core::fmt::Debug + Clone + Copy {
     type DataType: Clone + Copy + core::fmt::Debug;
     type ReverseDataType: Clone + Copy + core::fmt::Debug;
     type Alloced: AllocatedPacket<Perms = Self>;
+    type Bounds: NumBounds;
 
     /// Returns vtable function for getting packet length.
     fn len_fn(&self) -> LenFn<Self>;
 
     /// Returns packet length.
-    fn len(packet: &Packet<Self>) -> u64 {
+    fn len(packet: &Packet<Self>) -> Self::Bounds {
         if let Some(vtbl) = packet.vtbl.vtbl() {
             unsafe { (vtbl.len_fn())(packet) }
         } else {
-            unsafe { *Packet::simple_len(packet) as u64 }
+            unsafe {
+                NumCast::from(*Packet::simple_len(packet)).expect("Packet larger than bounds")
+            }
         }
     }
 
@@ -1455,7 +1461,8 @@ pub trait PacketPerms: 'static + core::fmt::Debug + Clone + Copy {
                     .view
                     .pkt()
                     .simple_data_ptr()
-                    .add(packet.view.start as usize)
+                    // This should never panic
+                    .add(packet.view.start.to_usize().unwrap())
             };
             if data.align_offset(alignment) == 0 {
                 Ok(unsafe { Self::alloced_simple(packet) })
@@ -1497,26 +1504,27 @@ pub trait PacketPerms: 'static + core::fmt::Debug + Clone + Copy {
 /// of data between the 2 buffers.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct ReadWrite {
-    pub len: unsafe extern "C" fn(&Packet<Self>) -> u64,
+pub struct ReadWrite<Bounds: NumBounds = u64> {
+    pub len: unsafe extern "C" fn(&Packet<Self>) -> Bounds,
     pub get_mut: for<'a> unsafe extern "C" fn(
         &mut ManuallyDrop<BoundPacketView<Self>>,
         usize,
-        &mut MaybeUninit<ReadWritePacketObj>,
+        &mut MaybeUninit<ReadWritePacketObj<Bounds>>,
     ) -> bool,
     pub transfer_data: for<'a, 'b> unsafe extern "C" fn(&'a mut PacketView<Self>, *mut ()),
 }
 
-impl core::fmt::Debug for ReadWrite {
+impl<Bounds: NumBounds> core::fmt::Debug for ReadWrite<Bounds> {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
         write!(fmt, "{:?}", self.get_mut as *const ())
     }
 }
 
-impl PacketPerms for ReadWrite {
+impl<Bounds: NumBounds> PacketPerms for ReadWrite<Bounds> {
     type DataType = *mut ();
     type ReverseDataType = *mut ();
-    type Alloced = ReadWritePacketObj;
+    type Alloced = ReadWritePacketObj<Bounds>;
+    type Bounds = Bounds;
 
     fn len_fn(&self) -> LenFn<Self> {
         self.len
@@ -1533,7 +1541,7 @@ impl PacketPerms for ReadWrite {
     unsafe fn alloced_simple(packet: BoundPacketView<Self>) -> Self::Alloced {
         let data = packet.view.pkt().simple_data_ptr().cast_mut();
         ReadWritePacketObj {
-            alloced_packet: unsafe { data.add(packet.view.start as usize) },
+            alloced_packet: unsafe { data.add(packet.view.start.to_usize().unwrap()) },
             buffer: packet,
         }
     }
@@ -1543,8 +1551,8 @@ impl PacketPerms for ReadWrite {
         // TODO: does this operation even make sense?
         core::ptr::swap_nonoverlapping(
             data.cast(),
-            dst.add(view.start as usize),
-            view.len() as usize,
+            dst.add(view.start.to_usize().unwrap()),
+            view.len().to_usize().unwrap(),
         );
     }
 }
@@ -1554,26 +1562,27 @@ impl PacketPerms for ReadWrite {
 /// This implies the packet is writeable and may not have valid data beforehand.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct Write {
-    pub len: unsafe extern "C" fn(&Packet<Self>) -> u64,
+pub struct Write<Bounds: NumBounds = u64> {
+    pub len: unsafe extern "C" fn(&Packet<Self>) -> Bounds,
     pub get_mut: for<'a> unsafe extern "C" fn(
         &mut ManuallyDrop<BoundPacketView<Self>>,
         usize,
-        &mut MaybeUninit<WritePacketObj>,
+        &mut MaybeUninit<WritePacketObj<Bounds>>,
     ) -> bool,
     pub transfer_data: for<'a, 'b> unsafe extern "C" fn(&'a mut PacketView<Self>, *const ()),
 }
 
-impl core::fmt::Debug for Write {
+impl<Bounds: NumBounds> core::fmt::Debug for Write<Bounds> {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
         write!(fmt, "{:?}", self.get_mut as *const ())
     }
 }
 
-impl PacketPerms for Write {
+impl<Bounds: NumBounds> PacketPerms for Write<Bounds> {
     type DataType = *mut ();
     type ReverseDataType = *const ();
-    type Alloced = WritePacketObj;
+    type Alloced = WritePacketObj<Bounds>;
+    type Bounds = Bounds;
 
     fn len_fn(&self) -> LenFn<Self> {
         self.len
@@ -1595,7 +1604,7 @@ impl PacketPerms for Write {
             .cast_mut()
             .cast::<MaybeUninit<u8>>();
         WritePacketObj {
-            alloced_packet: unsafe { data.add(packet.view.start as usize) },
+            alloced_packet: unsafe { data.add(packet.view.start.to_usize().unwrap()) },
             buffer: packet,
         }
     }
@@ -1604,8 +1613,8 @@ impl PacketPerms for Write {
         let dst = Packet::simple_data_ptr_mut(view.pkt_mut());
         core::ptr::copy(
             data.cast(),
-            dst.add(view.start as usize),
-            view.len() as usize,
+            dst.add(view.start.to_usize().unwrap()),
+            view.len().to_usize().unwrap(),
         );
     }
 }
@@ -1615,26 +1624,27 @@ impl PacketPerms for Write {
 /// This implies this packet contains valid data and it can be read.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct Read {
-    pub len: unsafe extern "C" fn(&Packet<Self>) -> u64,
+pub struct Read<Bounds: NumBounds = u64> {
+    pub len: unsafe extern "C" fn(&Packet<Self>) -> Bounds,
     pub get: unsafe extern "C" fn(
         &mut ManuallyDrop<BoundPacketView<Self>>,
         usize,
-        &mut MaybeUninit<ReadPacketObj>,
+        &mut MaybeUninit<ReadPacketObj<Bounds>>,
     ) -> bool,
     pub transfer_data: for<'a> unsafe extern "C" fn(&'a mut PacketView<Self>, *mut ()),
 }
 
-impl core::fmt::Debug for Read {
+impl<Bounds: NumBounds> core::fmt::Debug for Read<Bounds> {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
         write!(fmt, "{:?}", self.get as *const ())
     }
 }
 
-impl PacketPerms for Read {
+impl<Bounds: NumBounds> PacketPerms for Read<Bounds> {
     type DataType = *const ();
     type ReverseDataType = *mut ();
-    type Alloced = ReadPacketObj;
+    type Alloced = ReadPacketObj<Bounds>;
+    type Bounds = Bounds;
 
     fn len_fn(&self) -> LenFn<Self> {
         self.len
@@ -1651,7 +1661,7 @@ impl PacketPerms for Read {
     unsafe fn alloced_simple(packet: BoundPacketView<Self>) -> Self::Alloced {
         let data = packet.view.pkt().simple_data_ptr().cast::<u8>();
         ReadPacketObj {
-            alloced_packet: unsafe { data.add(packet.view.start as usize) },
+            alloced_packet: unsafe { data.add(packet.view.start.to_usize().unwrap()) },
             buffer: packet,
         }
     }
@@ -1660,30 +1670,65 @@ impl PacketPerms for Read {
         let src = view.pkt().simple_data_ptr();
         core::ptr::copy(
             src,
-            data.cast::<u8>().add(view.start as usize),
-            view.len() as usize,
+            data.cast::<u8>().add(view.start.to_usize().unwrap()),
+            view.len().to_usize().unwrap(),
         );
     }
 }
 
+pub trait NumBounds:
+    Integer
+    + NumCast
+    + Copy
+    + Send
+    + Default
+    + core::ops::Not<Output = Self>
+    + Saturating
+    + core::fmt::Debug
+    + Into<Self::Atomic>
+    + 'static
+{
+    type Atomic: atomic_traits::Atomic<Type = Self> + atomic_traits::NumOps + core::fmt::Debug;
+}
+
+macro_rules! num_bounds {
+    ($($ty1:ident => $ty2:ident),*) => {
+        $(
+        impl NumBounds for $ty1 {
+            type Atomic = core::sync::atomic::$ty2;
+        }
+        )*
+    }
+}
+
+num_bounds!(u8 => AtomicU8, u16 => AtomicU16, u32 => AtomicU32, u64 => AtomicU64, usize => AtomicUsize);
+
+//impl<T: Integer + NumCast + Copy + Default + Send + Saturating + 'static> NumBounds for T {}
+
 /// Objects that can be split.
 ///
 /// This trait enables splitting objects into non-overlapping parts.
-pub trait Splittable<T: Default + PartialEq>: Sized {
+pub trait Splittable: Sized {
+    type Bounds: NumBounds;
+
     /// Splits an object at given position.
     ///
     /// # Panics
     ///
     /// This function may panic if len is outside the bounds of the given object.
-    fn split_at(self, len: T) -> (Self, Self);
-    fn len(&self) -> T;
+    fn split_at(self, len: impl NumBounds) -> (Self, Self);
+    fn len(&self) -> Self::Bounds;
     fn is_empty(&self) -> bool {
         self.len() == Default::default()
     }
 }
 
-impl<T: Default + PartialEq, A: Splittable<T>, B: Splittable<T>> Splittable<T> for Result<A, B> {
-    fn split_at(self, len: T) -> (Self, Self) {
+impl<T: NumBounds, A: Splittable<Bounds = T>, B: Splittable<Bounds = T>> Splittable
+    for Result<A, B>
+{
+    type Bounds = T;
+
+    fn split_at(self, len: impl NumBounds) -> (Self, Self) {
         match self {
             Ok(v) => {
                 let (a, b) = v.split_at(len);
@@ -1724,7 +1769,7 @@ impl<A: Errorable, B: Errorable> Errorable for Result<A, B> {
 /// Packet which has been allocated.
 ///
 /// Allocated packets expose direct access to the underlying buffer.
-pub trait AllocatedPacket: Splittable<u64> + Errorable {
+pub trait AllocatedPacket: Splittable + Errorable {
     type Perms: PacketPerms;
     type Pointer: Copy;
 
@@ -1733,13 +1778,16 @@ pub trait AllocatedPacket: Splittable<u64> + Errorable {
 
 /// Represents a simple allocated packet with write permissions.
 #[repr(C)]
-pub struct ReadWritePacketObj {
+pub struct ReadWritePacketObj<Bounds: NumBounds = u64> {
     alloced_packet: *mut u8,
-    buffer: BoundPacketView<ReadWrite>,
+    buffer: BoundPacketView<ReadWrite<Bounds>>,
 }
 
-impl Splittable<u64> for ReadWritePacketObj {
-    fn split_at(self, len: u64) -> (Self, Self) {
+impl<Bounds: NumBounds> Splittable for ReadWritePacketObj<Bounds> {
+    type Bounds = Bounds;
+
+    fn split_at(self, len: impl NumBounds) -> (Self, Self) {
+        let len_usize = len.to_usize().expect("Input out of range");
         let (b1, b2) = self.buffer.split_at(len);
 
         (
@@ -1748,25 +1796,25 @@ impl Splittable<u64> for ReadWritePacketObj {
                 buffer: b1,
             },
             Self {
-                alloced_packet: unsafe { self.alloced_packet.add(len as usize) },
+                alloced_packet: unsafe { self.alloced_packet.add(len_usize) },
                 buffer: b2,
             },
         )
     }
 
-    fn len(&self) -> u64 {
+    fn len(&self) -> Bounds {
         self.buffer.view.len()
     }
 }
 
-impl Errorable for ReadWritePacketObj {
+impl<Bounds: NumBounds> Errorable for ReadWritePacketObj<Bounds> {
     fn error(self, err: Error) {
         self.buffer.error(err)
     }
 }
 
-impl AllocatedPacket for ReadWritePacketObj {
-    type Perms = ReadWrite;
+impl<Bounds: NumBounds> AllocatedPacket for ReadWritePacketObj<Bounds> {
+    type Perms = ReadWrite<Bounds>;
     type Pointer = *mut u8;
 
     fn as_ptr(&self) -> Self::Pointer {
@@ -1774,21 +1822,29 @@ impl AllocatedPacket for ReadWritePacketObj {
     }
 }
 
-unsafe impl Send for ReadWritePacketObj {}
-unsafe impl Sync for ReadWritePacketObj {}
+unsafe impl<Bounds: NumBounds> Send for ReadWritePacketObj<Bounds> {}
+unsafe impl<Bounds: NumBounds> Sync for ReadWritePacketObj<Bounds> {}
 
-impl core::ops::Deref for ReadWritePacketObj {
+impl<Bounds: NumBounds> core::ops::Deref for ReadWritePacketObj<Bounds> {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        unsafe { core::slice::from_raw_parts(self.alloced_packet, self.buffer.view.len() as usize) }
+        unsafe {
+            core::slice::from_raw_parts(
+                self.alloced_packet,
+                self.buffer.view.len().to_usize().unwrap(),
+            )
+        }
     }
 }
 
-impl core::ops::DerefMut for ReadWritePacketObj {
+impl<Bounds: NumBounds> core::ops::DerefMut for ReadWritePacketObj<Bounds> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe {
-            core::slice::from_raw_parts_mut(self.alloced_packet, self.buffer.view.len() as usize)
+            core::slice::from_raw_parts_mut(
+                self.alloced_packet,
+                self.buffer.view.len().to_usize().unwrap(),
+            )
         }
     }
 }
@@ -1797,13 +1853,16 @@ impl core::ops::DerefMut for ReadWritePacketObj {
 ///
 /// The data inside may not be initialized, therefore, this packet should only be written to.
 #[repr(C)]
-pub struct WritePacketObj {
+pub struct WritePacketObj<Bounds: NumBounds = u64> {
     alloced_packet: *mut MaybeUninit<u8>,
-    buffer: BoundPacketView<Write>,
+    buffer: BoundPacketView<Write<Bounds>>,
 }
 
-impl Splittable<u64> for WritePacketObj {
-    fn split_at(self, len: u64) -> (Self, Self) {
+impl<Bounds: NumBounds> Splittable for WritePacketObj<Bounds> {
+    type Bounds = Bounds;
+
+    fn split_at(self, len: impl NumBounds) -> (Self, Self) {
+        let len_usize = len.to_usize().expect("Input out of range");
         let (b1, b2) = self.buffer.split_at(len);
 
         (
@@ -1812,25 +1871,25 @@ impl Splittable<u64> for WritePacketObj {
                 buffer: b1,
             },
             Self {
-                alloced_packet: unsafe { self.alloced_packet.add(len as usize) },
+                alloced_packet: unsafe { self.alloced_packet.add(len_usize) },
                 buffer: b2,
             },
         )
     }
 
-    fn len(&self) -> u64 {
+    fn len(&self) -> Bounds {
         self.buffer.view.len()
     }
 }
 
-impl Errorable for WritePacketObj {
+impl<Bounds: NumBounds> Errorable for WritePacketObj<Bounds> {
     fn error(self, err: Error) {
         self.buffer.error(err)
     }
 }
 
-impl AllocatedPacket for WritePacketObj {
-    type Perms = Write;
+impl<Bounds: NumBounds> AllocatedPacket for WritePacketObj<Bounds> {
+    type Perms = Write<Bounds>;
     type Pointer = *mut MaybeUninit<u8>;
 
     fn as_ptr(&self) -> Self::Pointer {
@@ -1838,34 +1897,45 @@ impl AllocatedPacket for WritePacketObj {
     }
 }
 
-unsafe impl Send for WritePacketObj {}
-unsafe impl Sync for WritePacketObj {}
+unsafe impl<Bounds: NumBounds> Send for WritePacketObj<Bounds> {}
+unsafe impl<Bounds: NumBounds> Sync for WritePacketObj<Bounds> {}
 
-impl core::ops::Deref for WritePacketObj {
+impl<Bounds: NumBounds> core::ops::Deref for WritePacketObj<Bounds> {
     type Target = [MaybeUninit<u8>];
 
     fn deref(&self) -> &Self::Target {
-        unsafe { core::slice::from_raw_parts(self.alloced_packet, self.buffer.view.len() as usize) }
+        unsafe {
+            core::slice::from_raw_parts(
+                self.alloced_packet,
+                self.buffer.view.len().to_usize().unwrap(),
+            )
+        }
     }
 }
 
-impl core::ops::DerefMut for WritePacketObj {
+impl<Bounds: NumBounds> core::ops::DerefMut for WritePacketObj<Bounds> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe {
-            core::slice::from_raw_parts_mut(self.alloced_packet, self.buffer.view.len() as usize)
+            core::slice::from_raw_parts_mut(
+                self.alloced_packet,
+                self.buffer.view.len().to_usize().unwrap(),
+            )
         }
     }
 }
 
 /// Represents a simple allocated packet with read permissions.
 #[repr(C)]
-pub struct ReadPacketObj {
+pub struct ReadPacketObj<Bounds: NumBounds = u64> {
     alloced_packet: *const u8,
-    buffer: BoundPacketView<Read>,
+    buffer: BoundPacketView<Read<Bounds>>,
 }
 
-impl Splittable<u64> for ReadPacketObj {
-    fn split_at(self, len: u64) -> (Self, Self) {
+impl<Bounds: NumBounds> Splittable for ReadPacketObj<Bounds> {
+    type Bounds = Bounds;
+
+    fn split_at(self, len: impl NumBounds) -> (Self, Self) {
+        let len_usize = len.to_usize().expect("Input out of range");
         let (b1, b2) = self.buffer.split_at(len);
 
         (
@@ -1874,25 +1944,25 @@ impl Splittable<u64> for ReadPacketObj {
                 buffer: b1,
             },
             Self {
-                alloced_packet: unsafe { self.alloced_packet.add(len as usize) },
+                alloced_packet: unsafe { self.alloced_packet.add(len_usize) },
                 buffer: b2,
             },
         )
     }
 
-    fn len(&self) -> u64 {
+    fn len(&self) -> Bounds {
         self.buffer.view.len()
     }
 }
 
-impl Errorable for ReadPacketObj {
+impl<Bounds: NumBounds> Errorable for ReadPacketObj<Bounds> {
     fn error(self, err: Error) {
         self.buffer.error(err)
     }
 }
 
-impl AllocatedPacket for ReadPacketObj {
-    type Perms = Read;
+impl<Bounds: NumBounds> AllocatedPacket for ReadPacketObj<Bounds> {
+    type Perms = Read<Bounds>;
     type Pointer = *const u8;
 
     fn as_ptr(&self) -> Self::Pointer {
@@ -1900,14 +1970,19 @@ impl AllocatedPacket for ReadPacketObj {
     }
 }
 
-unsafe impl Send for ReadPacketObj {}
-unsafe impl Sync for ReadPacketObj {}
+unsafe impl<Bounds: NumBounds> Send for ReadPacketObj<Bounds> {}
+unsafe impl<Bounds: NumBounds> Sync for ReadPacketObj<Bounds> {}
 
-impl core::ops::Deref for ReadPacketObj {
+impl<Bounds: NumBounds> core::ops::Deref for ReadPacketObj<Bounds> {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        unsafe { core::slice::from_raw_parts(self.alloced_packet, self.buffer.view.len() as usize) }
+        unsafe {
+            core::slice::from_raw_parts(
+                self.alloced_packet,
+                self.buffer.view.len().to_usize().unwrap(),
+            )
+        }
     }
 }
 
@@ -1921,14 +1996,16 @@ impl core::ops::Deref for ReadPacketObj {
 #[must_use = "please handle point of drop intentionally"]
 pub struct TransferredPacket<T: PacketPerms>(BoundPacketView<T>);
 
-impl<T: PacketPerms> Splittable<u64> for TransferredPacket<T> {
-    fn split_at(self, len: u64) -> (Self, Self) {
+impl<T: PacketPerms> Splittable for TransferredPacket<T> {
+    type Bounds = T::Bounds;
+
+    fn split_at(self, len: impl NumBounds) -> (Self, Self) {
         let (b1, b2) = self.0.split_at(len);
 
         (Self(b1), Self(b2))
     }
 
-    fn len(&self) -> u64 {
+    fn len(&self) -> T::Bounds {
         self.0.view.len()
     }
 }
@@ -2158,7 +2235,7 @@ downgrade_packet!(perms::READ_WRITE, perms::WRITE);
 ///
 /// `ReboundPacket` helps in this situation, because it facilitates this rebind process safely.
 pub struct ReboundPacket<T: PacketPerms> {
-    ranges: RangeSet<u64>,
+    ranges: RangeSet<T::Bounds>,
     orig: ManuallyDrop<BoundPacketView<T>>,
     unbound: AtomicBool,
 }
@@ -2206,12 +2283,12 @@ impl<T: PacketPerms> ReboundPacket<T> {
     /// # Panics
     ///
     /// Whenever an invalid range is provided.
-    pub fn range_result(&mut self, start: u64, len: u64, err: Option<Error>) {
+    pub fn range_result(&mut self, start: T::Bounds, len: T::Bounds, err: Option<Error>) {
         let range = start..(start + len);
         let mut o = self.ranges.overlapping(&range);
         let o = o.next().unwrap();
         assert!(o.contains(&start));
-        assert!(o.contains(&(start + len.saturating_sub(1))));
+        assert!(o.contains(&(start + len.saturating_sub(One::one()))));
         self.ranges.remove(range);
 
         // SAFETY: we verified uniqueness of the range.
@@ -2229,7 +2306,7 @@ impl<T: PacketPerms> ReboundPacket<T> {
         }
     }
 
-    pub fn ranges(&self) -> &RangeSet<u64> {
+    pub fn ranges(&self) -> &RangeSet<T::Bounds> {
         &self.ranges
     }
 }

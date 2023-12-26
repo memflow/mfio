@@ -191,7 +191,7 @@ impl FileInner {
                                 }
                                 break;
                             } else if l > 0 {
-                                let (a, b) = pkt.split_at(l as _);
+                                let (a, b) = pkt.split_at(l);
                                 if let Err(pkt) = a {
                                     let _ = unsafe {
                                         pkt.transfer_data(self.tmp_buf.as_mut_ptr().cast())
@@ -270,7 +270,7 @@ impl FileInner {
                             if l == len as usize {
                                 break;
                             } else if l > 0 {
-                                pkt = pkt.split_at(l as _).1;
+                                pkt = pkt.split_at(l).1;
                             } else {
                                 pkt.error(io_err(State::Nop));
                                 break;
