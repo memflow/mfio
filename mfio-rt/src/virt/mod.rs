@@ -22,7 +22,7 @@ use futures::Stream;
 use log::*;
 use slab::Slab;
 
-use mfio::backend::{BackendContainer, BackendHandle, DynBackend, IoBackend, PollingHandle};
+use mfio::backend::{BackendContainer, BackendHandle, IoBackend, PollingHandle};
 use mfio::error::Result;
 use mfio::io::*;
 use mfio::mferr;
@@ -66,7 +66,7 @@ type InodeId = usize;
 
 pub struct VirtRt {
     cwd: VirtDir,
-    backend: BackendContainer<DynBackend>,
+    backend: BackendContainer,
 }
 
 impl Default for VirtRt {
@@ -95,13 +95,11 @@ impl VirtRt {
 }
 
 impl IoBackend for VirtRt {
-    type Backend = DynBackend;
-
     fn polling_handle(&self) -> Option<PollingHandle> {
         None
     }
 
-    fn get_backend(&self) -> BackendHandle<Self::Backend> {
+    fn get_backend(&self) -> BackendHandle {
         self.backend.acquire(None)
     }
 }

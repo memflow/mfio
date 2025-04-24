@@ -79,7 +79,7 @@ impl MioState {
 
 pub struct Runtime {
     state: BaseArc<MioState>,
-    backend: BackendContainer<DynBackend>,
+    backend: BackendContainer,
     waker: FdWakerOwner<OwnedFd>,
 }
 
@@ -296,8 +296,6 @@ impl Runtime {
 }
 
 impl IoBackend for Runtime {
-    type Backend = DynBackend;
-
     fn polling_handle(&self) -> Option<PollingHandle> {
         static READ: PollingFlags = PollingFlags::new().read(true);
         Some(PollingHandle {
@@ -308,7 +306,7 @@ impl IoBackend for Runtime {
         })
     }
 
-    fn get_backend(&self) -> BackendHandle<Self::Backend> {
+    fn get_backend(&self) -> BackendHandle {
         self.backend.acquire(Some(self.waker.flags()))
     }
 }

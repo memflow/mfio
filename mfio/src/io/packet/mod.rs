@@ -3,7 +3,7 @@ use crate::std_prelude::*;
 use super::OpaqueStore;
 use crate::error::Error;
 use atomic_traits::{fetch::Min, Atomic};
-pub use cglue::task::{CWaker, FastCWaker};
+pub use cglue::task::{CRefWaker, CWaker};
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::marker::{PhantomData, PhantomPinned};
@@ -27,6 +27,8 @@ const HAS_WAKER_BIT: u64 = 1 << 62;
 const FINALIZED_BIT: u64 = 1 << 61;
 const ALL_BITS: u64 = LOCK_BIT | HAS_WAKER_BIT | FINALIZED_BIT;
 
+#[repr(C)]
+#[cfg_attr(feature = "abi_stable", derive(::abi_stable::StableAbi))]
 struct RcAndWaker {
     rc_and_flags: AtomicU64,
     waker: UnsafeCell<MaybeUninit<CWaker>>,
@@ -120,6 +122,7 @@ impl RcAndWaker {
 /// enabled, then the packet can also be sent to I/O backend as reference. Otherwise, it first
 /// needs to be converted to an arc.
 #[repr(C)]
+#[cfg_attr(feature = "abi_stable", derive(::abi_stable::StableAbi))]
 pub struct FullPacket<T, Perms: PacketPerms> {
     header: Packet<Perms>,
     data: PackedLenData<T>,
@@ -181,11 +184,12 @@ impl<T, Perms: PacketPerms> core::ops::Deref for FullPacket<T, Perms> {
 /// This is a convenience structure to allow passing existing vectors to I/O system, and retrieving
 /// them afterwards. Only [`Vec::len`](Vec::len) amount of data is used for the packet.
 #[repr(C)]
+#[cfg_attr(feature = "abi_stable", derive(::abi_stable::StableAbi))]
 pub struct VecPacket<Perms: PacketPerms> {
     header: Packet<Perms>,
     data: PackedLenData<Perms::DataType>,
     capacity: usize,
-    drop: unsafe extern "C" fn(Perms::DataType, usize, usize),
+    drop: unsafe extern "C-unwind" fn(Perms::DataType, usize, usize),
 }
 
 unsafe impl<Perms: PacketPerms> Send for VecPacket<Perms> {}
@@ -250,7 +254,7 @@ impl<Perms: PacketPerms> Drop for VecPacket<Perms> {
 
 impl From<Vec<u8>> for VecPacket<Read> {
     fn from(mut vec: Vec<u8>) -> Self {
-        unsafe extern "C" fn drop(
+        unsafe extern "C-unwind" fn drop(
             data: <Read as PacketPerms>::DataType,
             len: usize,
             capacity: usize,
@@ -281,7 +285,7 @@ impl From<Vec<u8>> for VecPacket<Read> {
 
 impl<T: AnyBytes> From<Vec<T>> for VecPacket<Write> {
     fn from(mut vec: Vec<T>) -> Self {
-        unsafe extern "C" fn drop(
+        unsafe extern "C-unwind" fn drop(
             data: <Write as PacketPerms>::DataType,
             len: usize,
             capacity: usize,
@@ -316,10 +320,11 @@ impl<T: AnyBytes> From<Vec<T>> for VecPacket<Write> {
 ///
 /// Once the packet is dropped, the underlying box is dropped as well.
 #[repr(C)]
+#[cfg_attr(feature = "abi_stable", derive(::abi_stable::StableAbi))]
 pub struct OwnedPacket<Perms: PacketPerms> {
     header: Packet<Perms>,
     data: PackedLenData<Perms::DataType>,
-    drop: unsafe extern "C" fn(Perms::DataType, usize),
+    drop: unsafe extern "C-unwind" fn(Perms::DataType, usize),
 }
 
 unsafe impl<Perms: PacketPerms> Send for OwnedPacket<Perms> {}
@@ -335,7 +340,7 @@ impl<Perms: PacketPerms> Drop for OwnedPacket<Perms> {
 
 impl From<Box<[u8]>> for OwnedPacket<Read> {
     fn from(slc: Box<[u8]>) -> Self {
-        unsafe extern "C" fn drop(data: <Read as PacketPerms>::DataType, len: usize) {
+        unsafe extern "C-unwind" fn drop(data: <Read as PacketPerms>::DataType, len: usize) {
             let _ = Box::from_raw(core::slice::from_raw_parts_mut(
                 data.cast_mut().cast::<u8>(),
                 len,
@@ -361,7 +366,7 @@ impl From<Box<[u8]>> for OwnedPacket<Read> {
 
 impl From<Box<[u8]>> for OwnedPacket<ReadWrite> {
     fn from(slc: Box<[u8]>) -> Self {
-        unsafe extern "C" fn drop(data: <ReadWrite as PacketPerms>::DataType, len: usize) {
+        unsafe extern "C-unwind" fn drop(data: <ReadWrite as PacketPerms>::DataType, len: usize) {
             let _ = Box::from_raw(core::slice::from_raw_parts_mut(data.cast::<u8>(), len));
         }
 
@@ -384,7 +389,7 @@ impl From<Box<[u8]>> for OwnedPacket<ReadWrite> {
 
 impl<T: AnyBytes> From<Box<[T]>> for OwnedPacket<Write> {
     fn from(slc: Box<[T]>) -> Self {
-        unsafe extern "C" fn drop(data: <Write as PacketPerms>::DataType, len: usize) {
+        unsafe extern "C-unwind" fn drop(data: <Write as PacketPerms>::DataType, len: usize) {
             let _ = Box::from_raw(core::slice::from_raw_parts_mut(
                 data.cast::<MaybeUninit<u8>>(),
                 len,
@@ -430,6 +435,7 @@ impl<Perms: PacketPerms> core::ops::Deref for OwnedPacket<Perms> {
 /// config switch is enabled. Otherwise, only static `RefPacket`s may be sent, and only when they
 /// are wrapped in an arc.
 #[repr(C)]
+#[cfg_attr(feature = "abi_stable", derive(::abi_stable::StableAbi))]
 pub struct RefPacket<'a, Perms: PacketPerms> {
     header: Packet<Perms>,
     data: PackedLenData<Perms::DataType>,
@@ -507,6 +513,7 @@ impl<Perms: PacketPerms> core::ops::Deref for RefPacket<'_, Perms> {
 
 /// Packed length + data pair for simple packets.
 #[repr(C, packed)]
+#[cfg_attr(feature = "abi_stable", derive(::abi_stable::StableAbi))]
 struct PackedLenData<T> {
     len: usize,
     data: T,
@@ -515,6 +522,7 @@ struct PackedLenData<T> {
 /// Represents different packet modes.
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[cfg_attr(feature = "abi_stable", derive(::abi_stable::StableAbi))]
 pub enum PacketVtblTag {
     /// Simple packet where after header we have length+buffer with no indirection.
     SimpleDirect = 0,
@@ -533,6 +541,8 @@ pub enum PacketVtblTag {
 /// simple, and `tag` should be accessed. Meanwhile, any other value implies the packet is a
 /// complex one, and `vtable` should be accessed instead.
 #[derive(Clone, Copy)]
+#[repr(C)]
+#[cfg_attr(feature = "abi_stable", derive(::abi_stable::StableAbi))]
 pub union PacketVtblRef<Perms: PacketPerms> {
     pub tag: usize,
     pub vtbl: &'static Perms,
@@ -586,6 +596,7 @@ impl<Perms: PacketPerms> PacketVtblRef<Perms> {
 /// allocated outputs.
 #[repr(C)]
 #[derive(Debug)]
+#[cfg_attr(feature = "abi_stable", derive(::abi_stable::StableAbi))]
 pub struct Packet<Perms: PacketPerms> {
     /// If `None`, then we have a len + byte buffer after the header
     vtbl: PacketVtblRef<Perms>,
@@ -924,19 +935,15 @@ impl<Perms: PacketPerms> Packet<Perms> {
         let size = core::mem::size_of::<FullPacket<PhantomData<()>, Perms>>() + len;
         let align = core::mem::align_of::<FullPacket<PhantomData<()>, Perms>>();
 
-        unsafe extern "C" fn drop_pkt<Perms: PacketPerms>(data: *mut ()) {
-            core::ptr::drop_in_place(data.cast::<Packet<Perms>>())
-        }
-
         // SAFETY: we are creating a packet that is sufficient for our needed amount of data.
         // In addition, we do not need a cleanup routine, because, because the only object that
         // would need freeing is the `CWaker`. The polling implementation ensures that the
         // `CWaker` is not left without any packets left to process it, and any outputted packets
         // will trigger the `CWaker`. Any other fields are POD.
         let packet = unsafe {
-            BaseArc::custom(
+            BaseArc::new_custom(
                 Layout::from_size_align_unchecked(size, align),
-                Some(drop_pkt::<Perms>),
+                core::ptr::drop_in_place as unsafe fn(*mut Packet<Perms>),
             )
         };
 
@@ -991,9 +998,18 @@ impl Packet<ReadWrite> {
 
 unsafe impl<Perms: PacketPerms> OpaqueStore for BaseArc<Packet<Perms>> {
     type ConstHdr = Packet<Perms>;
-    type Opaque<'a> = PacketView<'a, Perms> where Self: 'a;
-    type StackReq<'a> = Self where Self: 'a;
-    type HeapReq = Self where Self: 'static;
+    type Opaque<'a>
+        = PacketView<'a, Perms>
+    where
+        Self: 'a;
+    type StackReq<'a>
+        = Self
+    where
+        Self: 'a;
+    type HeapReq
+        = Self
+    where
+        Self: 'static;
 
     fn stack<'a>(self) -> Self::StackReq<'a>
     where
@@ -1021,9 +1037,18 @@ unsafe impl<Perms: PacketPerms> OpaqueStore for BaseArc<Packet<Perms>> {
 
 unsafe impl<'c, Perms: PacketPerms> OpaqueStore for &'c BaseArc<Packet<Perms>> {
     type ConstHdr = Packet<Perms>;
-    type Opaque<'a> = PacketView<'a, Perms> where Self: 'a;
-    type StackReq<'a> = Self where Self: 'a;
-    type HeapReq = BaseArc<Packet<Perms>> where Self: 'static;
+    type Opaque<'a>
+        = PacketView<'a, Perms>
+    where
+        Self: 'a;
+    type StackReq<'a>
+        = Self
+    where
+        Self: 'a;
+    type HeapReq
+        = BaseArc<Packet<Perms>>
+    where
+        Self: 'static;
 
     fn stack<'a>(self) -> Self::StackReq<'a>
     where
@@ -1054,7 +1079,10 @@ unsafe impl<'c, Perms: PacketPerms> OpaqueStore for &'c BaseArc<Packet<Perms>> {
 
 unsafe impl<T: 'static, Perms: PacketPerms> OpaqueStore for FullPacket<T, Perms> {
     type ConstHdr = Packet<Perms>;
-    type Opaque<'a> = PacketView<'a, Perms> where Self: 'a;
+    type Opaque<'a>
+        = PacketView<'a, Perms>
+    where
+        Self: 'a;
 
     crate::linear_types_switch! {
         Standard => {
@@ -1065,7 +1093,10 @@ unsafe impl<T: 'static, Perms: PacketPerms> OpaqueStore for FullPacket<T, Perms>
         }
     }
 
-    type HeapReq = BaseArc<Self> where Self: 'static;
+    type HeapReq
+        = BaseArc<Self>
+    where
+        Self: 'static;
 
     fn stack<'a>(self) -> Self::StackReq<'a>
     where
@@ -1111,9 +1142,18 @@ unsafe impl<T: 'static, Perms: PacketPerms> OpaqueStore for FullPacket<T, Perms>
 
 unsafe impl<T: 'static, Perms: PacketPerms> OpaqueStore for BaseArc<FullPacket<T, Perms>> {
     type ConstHdr = Packet<Perms>;
-    type Opaque<'a> = PacketView<'a, Perms> where Self: 'a;
-    type StackReq<'a> = Self where Self: 'a;
-    type HeapReq = Self where Self: 'static;
+    type Opaque<'a>
+        = PacketView<'a, Perms>
+    where
+        Self: 'a;
+    type StackReq<'a>
+        = Self
+    where
+        Self: 'a;
+    type HeapReq
+        = Self
+    where
+        Self: 'static;
 
     fn stack<'a>(self) -> Self::StackReq<'a>
     where
@@ -1146,10 +1186,19 @@ unsafe impl<T: 'static, Perms: PacketPerms> OpaqueStore for BaseArc<FullPacket<T
 
 unsafe impl<Perms: PacketPerms> OpaqueStore for crate::linear_types_switch! { Standard => { RefPacket::<'static, Perms> } Linear => { RefPacket::<'_, Perms> } } {
     type ConstHdr = Packet<Perms>;
-    type Opaque<'a> = PacketView<'a, Perms> where Self: 'a;
-    type StackReq<'a> = Self where Self: 'a;
+    type Opaque<'a>
+        = PacketView<'a, Perms>
+    where
+        Self: 'a;
+    type StackReq<'a>
+        = Self
+    where
+        Self: 'a;
     // TODO: do we need an arc here?
-    type HeapReq = BaseArc<Self> where Self: 'static;
+    type HeapReq
+        = BaseArc<Self>
+    where
+        Self: 'static;
 
     fn stack<'a>(self) -> Self::StackReq<'a>
     where
@@ -1185,9 +1234,18 @@ unsafe impl<Perms: PacketPerms> OpaqueStore for crate::linear_types_switch! { St
 
 unsafe impl<Perms: PacketPerms> OpaqueStore for VecPacket<Perms> {
     type ConstHdr = Packet<Perms>;
-    type Opaque<'a> = PacketView<'a, Perms> where Self: 'a;
-    type StackReq<'a> = Self where Self: 'a;
-    type HeapReq = BaseArc<Self> where Self: 'static;
+    type Opaque<'a>
+        = PacketView<'a, Perms>
+    where
+        Self: 'a;
+    type StackReq<'a>
+        = Self
+    where
+        Self: 'a;
+    type HeapReq
+        = BaseArc<Self>
+    where
+        Self: 'static;
 
     fn stack<'a>(self) -> Self::StackReq<'a>
     where
@@ -1223,9 +1281,18 @@ unsafe impl<Perms: PacketPerms> OpaqueStore for VecPacket<Perms> {
 
 unsafe impl<Perms: PacketPerms> OpaqueStore for OwnedPacket<Perms> {
     type ConstHdr = Packet<Perms>;
-    type Opaque<'a> = PacketView<'a, Perms> where Self: 'a;
-    type StackReq<'a> = Self where Self: 'a;
-    type HeapReq = BaseArc<Self> where Self: 'static;
+    type Opaque<'a>
+        = PacketView<'a, Perms>
+    where
+        Self: 'a;
+    type StackReq<'a>
+        = Self
+    where
+        Self: 'a;
+    type HeapReq
+        = BaseArc<Self>
+    where
+        Self: 'static;
 
     fn stack<'a>(self) -> Self::StackReq<'a>
     where
@@ -1383,7 +1450,7 @@ use cglue::prelude::v1::*;
 ///
 /// The caller should prefer [`TransferDataFn`](TransferDataFn), as opposed to this function, if
 /// they can access their internal buffer with zero allocations.
-pub type AllocFn<T> = for<'a> unsafe extern "C" fn(
+pub type AllocFn<T> = for<'a> unsafe extern "C-unwind" fn(
     packet: &'a mut ManuallyDrop<BoundPacketView<T>>,
     alignment: usize,
     out_alloced: &'a mut MaybeUninit<<T as PacketPerms>::Alloced>,
@@ -1395,13 +1462,13 @@ pub type AllocFn<T> = for<'a> unsafe extern "C" fn(
 /// ensure that `input` bounds are sufficient for the size of the packet.
 ///
 /// TODO: decide on whether this function can fail.
-pub type TransferDataFn<T> = for<'a> unsafe extern "C" fn(
+pub type TransferDataFn<T> = for<'a> unsafe extern "C-unwind" fn(
     packet: &'a mut PacketView<T>,
     input: <T as PacketPerms>::ReverseDataType,
 );
 
 /// Retrieves total length of the packet.
-pub type LenFn<T> = unsafe extern "C" fn(packet: &Packet<T>) -> <T as PacketPerms>::Bounds;
+pub type LenFn<T> = unsafe extern "C-unwind" fn(packet: &Packet<T>) -> <T as PacketPerms>::Bounds;
 
 /// Packet that may be alloced.
 ///
@@ -1415,6 +1482,9 @@ pub type AllocedOrTransferred<T> = Result<<T as PacketPerms>::Alloced, Transferr
 
 /// Describes type constraints on packet operations.
 pub trait PacketPerms: 'static + core::fmt::Debug + Clone + Copy {
+    #[cfg(feature = "abi_stable")]
+    type DataType: Clone + Copy + core::fmt::Debug + ::abi_stable::StableAbi;
+    #[cfg(not(feature = "abi_stable"))]
     type DataType: Clone + Copy + core::fmt::Debug;
     type ReverseDataType: Clone + Copy + core::fmt::Debug;
     type Alloced: AllocatedPacket<Perms = Self>;
@@ -1504,14 +1574,15 @@ pub trait PacketPerms: 'static + core::fmt::Debug + Clone + Copy {
 /// of data between the 2 buffers.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[cfg_attr(feature = "abi_stable", derive(::abi_stable::StableAbi))]
 pub struct ReadWrite<Bounds: NumBounds = u64> {
-    pub len: unsafe extern "C" fn(&Packet<Self>) -> Bounds,
-    pub get_mut: for<'a> unsafe extern "C" fn(
+    pub len: unsafe extern "C-unwind" fn(&Packet<Self>) -> Bounds,
+    pub get_mut: for<'a> unsafe extern "C-unwind" fn(
         &mut ManuallyDrop<BoundPacketView<Self>>,
         usize,
         &mut MaybeUninit<ReadWritePacketObj<Bounds>>,
     ) -> bool,
-    pub transfer_data: for<'a, 'b> unsafe extern "C" fn(&'a mut PacketView<Self>, *mut ()),
+    pub transfer_data: for<'a, 'b> unsafe extern "C-unwind" fn(&'a mut PacketView<Self>, *mut ()),
 }
 
 impl<Bounds: NumBounds> core::fmt::Debug for ReadWrite<Bounds> {
@@ -1562,14 +1633,15 @@ impl<Bounds: NumBounds> PacketPerms for ReadWrite<Bounds> {
 /// This implies the packet is writeable and may not have valid data beforehand.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[cfg_attr(feature = "abi_stable", derive(::abi_stable::StableAbi))]
 pub struct Write<Bounds: NumBounds = u64> {
-    pub len: unsafe extern "C" fn(&Packet<Self>) -> Bounds,
-    pub get_mut: for<'a> unsafe extern "C" fn(
+    pub len: unsafe extern "C-unwind" fn(&Packet<Self>) -> Bounds,
+    pub get_mut: for<'a> unsafe extern "C-unwind" fn(
         &mut ManuallyDrop<BoundPacketView<Self>>,
         usize,
         &mut MaybeUninit<WritePacketObj<Bounds>>,
     ) -> bool,
-    pub transfer_data: for<'a, 'b> unsafe extern "C" fn(&'a mut PacketView<Self>, *const ()),
+    pub transfer_data: for<'a, 'b> unsafe extern "C-unwind" fn(&'a mut PacketView<Self>, *const ()),
 }
 
 impl<Bounds: NumBounds> core::fmt::Debug for Write<Bounds> {
@@ -1619,19 +1691,24 @@ impl<Bounds: NumBounds> PacketPerms for Write<Bounds> {
     }
 }
 
+macro_rules! remap_abi {
+    ($($tt:tt)*) => { unsafe extern "C" $($tt)* }
+}
+
 /// Read permissions.
 ///
 /// This implies this packet contains valid data and it can be read.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[cfg_attr(feature = "abi_stable", derive(::abi_stable::StableAbi))]
 pub struct Read<Bounds: NumBounds = u64> {
-    pub len: unsafe extern "C" fn(&Packet<Self>) -> Bounds,
-    pub get: unsafe extern "C" fn(
+    pub len: unsafe extern "C-unwind" fn(&Packet<Self>) -> Bounds,
+    pub get: unsafe extern "C-unwind" fn(
         &mut ManuallyDrop<BoundPacketView<Self>>,
         usize,
         &mut MaybeUninit<ReadPacketObj<Bounds>>,
     ) -> bool,
-    pub transfer_data: for<'a> unsafe extern "C" fn(&'a mut PacketView<Self>, *mut ()),
+    pub transfer_data: for<'a> unsafe extern "C-unwind" fn(&'a mut PacketView<Self>, *mut ()),
 }
 
 impl<Bounds: NumBounds> core::fmt::Debug for Read<Bounds> {
@@ -1676,6 +1753,7 @@ impl<Bounds: NumBounds> PacketPerms for Read<Bounds> {
     }
 }
 
+#[cfg(not(feature = "abi_stable"))]
 pub trait NumBounds:
     Integer
     + NumCast
@@ -1689,6 +1767,26 @@ pub trait NumBounds:
     + 'static
 {
     type Atomic: atomic_traits::Atomic<Type = Self> + atomic_traits::NumOps + core::fmt::Debug;
+}
+
+#[cfg(feature = "abi_stable")]
+pub trait NumBounds:
+    Integer
+    + NumCast
+    + Copy
+    + Send
+    + Default
+    + core::ops::Not<Output = Self>
+    + Saturating
+    + core::fmt::Debug
+    + Into<Self::Atomic>
+    + 'static
+    + ::abi_stable::StableAbi
+{
+    type Atomic: atomic_traits::Atomic<Type = Self>
+        + atomic_traits::NumOps
+        + core::fmt::Debug
+        + ::abi_stable::StableAbi;
 }
 
 macro_rules! num_bounds {
@@ -1778,6 +1876,7 @@ pub trait AllocatedPacket: Splittable + Errorable {
 
 /// Represents a simple allocated packet with write permissions.
 #[repr(C)]
+#[cfg_attr(feature = "abi_stable", derive(::abi_stable::StableAbi))]
 pub struct ReadWritePacketObj<Bounds: NumBounds = u64> {
     alloced_packet: *mut u8,
     buffer: BoundPacketView<ReadWrite<Bounds>>,
@@ -1853,6 +1952,7 @@ impl<Bounds: NumBounds> core::ops::DerefMut for ReadWritePacketObj<Bounds> {
 ///
 /// The data inside may not be initialized, therefore, this packet should only be written to.
 #[repr(C)]
+#[cfg_attr(feature = "abi_stable", derive(::abi_stable::StableAbi))]
 pub struct WritePacketObj<Bounds: NumBounds = u64> {
     alloced_packet: *mut MaybeUninit<u8>,
     buffer: BoundPacketView<Write<Bounds>>,
@@ -1926,6 +2026,7 @@ impl<Bounds: NumBounds> core::ops::DerefMut for WritePacketObj<Bounds> {
 
 /// Represents a simple allocated packet with read permissions.
 #[repr(C)]
+#[cfg_attr(feature = "abi_stable", derive(::abi_stable::StableAbi))]
 pub struct ReadPacketObj<Bounds: NumBounds = u64> {
     alloced_packet: *const u8,
     buffer: BoundPacketView<Read<Bounds>>,
@@ -1994,6 +2095,7 @@ impl<Bounds: NumBounds> core::ops::Deref for ReadPacketObj<Bounds> {
 /// sections.
 #[repr(transparent)]
 #[must_use = "please handle point of drop intentionally"]
+#[cfg_attr(feature = "abi_stable", derive(::abi_stable::StableAbi))]
 pub struct TransferredPacket<T: PacketPerms>(BoundPacketView<T>);
 
 impl<T: PacketPerms> Splittable for TransferredPacket<T> {

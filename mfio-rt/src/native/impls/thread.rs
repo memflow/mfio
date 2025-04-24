@@ -436,7 +436,7 @@ impl<Handle: IoHandle> Default for StoreInner<Handle> {
 type Store<Handle> = BaseArc<RwLock<StoreInner<Handle>>>;
 
 pub struct Runtime {
-    backend: BackendContainer<DynBackend>,
+    backend: BackendContainer,
     file_store: Store<File>,
     tcp_store: Store<net::TcpStream>,
 }
@@ -458,13 +458,11 @@ impl Runtime {
 }
 
 impl IoBackend for Runtime {
-    type Backend = DynBackend;
-
     fn polling_handle(&self) -> Option<PollingHandle> {
         None
     }
 
-    fn get_backend(&self) -> BackendHandle<Self::Backend> {
+    fn get_backend(&self) -> BackendHandle {
         self.backend.acquire(None)
     }
 }

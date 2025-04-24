@@ -10,6 +10,7 @@ members = [
 	"mfio-rt",
 	"mfio-derive",
 	"mfio-netfs",
+	"version-hack"
 ]
 
 default-members = [
@@ -17,5 +18,10 @@ default-members = [
 	"mfio-rt",
 	"mfio-derive",
 	"mfio-netfs",
+	"version-hack"
 ]
 
+[patch.crates-io]
+abi_stable = { version = "0.11", git = "https://github.com/h33p/abi_stable_crates", branch = "c-unwind" }
+abi_stable_derive = { version = "0.11", git = "https://github.com/h33p/abi_stable_crates", branch = "c-unwind" }
+cglue = { version = "0.3", git = "https://github.com/h33p/cglue" }

@@ -66,10 +66,10 @@ impl Integration for Tokio {
     }
 }
 
-enum TokioState<'a, B: IoBackend + ?Sized + 'a, Func, F> {
+enum TokioState<'a, Func, F> {
     Initial(Func),
     Loaded(
-        WithBackend<'a, B::Backend, F>,
+        WithBackend<'a, F>,
         Option<(AsyncFd<RawFd>, &'a PollingFlags, Waker)>,
     ),
     Finished,
@@ -78,7 +78,7 @@ enum TokioState<'a, B: IoBackend + ?Sized + 'a, Func, F> {
 #[doc(hidden)]
 pub struct TokioImpl<'a, B: LinksIoBackend + 'a, Func, F> {
     backend: B,
-    state: TokioState<'a, B::Link, Func, F>,
+    state: TokioState<'a, Func, F>,
 }
 
 impl<'a, B: LinksIoBackend + 'a, Func: BorrowingFn<B::Link>> TokioImpl<'a, B, Func, Func::Fut<'a>> {

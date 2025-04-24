@@ -20,7 +20,7 @@ jobs:
       matrix:
         # TODO: enable windows, macos
         os: [ubuntu-latest]
-        toolchain: ["nightly-2023-10-01"]
+        toolchain: ["nightly-2024-12-12"]
         rustflags: ["--cfg mfio_assume_linear_types --cfg tokio_unstable", "--cfg tokio_unstable"]
     steps:
       - uses: actions/checkout@v2
@@ -34,7 +34,7 @@ jobs:
           echo "RUSTC_TARGET=$(rustc -vV | sed -n 's|host: ||p')" >> $GITHUB_OUTPUT
         id: target
       - name: Install llvm
-        run: sudo apt update && sudo apt install llvm-13
+        run: sudo apt update && sudo apt install llvm-19
       - run: rustup component add rust-src
       - name: Run all tests
         run: cargo -Zbuild-std test --verbose --target ${{ steps.target.outputs.RUSTC_TARGET }}
@@ -51,7 +51,7 @@ jobs:
       matrix:
         # TODO: enable windows, macos
         os: [ubuntu-latest]
-        toolchain: ["nightly-2023-10-01"]
+        toolchain: ["nightly-2024-12-12"]
         rustflags: ["--cfg mfio_assume_linear_types --cfg tokio_unstable", "--cfg tokio_unstable"]
     steps:
       - uses: actions/checkout@v2
@@ -65,6 +65,6 @@ jobs:
           echo "RUSTC_TARGET=$(rustc -vV | sed -n 's|host: ||p')" >> $GITHUB_OUTPUT
         id: target
       - name: Install llvm
-        run: sudo apt update && sudo apt install llvm-13
+        run: sudo apt update && sudo apt install llvm-19
       - name: Run all tests
         run: cargo test --verbose --target ${{ steps.target.outputs.RUSTC_TARGET }}

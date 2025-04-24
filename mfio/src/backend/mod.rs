@@ -9,8 +9,11 @@ use crate::std_prelude::*;
 
 use crate::poller::{self, ParkHandle};
 
+use cglue::ext::FutureBox;
+use cglue::task::CRefWaker;
 use core::cell::UnsafeCell;
 use core::future::Future;
+use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use core::task::{Context, Poll, Waker};
@@ -49,13 +52,12 @@ pub type DefaultHandle = RawHandle;
 #[cfg(not(feature = "std"))]
 pub type DefaultHandle = core::convert::Infallible;
 
-pub type DynBackend = dyn Future<Output = ()> + Send;
-
 #[repr(C)]
+#[cfg_attr(feature = "abi_stable", derive(::abi_stable::StableAbi))]
 struct NestedBackend {
     owner: *const (),
-    poll: unsafe extern "C" fn(*const (), &mut Context),
-    release: unsafe extern "C" fn(*const ()),
+    poll: unsafe extern "C-unwind" fn(*const (), &CRefWaker),
+    release: unsafe extern "C-unwind" fn(*const ()),
 }
 
 /// Stores a backend.
@@ -65,16 +67,65 @@ struct NestedBackend {
 ///
 /// Once the backend is acquired, it can be used to drive I/O to completion.
 #[repr(C)]
-pub struct BackendContainer<B: ?Sized> {
-    nest: UnsafeCell<Option<NestedBackend>>,
-    backend: UnsafeCell<Pin<Box<B>>>,
-    lock: AtomicBool,
+#[cfg_attr(feature = "abi_stable", derive(::abi_stable::StableAbi))]
+pub struct BackendContainer {
+    nest: UnsafeCell<MaybeUninit<NestedBackend>>,
+    backend: UnsafeCell<FutureBox<'static, ()>>,
+    lock_and_presence: AtomicU8,
 }
 
-unsafe impl<B: ?Sized + Send> Send for BackendContainer<B> {}
-unsafe impl<B: ?Sized + Send> Sync for BackendContainer<B> {}
+const LOCK_BIT: u8 = 0b1;
+const PRESENCE_BIT: u8 = 0b10;
 
-impl<B: ?Sized> BackendContainer<B> {
+impl BackendContainer {
+    /// SAFETY: must not create 2 aliasing references to underlying data.
+    unsafe fn nest_get_locked(&self) -> Option<&mut NestedBackend> {
+        if self.lock_and_presence.load(Ordering::Relaxed) & PRESENCE_BIT != 0 {
+            Some((*self.nest.get()).assume_init_mut())
+        } else {
+            None
+        }
+    }
+
+    /// SAFETY: must hold the lock
+    unsafe fn nest_take_locked(&self) -> Option<NestedBackend> {
+        if self
+            .lock_and_presence
+            .fetch_and(!PRESENCE_BIT, Ordering::Relaxed)
+            & PRESENCE_BIT
+            != 0
+        {
+            Some(core::ptr::read(self.nest.get()).assume_init())
+        } else {
+            None
+        }
+    }
+
+    /// SAFETY: must hold the lock
+    unsafe fn nest_store_locked(&self, nest: NestedBackend) {
+        if self
+            .lock_and_presence
+            .fetch_or(PRESENCE_BIT, Ordering::Relaxed)
+            & PRESENCE_BIT
+            != 0
+        {
+            (*self.nest.get()).assume_init_drop();
+        }
+
+        *self.nest.get() = MaybeUninit::new(nest);
+    }
+}
+
+unsafe impl Send for BackendContainer {}
+unsafe impl Sync for BackendContainer {}
+
+impl Drop for BackendContainer {
+    fn drop(&mut self) {
+        unsafe { self.nest_take_locked() };
+    }
+}
+
+impl BackendContainer {
     /// Acquire a backend.
     ///
     /// This function locks the backend and the returned handle keeps it locked, until the handle
@@ -83,12 +134,12 @@ impl<B: ?Sized> BackendContainer<B> {
     /// # Panics
     ///
     /// Panics if the backend has already been acquired.
-    pub fn acquire(&self, wake_flags: Option<Arc<AtomicU8>>) -> BackendHandle<B> {
-        if self.lock.swap(true, Ordering::AcqRel) {
+    pub fn acquire(&self, wake_flags: Option<Arc<AtomicU8>>) -> BackendHandle {
+        if self.lock_and_presence.fetch_or(LOCK_BIT, Ordering::AcqRel) & LOCK_BIT != 0 {
             panic!("Tried to acquire backend twice!");
         }
 
-        let backend = unsafe { &mut *self.backend.get() }.as_mut();
+        let backend = unsafe { Pin::new_unchecked(&mut *self.backend.get()) };
 
         BackendHandle {
             owner: self,
@@ -103,31 +154,29 @@ impl<B: ?Sized> BackendContainer<B> {
     /// backend will be polled, and afterwards, the provided handle. The ordering is consistent
     /// with the behavior of first polling the user's future, and then polling the backend. In the
     /// end, backends will be peeled off layer by layer, until the innermost backend is reached.
-    pub fn acquire_nested<B2: ?Sized + Future<Output = ()>>(
-        &self,
-        mut handle: BackendHandle<B2>,
-    ) -> BackendHandle<B> {
+    pub fn acquire_nested(&self, mut handle: BackendHandle) -> BackendHandle {
         let wake_flags = handle.wake_flags.take();
         let owner = handle.owner;
 
         let our_handle = self.acquire(wake_flags);
 
-        unsafe extern "C" fn poll<B: ?Sized + Future<Output = ()>>(
-            data: *const (),
-            context: &mut Context,
-        ) {
-            let data = &*(data as *const BackendContainer<B>);
-            if Pin::new_unchecked(&mut *data.backend.get())
-                .poll(context)
-                .is_ready()
-            {
-                panic!("Backend polled to completion!")
-            }
+        unsafe extern "C-unwind" fn poll(data: *const (), cx: &CRefWaker) {
+            let data = &*(data as *const BackendContainer);
+            cx.with_waker(|waker| {
+                let mut context = Context::from_waker(waker);
+                if Pin::new_unchecked(&mut *data.backend.get())
+                    .poll(&mut context)
+                    .is_ready()
+                {
+                    panic!("Backend polled to completion!")
+                }
+            })
         }
 
-        unsafe extern "C" fn release<B: ?Sized>(data: *const ()) {
-            let data = &*(data as *const BackendContainer<B>);
-            data.lock.store(false, Ordering::Release);
+        unsafe extern "C-unwind" fn release(data: *const ()) {
+            let data = &*(data as *const BackendContainer);
+            data.lock_and_presence
+                .fetch_and(!LOCK_BIT, Ordering::Release);
         }
 
         // We must prevent drop from being called, since we are replacing the release mechanism
@@ -135,10 +184,10 @@ impl<B: ?Sized> BackendContainer<B> {
         core::mem::forget(handle);
 
         unsafe {
-            *self.nest.get() = Some(NestedBackend {
+            self.nest_store_locked(NestedBackend {
                 owner: owner as *const _ as *const (),
-                poll: poll::<B2>,
-                release: release::<B2>,
+                poll,
+                release,
             });
         }
 
@@ -146,13 +195,13 @@ impl<B: ?Sized> BackendContainer<B> {
     }
 }
 
-impl BackendContainer<DynBackend> {
-    /// Creates a new [`DynBackend`] container.
+impl BackendContainer {
+    /// Creates a new container.
     pub fn new_dyn<T: Future<Output = ()> + Send + 'static>(backend: T) -> Self {
         Self {
-            backend: UnsafeCell::new(Box::pin(backend) as Pin<Box<dyn Future<Output = ()> + Send>>),
-            nest: UnsafeCell::new(None),
-            lock: Default::default(),
+            backend: UnsafeCell::new(cglue::trait_obj!(backend as Future)),
+            nest: UnsafeCell::new(MaybeUninit::uninit()),
+            lock_and_presence: Default::default(),
         }
     }
 }
@@ -165,36 +214,37 @@ impl BackendContainer<DynBackend> {
 ///
 /// Usually, the user would want to bypass this type and use [`IoBackendExt::block_on`], or an
 /// [`Integration`] equivalent.
-pub struct BackendHandle<'a, B: ?Sized> {
-    owner: &'a BackendContainer<B>,
-    backend: Pin<&'a mut B>,
+pub struct BackendHandle<'a> {
+    owner: &'a BackendContainer,
+    backend: Pin<&'a mut FutureBox<'static, ()>>,
     wake_flags: Option<Arc<AtomicU8>>,
 }
 
-impl<'a, B: ?Sized> Drop for BackendHandle<'a, B> {
+impl<'a> Drop for BackendHandle<'a> {
     fn drop(&mut self) {
         // SAFETY: we are still holding the lock to this data
-        if let Some(NestedBackend { owner, release, .. }) =
-            unsafe { (*self.owner.nest.get()).take() }
+        if let Some(NestedBackend { owner, release, .. }) = unsafe { self.owner.nest_take_locked() }
         {
             // SAFETY: this structure is constructed only in acquire_nested. We assume it
             // constructs the structure correctly.
             unsafe { release(owner) }
         }
 
-        self.owner.lock.store(false, Ordering::Release);
+        self.owner
+            .lock_and_presence
+            .fetch_and(!LOCK_BIT, Ordering::Release);
     }
 }
 
-impl<'a, B: ?Sized> core::ops::Deref for BackendHandle<'a, B> {
-    type Target = Pin<&'a mut B>;
+impl<'a> core::ops::Deref for BackendHandle<'a> {
+    type Target = Pin<&'a mut FutureBox<'static, ()>>;
 
     fn deref(&self) -> &Self::Target {
         &self.backend
     }
 }
 
-impl<'a, B: ?Sized> core::ops::DerefMut for BackendHandle<'a, B> {
+impl<'a> core::ops::DerefMut for BackendHandle<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.backend
     }
@@ -207,12 +257,12 @@ impl<'a, B: ?Sized> core::ops::DerefMut for BackendHandle<'a, B> {
 ///
 /// Usually, the user would want to bypass this type and use [`IoBackendExt::block_on`], or an
 /// [`Integration`] equivalent.
-pub struct WithBackend<'a, Backend: ?Sized, Fut: ?Sized> {
-    backend: BackendHandle<'a, Backend>,
+pub struct WithBackend<'a, Fut: ?Sized> {
+    backend: BackendHandle<'a>,
     future: Fut,
 }
 
-impl<'a, Backend: Future + ?Sized, Fut: Future + ?Sized> Future for WithBackend<'a, Backend, Fut> {
+impl<'a, Fut: Future + ?Sized> Future for WithBackend<'a, Fut> {
     type Output = Fut::Output;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
@@ -238,11 +288,12 @@ impl<'a, Backend: Future + ?Sized, Fut: Future + ?Sized> Future for WithBackend<
                     Poll::Pending => {
                         // SAFETY: we are holding the lock to the backend.
                         if let Some(NestedBackend { owner, poll, .. }) =
-                            unsafe { &*this.backend.owner.nest.get() }
+                            unsafe { this.backend.owner.nest_get_locked() }
                         {
+                            let cx = CRefWaker::from(cx.waker());
                             // SAFETY: this structure is constructed only in acquire_nested. We
                             // assume it constructs the structure correctly.
-                            unsafe { poll(*owner, cx) };
+                            unsafe { poll(*owner, &cx) };
                         }
                     }
                 },
@@ -388,8 +439,6 @@ impl PollingFlags {
 /// Users may want to call methods available on [`IoBackendExt`], instead of the ones on this
 /// trait.
 pub trait IoBackend<Handle: Pollable = DefaultHandle> {
-    type Backend: Future<Output = ()> + Send + ?Sized;
-
     /// Gets handle to the backing event system.
     ///
     /// This function returns a handle and a waker. The handle is a `RawFd` on Unix systems, and a
@@ -409,7 +458,7 @@ pub trait IoBackend<Handle: Pollable = DefaultHandle> {
     /// This function panics when multiple backend handles are attempted to be acquired. This
     /// function does not return an `Option`, because such case usually indicates a bug in the
     /// code.
-    fn get_backend(&self) -> BackendHandle<Self::Backend>;
+    fn get_backend(&self) -> BackendHandle;
 }
 
 /// Helpers for [`IoBackend`].
@@ -418,10 +467,7 @@ pub trait IoBackendExt<Handle: Pollable>: IoBackend<Handle> {
     ///
     /// If second tuple element is not `None`, then the caller is responsible for registering and
     /// handling read-readiness events.
-    fn with_backend<F: Future>(
-        &self,
-        future: F,
-    ) -> (WithBackend<Self::Backend, F>, Option<PollingHandle>) {
+    fn with_backend<F: Future>(&self, future: F) -> (WithBackend<F>, Option<PollingHandle>) {
         (
             WithBackend {
                 backend: self.get_backend(),
@@ -438,7 +484,7 @@ pub trait IoBackendExt<Handle: Pollable>: IoBackend<Handle> {
     fn block_on<F: Future>(&self, fut: F) -> F::Output {
         let backend = self.get_backend();
         let polling = self.polling_handle();
-        block_on::<Handle, F, Self>(fut, backend, polling)
+        block_on::<Handle, F>(fut, backend, polling)
     }
 }
 
@@ -470,9 +516,9 @@ impl<'a, T: IoBackend + ?Sized> LinksIoBackend for RefLink<'a, T> {
     }
 }
 
-pub fn block_on<H: Pollable, F: Future, B: IoBackend<H> + ?Sized>(
+pub fn block_on<H: Pollable, F: Future>(
     future: F,
-    backend: BackendHandle<B::Backend>,
+    backend: BackendHandle,
     polling: Option<PollingHandle>,
 ) -> F::Output {
     let fut = WithBackend { backend, future };

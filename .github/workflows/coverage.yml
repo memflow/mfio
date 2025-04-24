@@ -17,17 +17,19 @@ jobs:
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: nightly-2023-10-01
+          toolchain: nightly-2024-11-22
           override: true
+          components: llvm-tools-preview
       - run: cargo install grcov
       - name: Run tests with coverage
         run: |
           cd mfio-repo
           export CARGO_INCREMENTAL=0
-          export RUSTFLAGS="-Zprofile -Ccodegen-units=1 -Copt-level=0 -Clink-dead-code -Coverflow-checks=off -Zpanic_abort_tests -Cpanic=abort"
+          export RUSTFLAGS="-Cinstrument-coverage -Ccodegen-units=1 -Copt-level=0 -Clink-dead-code -Coverflow-checks=off -Zpanic_abort_tests -Cpanic=abort"
           export RUSTDOCFLAGS="-Cpanic=abort"
+          export LLVM_PROFILE_FILE="your_name-%p-%m.profraw"
           cargo build --workspace --exclude mfio-derive --all-features
           cargo test --workspace --exclude mfio-derive --all-features
-          grcov ./target/debug/ -s . -t lcov --llvm --branch --ignore-not-existing -o ./target/debug/coverage
-          bash <(curl -s https://codecov.io/bash) -f ./target/debug/coverage -t ${{ secrets.CODECOV_TOKEN }};
+          grcov . --binary-path ./target/debug/ -s . -t lcov --branch --ignore-not-existing --ignore "/*" -o lcov.info
+          bash <(curl -s https://codecov.io/bash) -f lcov.info -t ${{ secrets.CODECOV_TOKEN }};
 

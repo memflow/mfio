@@ -75,15 +75,13 @@ macro_rules! fs_dispatch {
         }
 
         impl IoBackend for NativeRtInstance {
-            type Backend = DynBackend;
-
             fn polling_handle(&self) -> Option<PollingHandle> {
                 match self {
                     $($(#[cfg($meta)])* Self::$name(v) => v.polling_handle()),*
                 }
             }
 
-            fn get_backend(&self) -> BackendHandle<Self::Backend> {
+            fn get_backend(&self) -> BackendHandle {
                 match self {
                     $($(#[cfg($meta)])* Self::$name(v) => v.get_backend()),*
                 }
@@ -442,13 +440,11 @@ pub struct NativeRt {
 }
 
 impl IoBackend for NativeRt {
-    type Backend = <NativeRtInstance as IoBackend>::Backend;
-
     fn polling_handle(&self) -> Option<PollingHandle> {
         self.cwd.instance.polling_handle()
     }
 
-    fn get_backend(&self) -> BackendHandle<Self::Backend> {
+    fn get_backend(&self) -> BackendHandle {
         self.cwd.instance.get_backend()
     }
 }

@@ -17,6 +17,7 @@ use tarc::BaseArc;
 /// is bound to such output ref, then, upon completion of processing, every resulting packet view
 /// is passed to the given output ref.
 #[repr(C)]
+#[cfg_attr(feature = "abi_stable", derive(::abi_stable::StableAbi))]
 pub struct BoundPacketView<Perms: PacketPerms> {
     pub(crate) view: ManuallyDrop<PacketView<'static, Perms>>,
     pub(crate) has_output: bool,
@@ -214,6 +215,7 @@ impl<Perms: PacketPerms> BoundPacketView<Perms> {
 /// non-overlapping views. This structure contains necessary data for describing the bounds of each
 /// sub-view.
 #[repr(C)]
+#[cfg_attr(feature = "abi_stable", derive(::abi_stable::StableAbi))]
 pub struct PacketView<'a, Perms: PacketPerms> {
     pub(crate) pkt: NonNull<Packet<Perms>>,
     /// Right-most bit indicates whether packet is an Arc or a ref. The rest is user-defined.

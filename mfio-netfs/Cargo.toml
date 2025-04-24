@@ -21,7 +21,7 @@ required-features = ["bin-deps"]
 [dependencies]
 mfio = { version = "0.1", path = "../mfio", default-features = false }
 mfio-rt = { version = "0.1", path = "../mfio-rt", default-features = false }
-cglue = { version = "0.2", features = ["task_unstable"], default-features = false }
+cglue = { version = "0.3", features = ["task"], default-features = false }
 
 log = "0.4"
 bytemuck = { version = "1", features = ["derive"] }

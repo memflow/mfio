@@ -285,7 +285,7 @@ impl IntoOp for Write {
 
 impl<Perms: IntoOp> PacketIo<Perms, NoPos> for TcpStream {
     fn send_io(&self, _: NoPos, packet: BoundPacketView<Perms>) {
-        log::debug!("Send io {}", packet.len());
+        log::debug!("Send io {:?}", packet.len());
 
         let mut state = self.state.lock();
         let state = &mut *state;

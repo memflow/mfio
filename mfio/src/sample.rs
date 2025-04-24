@@ -160,7 +160,7 @@ impl Drop for VolatileMem {
 pub struct IoThreadState {
     read_io: BaseArc<IoThreadHandle<Write>>,
     write_io: BaseArc<IoThreadHandle<Read>>,
-    backend: BackendContainer<DynBackend>,
+    backend: BackendContainer,
 }
 
 impl IoThreadState {
@@ -274,13 +274,11 @@ impl PacketIo<Write, Address> for SampleIo {
 }
 
 impl IoBackend for SampleIo {
-    type Backend = DynBackend;
-
     fn polling_handle(&self) -> Option<PollingHandle> {
         None
     }
 
-    fn get_backend(&self) -> BackendHandle<Self::Backend> {
+    fn get_backend(&self) -> BackendHandle {
         self.thread_state.backend.acquire(None)
     }
 }

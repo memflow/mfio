@@ -26,7 +26,10 @@ pub trait BorrowingFn<B: ?Sized> {
 }
 
 impl<B: ?Sized, Func: for<'a> FnOnce(&'a B) -> F, F: Future> BorrowingFn<B> for Func {
-    type Fut<'a> = F where B: 'a;
+    type Fut<'a>
+        = F
+    where
+        B: 'a;
 
     fn call(self, arg: &B) -> Self::Fut<'_> {
         self(arg)
@@ -56,7 +59,10 @@ impl<'a, B: ?Sized, Func: FnOnce(&'a B) -> F, F: Future> UnsafeHrtb<'a, B, Func,
 impl<'a, B: ?Sized, Func: FnOnce(&'a B) -> F, F: Future> BorrowingFn<B>
     for UnsafeHrtb<'a, B, Func, F>
 {
-    type Fut<'b> = F where B: 'b;
+    type Fut<'b>
+        = F
+    where
+        B: 'b;
 
     fn call<'b>(self, arg: &'b B) -> Self::Fut<'b> {
         let arg: &'a B = unsafe { &*(arg as *const B) };

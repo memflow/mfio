@@ -1,0 +1,10 @@
+[package]
+name = "version-hack"
+version = "0.1.0"
+edition = "2018"
+
+[dependencies]
+enclose = "=1.2.0"
+
+[dev-dependencies]
+pollster = "=0.2.0"

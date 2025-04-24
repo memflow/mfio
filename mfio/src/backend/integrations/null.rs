@@ -29,8 +29,8 @@ use super::{BorrowingFn, Integration};
 ///     // Run the integration. Prefer to use `run_with_mut`, so that panics can be avoided.
 ///     Null::run_with_mut(&mut handle, |handle| async move {
 ///         // Read value
-///         let val = handle.read(0).await.unwrap();
-///         assert_eq!(1u8, val);
+///         let val: u8 = handle.read(0).await.unwrap();
+///         assert_eq!(1, val);
 ///     })
 ///     .await
 /// });
@@ -53,16 +53,16 @@ impl Integration for Null {
     }
 }
 
-enum NullState<'a, B: IoBackend + ?Sized + 'a, Func, F> {
+enum NullState<'a, Func, F> {
     Initial(Func),
-    Loaded(WithBackend<'a, B::Backend, F>),
+    Loaded(WithBackend<'a, F>),
     Finished,
 }
 
 #[doc(hidden)]
 pub struct NullImpl<'a, B: LinksIoBackend + 'a, Func, F> {
     backend: B,
-    state: NullState<'a, B::Link, Func, F>,
+    state: NullState<'a, Func, F>,
 }
 
 impl<'a, B: LinksIoBackend + 'a, Func: for<'b> BorrowingFn<B::Link>>

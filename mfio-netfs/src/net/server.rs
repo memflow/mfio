@@ -70,14 +70,14 @@ struct ReadPacket {
 
 impl ReadPacket {
     pub fn new(capacity: u64) -> Self {
-        unsafe extern "C" fn len(pkt: &Packet<Write>) -> u64 {
+        unsafe extern "C-unwind" fn len(pkt: &Packet<Write>) -> u64 {
             unsafe {
                 let this = &*(pkt as *const Packet<Write> as *const ReadPacket);
                 this.len
             }
         }
 
-        unsafe extern "C" fn get_mut(
+        unsafe extern "C-unwind" fn get_mut(
             _: &mut ManuallyDrop<BoundPacketView<Write>>,
             _: usize,
             _: &mut MaybeUninit<WritePacketObj>,
@@ -85,7 +85,7 @@ impl ReadPacket {
             false
         }
 
-        unsafe extern "C" fn transfer_data(obj: &mut PacketView<'_, Write>, src: *const ()) {
+        unsafe extern "C-unwind" fn transfer_data(obj: &mut PacketView<'_, Write>, src: *const ()) {
             let this = &*(obj.pkt() as *const Packet<Write> as *const ReadPacket);
             let len = obj.len();
             let idx = obj.start();
@@ -647,7 +647,7 @@ mod tests {
     #[test]
     fn fs_test() {
         let _ = ::env_logger::builder().is_test(true).try_init();
-        let addr: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
         let (server, addr) = single_client_server(addr);
 

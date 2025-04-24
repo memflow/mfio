@@ -31,6 +31,7 @@ pub type Output<'a, Perms> = (PacketView<'a, Perms>, Option<Error>);
 
 /// Represents a reference where final packet views are collected.
 #[repr(C)]
+#[cfg_attr(feature = "abi_stable", derive(::abi_stable::StableAbi))]
 pub struct OutputRef<'a, Perms: PacketPerms> {
     pub(crate) out: NonNull<PacketOutput<Perms>>,
     pub(crate) arc: bool,
@@ -127,6 +128,7 @@ impl<'a, Perms: PacketPerms, T> OutputStore<'a, Perms> for T where
 /// Note that this is an opaque object with data referenced beyond the size of this struct.
 #[repr(C)]
 #[derive(Debug)]
+#[cfg_attr(feature = "abi_stable", derive(::abi_stable::StableAbi))]
 pub struct PacketOutput<Perms: PacketPerms> {
     pub(crate) vtbl: &'static PacketOutputVtbl<Perms>, /* output, while drop is called by the object owner. */
     pub(crate) bound_views: AtomicUsize,
@@ -136,6 +138,7 @@ pub struct PacketOutput<Perms: PacketPerms> {
 /// Describes operations that can be performed on a packet output object.
 #[repr(C)]
 #[derive(Debug)]
+#[cfg_attr(feature = "abi_stable", derive(::abi_stable::StableAbi))]
 pub struct PacketOutputVtbl<Perms: PacketPerms> {
     /// Output handler.
     ///
@@ -144,7 +147,7 @@ pub struct PacketOutputVtbl<Perms: PacketPerms> {
     /// potential waker (of the last packet view standing) gets triggered.
     ///
     /// TODO: make this a polled async function.
-    pub output: unsafe extern "C" fn(
+    pub output: unsafe extern "C-unwind" fn(
         OutputRef<'static, Perms>,
         PacketView<'static, Perms>,
         Option<NonZeroI32>,
@@ -201,7 +204,7 @@ impl<'a, F: Fn(PacketView<'a, Perms>, Option<Error>) + Send + Sync, Perms: Packe
     OutputFunction<F, Perms>
 {
     pub fn new(func: F) -> Self {
-        unsafe extern "C" fn output<
+        unsafe extern "C-unwind" fn output<
             'a,
             F: Fn(PacketView<'a, Perms>, Option<Error>) + Send + Sync,
             Perms: PacketPerms,
@@ -233,10 +236,19 @@ unsafe impl<'b, F: Fn(PacketView<'b, Perms>, Option<Error>) + Send + Sync, Perms
     OpaqueStore for OutputFunction<F, Perms>
 {
     type ConstHdr = PacketOutput<Perms>;
-    type Opaque<'a> = OutputRef<'a, Perms> where Self: 'a;
+    type Opaque<'a>
+        = OutputRef<'a, Perms>
+    where
+        Self: 'a;
     // TODO: cfg switch this to a stack based obj.
-    type StackReq<'a> = BaseArc<Self> where Self: 'a;
-    type HeapReq = BaseArc<Self> where Self: 'static;
+    type StackReq<'a>
+        = BaseArc<Self>
+    where
+        Self: 'a;
+    type HeapReq
+        = BaseArc<Self>
+    where
+        Self: 'static;
 
     fn stack<'a>(self) -> Self::StackReq<'a>
     where
@@ -330,7 +342,11 @@ impl<'a, T: PushPop<Output<'a, Perms>>, Perms: PacketPerms> PacketStream<'_, T, 
     }
 
     pub fn new(container: T) -> Self {
-        unsafe extern "C" fn output<'a, T: PushPop<Output<'a, Perms>>, Perms: PacketPerms>(
+        unsafe extern "C-unwind" fn output<
+            'a,
+            T: PushPop<Output<'a, Perms>>,
+            Perms: PacketPerms,
+        >(
             out: OutputRef<'static, Perms>,
             view: PacketView<'static, Perms>,
             err: Option<NonZeroI32>,
@@ -422,10 +438,19 @@ impl<'a, T: PushPop<Output<'a, Perms>>, Perms: PacketPerms> Stream for &PacketSt
 
 unsafe impl<Perms: PacketPerms> OpaqueStore for BaseArc<PacketOutput<Perms>> {
     type ConstHdr = PacketOutput<Perms>;
-    type Opaque<'a> = OutputRef<'a, Perms> where Self: 'a;
+    type Opaque<'a>
+        = OutputRef<'a, Perms>
+    where
+        Self: 'a;
     // TODO: cfg switch this to a stack based obj.
-    type StackReq<'a> = Self where Self: 'a;
-    type HeapReq = Self where Self: 'static;
+    type StackReq<'a>
+        = Self
+    where
+        Self: 'a;
+    type HeapReq
+        = Self
+    where
+        Self: 'static;
 
     fn stack<'a>(self) -> Self::StackReq<'a>
     where
@@ -452,10 +477,19 @@ unsafe impl<Perms: PacketPerms> OpaqueStore for BaseArc<PacketOutput<Perms>> {
 
 unsafe impl<'c, Perms: PacketPerms> OpaqueStore for &'c BaseArc<PacketOutput<Perms>> {
     type ConstHdr = PacketOutput<Perms>;
-    type Opaque<'a> = OutputRef<'a, Perms> where Self: 'a;
+    type Opaque<'a>
+        = OutputRef<'a, Perms>
+    where
+        Self: 'a;
     // TODO: cfg switch this to a stack based obj.
-    type StackReq<'a> = Self where Self: 'a;
-    type HeapReq = BaseArc<PacketOutput<Perms>> where Self: 'static;
+    type StackReq<'a>
+        = Self
+    where
+        Self: 'a;
+    type HeapReq
+        = BaseArc<PacketOutput<Perms>>
+    where
+        Self: 'static;
 
     fn stack<'a>(self) -> Self::StackReq<'a>
     where
@@ -485,10 +519,19 @@ unsafe impl<'c, Perms: PacketPerms> OpaqueStore for &'c BaseArc<PacketOutput<Per
 
 unsafe impl<T, Perms: PacketPerms> OpaqueStore for BaseArc<PacketStream<'_, T, Perms>> {
     type ConstHdr = PacketOutput<Perms>;
-    type Opaque<'a> = OutputRef<'a, Perms> where Self: 'a;
+    type Opaque<'a>
+        = OutputRef<'a, Perms>
+    where
+        Self: 'a;
     // TODO: cfg switch this to a stack based obj.
-    type StackReq<'a> = Self where Self: 'a;
-    type HeapReq = Self where Self: 'static;
+    type StackReq<'a>
+        = Self
+    where
+        Self: 'a;
+    type HeapReq
+        = Self
+    where
+        Self: 'static;
 
     fn stack<'a>(self) -> Self::StackReq<'a>
     where
@@ -518,10 +561,19 @@ unsafe impl<T, Perms: PacketPerms> OpaqueStore for BaseArc<PacketStream<'_, T, P
 
 unsafe impl<T, Perms: PacketPerms> OpaqueStore for PacketStream<'_, T, Perms> {
     type ConstHdr = PacketOutput<Perms>;
-    type Opaque<'a> = OutputRef<'a, Perms> where Self: 'a;
+    type Opaque<'a>
+        = OutputRef<'a, Perms>
+    where
+        Self: 'a;
     // TODO: cfg switch this to a stack based obj.
-    type StackReq<'a> = BaseArc<Self> where Self: 'a;
-    type HeapReq = BaseArc<Self> where Self: 'static;
+    type StackReq<'a>
+        = BaseArc<Self>
+    where
+        Self: 'a;
+    type HeapReq
+        = BaseArc<Self>
+    where
+        Self: 'static;
 
     fn stack<'a>(self) -> Self::StackReq<'a>
     where

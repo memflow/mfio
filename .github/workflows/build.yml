@@ -15,7 +15,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
-        toolchain: ["1.74", "stable"]
+        toolchain: ["1.84", "stable"]
         rustflags: ["--cfg mfio_assume_linear_types --cfg tokio_unstable", "--cfg tokio_unstable"]
     steps:
       - uses: actions/checkout@v2
@@ -35,7 +35,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
-        toolchain: ["1.74", "stable", "nightly-2023-10-01"]
+        toolchain: ["1.84", "stable", "nightly-2024-11-22"]
         rustflags: ["--cfg mfio_assume_linear_types --cfg tokio_unstable", "--cfg tokio_unstable"]
     steps:
       - uses: actions/checkout@v2
@@ -57,7 +57,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        toolchain: ["1.74", "stable"]
+        toolchain: ["1.84", "stable"]
         rustflags: ["--cfg mfio_assume_linear_types --cfg tokio_unstable", "--cfg tokio_unstable"]
     steps:
       - uses: actions/checkout@v2

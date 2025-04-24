@@ -160,6 +160,7 @@ pub use opaque::*;
 /// # });
 /// ```
 #[cfg_attr(feature = "cglue-trait", cglue_trait)]
+#[cfg_attr(feature = "cglue-trait", cglue_forward)]
 pub trait PacketIo<Perms: PacketPerms, Param>: Sized {
     /// Send I/O request to the backend.
     ///

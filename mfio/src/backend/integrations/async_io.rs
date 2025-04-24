@@ -62,10 +62,10 @@ impl Integration for AsyncIo {
     }
 }
 
-enum AsyncIoState<'a, B: IoBackend + ?Sized + 'a, Func, F> {
+enum AsyncIoState<'a, Func, F> {
     Initial(Func),
     Loaded(
-        WithBackend<'a, B::Backend, F>,
+        WithBackend<'a, F>,
         Option<(Async<BorrowedFd<'a>>, &'a PollingFlags, Waker)>,
     ),
     Finished,
@@ -74,7 +74,7 @@ enum AsyncIoState<'a, B: IoBackend + ?Sized + 'a, Func, F> {
 #[doc(hidden)]
 pub struct AsyncIoImpl<'a, B: LinksIoBackend + 'a, Func, F> {
     backend: B,
-    state: AsyncIoState<'a, B::Link, Func, F>,
+    state: AsyncIoState<'a, Func, F>,
 }
 
 impl<'a, B: LinksIoBackend + 'a, Func: BorrowingFn<B::Link>>

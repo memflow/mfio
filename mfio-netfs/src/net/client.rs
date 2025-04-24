@@ -182,7 +182,7 @@ struct Senders {
 }
 
 pub struct NetworkFs {
-    backend: BackendContainer<DynBackend>,
+    backend: BackendContainer,
     cwd: NetworkFsDir,
     fs: Arc<mfio_rt::NativeRt>,
     cancel_ops_on_drop: bool,
@@ -617,13 +617,11 @@ impl NetworkFs {
 }
 
 impl IoBackend for NetworkFs {
-    type Backend = DynBackend;
-
     fn polling_handle(&self) -> Option<PollingHandle> {
         self.fs.polling_handle()
     }
 
-    fn get_backend(&self) -> BackendHandle<Self::Backend> {
+    fn get_backend(&self) -> BackendHandle {
         self.backend.acquire_nested(self.fs.get_backend())
     }
 }

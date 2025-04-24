@@ -658,7 +658,7 @@ impl IocpState {
 pub struct Runtime {
     // NOTE: this must be before `state`, because `backend` contains references to data, owned by
     // `state`.
-    backend: BackendContainer<DynBackend>,
+    backend: BackendContainer,
     state: BaseArc<Mutex<IocpState>>,
     waker: EventWaker,
 }
@@ -767,8 +767,6 @@ impl Runtime {
 }
 
 impl IoBackend for Runtime {
-    type Backend = DynBackend;
-
     fn polling_handle(&self) -> Option<PollingHandle> {
         static FLAGS: PollingFlags = PollingFlags::new();
         Some(PollingHandle {
@@ -779,7 +777,7 @@ impl IoBackend for Runtime {
         })
     }
 
-    fn get_backend(&self) -> BackendHandle<Self::Backend> {
+    fn get_backend(&self) -> BackendHandle {
         self.backend.acquire(Some(self.waker.flags()))
     }
 }
